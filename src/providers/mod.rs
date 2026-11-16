@@ -196,55 +196,6 @@ impl ProviderAccountObservation {
     }
 }
 
-/// One app-owned provider check. It carries no role socket, token,
-/// generation, hook or project path; its scope is an empty app directory.
-#[derive(Clone, Debug)]
-pub struct ObservationLaunch {
-    pub provider: Provider,
-    pub executable: PathBuf,
-    pub executable_version: String,
-    pub model: String,
-    pub effort: String,
-    pub arguments: Vec<String>,
-    pub environment: Vec<(String, String)>,
-    pub scope: PathBuf,
-    pub supervision_executable: PathBuf,
-    pub policy: crate::provider_compatibility::PolicyBinding,
-}
-
-impl ObservationLaunch {
-    pub fn process(&self) -> ProviderProcess<'_> {
-        ProviderProcess {
-            provider: self.provider,
-            executable: &self.executable,
-            arguments: &self.arguments,
-            environment: &self.environment,
-            cwd: &self.scope,
-            supervision_executable: &self.supervision_executable,
-        }
-    }
-
-    /// The session record omits the prompt, which carries the check value.
-    pub fn record(&self) -> serde_json::Value {
-        let mut arguments = self.arguments.clone();
-        if let Some(prompt) = arguments.last_mut() {
-            *prompt = "<provider-check-prompt>".to_owned();
-        }
-        json!({
-            "kind": "provider_observation",
-            "provider": self.provider,
-            "executable": self.executable,
-            "executable_version": self.executable_version,
-            "model": self.model,
-            "effort": self.effort,
-            "argv": arguments,
-            "environment_keys": self.environment.iter().map(|(key, _)| key).collect::<Vec<_>>(),
-            "scope": self.scope,
-            "policy": self.policy,
-        })
-    }
-}
-
 /// Model and effort become separate argv elements, never shell text; a
 /// leading dash or whitespace is still refused so neither can become a flag.
 fn require_provider_word(label: &str, value: &str) -> Result<()> {
@@ -264,49 +215,6 @@ fn require_provider_word(label: &str, value: &str) -> Result<()> {
 pub(crate) fn require_observation_selection(model: &str, effort: &str) -> Result<()> {
     require_provider_word("model", model)?;
     require_provider_word("effort", effort)
-}
-
-pub fn prepare_observation_launch(
-    installation: &ProviderInstallation,
-    policy: crate::provider_compatibility::PolicyBinding,
-    model: &str,
-    effort: &str,
-    scope: &Path,
-    prompt: &str,
-    supervision_executable: &Path,
-) -> Result<ObservationLaunch> {
-    require_observation_selection(model, effort)?;
-    if policy.mode != crate::provider_compatibility::PolicyMode::ProviderObservation
-        || policy.provider != installation.provider
-        || policy.exact_version != installation.executable_version
-    {
-        bail!("provider check launch requires the observation contract for this exact installation")
-    }
-    let (arguments, environment) = match installation.provider {
-        Provider::Codex => (
-            codex::observation_arguments(model, effort, scope, prompt)?,
-            Vec::new(),
-        ),
-        Provider::Claude => (
-            claude::observation_arguments(model, effort, prompt),
-            vec![
-                ("DISABLE_AUTOUPDATER".to_owned(), "1".to_owned()),
-                ("DISABLE_UPDATES".to_owned(), "1".to_owned()),
-            ],
-        ),
-    };
-    Ok(ObservationLaunch {
-        provider: installation.provider,
-        executable: installation.executable.canonical_path.clone(),
-        executable_version: installation.executable_version.clone(),
-        model: model.to_owned(),
-        effort: effort.to_owned(),
-        arguments,
-        environment,
-        scope: scope.to_path_buf(),
-        supervision_executable: supervision_executable.to_path_buf(),
-        policy,
-    })
 }
 
 #[derive(Clone, Debug)]
@@ -683,8 +591,8 @@ struct SingleAgentReadScope {
 }
 
 fn single_agent_read_scope(request: &SingleAgentLaunchRequest<'_>) -> Result<SingleAgentReadScope> {
-    if !request.purpose.is_writer() && request.checkout_scope.is_some() {
-        bail!("Repository readers and reviewers require an isolated worktree")
+    if !request.purpose.is_writer() {
+        bail!("Repository reader and reviewer execution has been retired.")
     }
     if let Some(scope) = request.checkout_scope {
         let root = PathBuf::from(scope["root"].as_str().context("Main scope has no root")?);
@@ -1326,10 +1234,8 @@ pub fn prepare_single_agent_launch(
 ) -> Result<SingleAgentLaunch> {
     require_provider_word("model", request.model)?;
     require_provider_word("effort", request.effort)?;
-    if request.purpose == crate::domain::ProfilePurpose::RepositoryReviewer
-        && request.native_session_id.is_some()
-    {
-        bail!("Independent reviewers must start a fresh conversation")
+    if !request.purpose.is_writer() {
+        bail!("Repository reader and reviewer execution has been retired.")
     }
     let native = match request.provider {
         Provider::Codex => codex::single_agent_native(request)?,
@@ -1357,6 +1263,14 @@ fn assemble_single_agent_launch(
     native: SingleAgentNative,
     binding: &crate::provider_compatibility::PolicyBinding,
 ) -> Result<SingleAgentLaunch> {
+    let native_contract = json!({
+        "launch_revision": binding.launch_revision.as_deref()
+            .context("Resolved Single agent binding is missing its exact launch revision")?,
+        "native_policy_revision": binding.native_policy_revision.as_deref()
+            .context("Resolved Single agent binding is missing its exact native policy revision")?,
+        "policy_binding_hash": binding.effective_hash,
+        "exact_version": binding.exact_version,
+    });
     let mut identity = SingleAgentNativeIdentity {
         provider: request.provider,
         executable: executable_fingerprint(&native.executable)?,
@@ -1399,8 +1313,10 @@ fn assemble_single_agent_launch(
         "environment_keys": native.environment.iter().map(|(key, _)| key).collect::<Vec<_>>(),
         "native_session_id": request.native_session_id,
         "execution_policy": policy,
+        "execution_policy_revision_scope": "version_independent_profile_policy",
         "execution_policy_hash": policy.content_hash(),
         "policy_binding": binding,
+        "native_contract": native_contract,
     });
     if let Some(scope) = request.checkout_scope {
         record["checkout_scope"] = scope.clone();

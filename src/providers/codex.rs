@@ -23,6 +23,7 @@ pub const LEGACY_MCP_COVERAGE_GAP: &str = "historical Codex configuration does n
 pub const LEGACY_APPROVAL_OWNERSHIP_GAP: &str = "historical Codex Implementer configuration does not match the current native approval ownership contract; fresh exact-version native validation is required";
 pub const EXACT_CODEX_VERSION: &str = "codex-cli 0.162.1";
 pub const SINGLE_AGENT_QUALIFICATION_VERSION: &str = "codex-cli 0.166.0";
+pub const CURRENT_SINGLE_AGENT_VERSION: &str = "codex-cli 0.167.0";
 pub(crate) const SOURCE_VERSION: &str = "0.162.1";
 pub const LAUNCH_CONTRACT_REVISION: &str = "llmrelay-codex-launch-v3";
 pub const RESUME_CONTRACT_REVISION: &str = "llmrelay-codex-resume-v3";
@@ -63,15 +64,6 @@ const DISABLED_FEATURES: &[&str] = &[
 
 /// A read-only sandbox permits file reads. Observation separately requests
 /// these tool features off; native exclusion still needs qualification.
-const OBSERVATION_DISABLED_TOOLS: &[&str] = &[
-    "shell_tool",
-    "unified_exec",
-    "view_image",
-    "sleep_tool",
-    "tool_suggest",
-    "goals",
-    "workspace_dependencies",
-];
 
 #[derive(Debug)]
 struct NativeCompatibility {
@@ -408,9 +400,8 @@ pub(crate) fn single_agent_native(
     request: &super::SingleAgentLaunchRequest<'_>,
 ) -> Result<super::SingleAgentNative> {
     let scope = super::single_agent_read_scope(request)?;
-    let writer = request.purpose.is_writer();
-    let base = if writer { ":workspace" } else { ":read-only" };
-    let approval = if writer { "on-request" } else { "never" };
+    let base = ":workspace";
+    let approval = "on-request";
     let synthetic = request.bundles.is_synthetic();
     let (executable, version) = if synthetic {
         (
@@ -458,7 +449,7 @@ pub(crate) fn single_agent_native(
         )?,
         network_proxy: network_proxy(&canonical_role_socket)?,
         hook_command: &shell_quote(&request.assets.runner.to_string_lossy()),
-        writer,
+        writer: true,
         disabled_mcp_servers: &disabled_mcp_servers,
         native_session_id: request.native_session_id,
     })?;
@@ -468,7 +459,7 @@ pub(crate) fn single_agent_native(
         "permission_profile": {
             "name": DENIED_READ_FLOOR_PROFILE,
             "extends": base,
-            "filesystem": {"deny": denied_paths, "write": if writer { vec!["<worktree>"] } else { vec![] },
+            "filesystem": {"deny": denied_paths, "write": ["<worktree>"],
                 "read": &scope.executable_read, "temporary_directories": "read-only"},
         },
         "executable_read_exception": scope.executable_read.as_deref()
@@ -945,7 +936,13 @@ fn inspect_native_compatibility(
 fn native_version_supported(version: &str, launch_mode: NativeLaunchMode) -> bool {
     match launch_mode {
         NativeLaunchMode::ConversationStdio => version == super::codex_app_server::EXACT_VERSION,
-        NativeLaunchMode::InteractiveStandalone | NativeLaunchMode::ObservationExec => {
+        NativeLaunchMode::InteractiveStandalone => [
+            EXACT_CODEX_VERSION,
+            SINGLE_AGENT_QUALIFICATION_VERSION,
+            CURRENT_SINGLE_AGENT_VERSION,
+        ]
+        .contains(&version),
+        NativeLaunchMode::ObservationExec => {
             [EXACT_CODEX_VERSION, SINGLE_AGENT_QUALIFICATION_VERSION].contains(&version)
         }
     }
@@ -1205,66 +1202,6 @@ pub fn inspect_observation_account(
         authentication: format!("chatgpt_{}", compatibility.account.plan),
         config_identity: compatibility.identity,
     })
-}
-
-/// Candidate arguments for the provider-observation contract: one ephemeral
-/// turn ignoring user configuration and rules in the empty read-only scope,
-/// no shell or exec tool, approvals, hooks, configured MCP servers or excluded
-/// features, and no role environment. Whether the pinned build then exposes no
-/// tool at all is unproven until native qualification.
-pub(crate) fn observation_arguments(
-    model: &str,
-    effort: &str,
-    scope: &Path,
-    prompt: &str,
-) -> Result<Vec<String>> {
-    let compatibility = inspect_native_compatibility(
-        scope,
-        EXACT_CODEX_VERSION,
-        NativeUserConfig::Ignore,
-        NativeLaunchMode::ObservationExec,
-    )?;
-    let mut arguments = vec![
-        "exec".to_owned(),
-        "--strict-config".to_owned(),
-        "--ephemeral".to_owned(),
-        "--ignore-user-config".to_owned(),
-        "--ignore-rules".to_owned(),
-        "--skip-git-repo-check".to_owned(),
-        "--cd".to_owned(),
-        scope.to_string_lossy().into_owned(),
-        "--model".to_owned(),
-        model.to_owned(),
-        "--sandbox".to_owned(),
-        "read-only".to_owned(),
-        "--config".to_owned(),
-        "approval_policy=\"never\"".to_owned(),
-        "--config".to_owned(),
-        format!("model_reasoning_effort={}", toml_string(effort)?),
-        "--config".to_owned(),
-        "cli_auth_credentials_store=\"file\"".to_owned(),
-        "--config".to_owned(),
-        "features.hooks=false".to_owned(),
-        "--config".to_owned(),
-        "features.multi_agent=false".to_owned(),
-        "--config".to_owned(),
-        "features.multi_agent_v2=false".to_owned(),
-        "--config".to_owned(),
-        "web_search=\"disabled\"".to_owned(),
-        "--config".to_owned(),
-        "project_doc_max_bytes=0".to_owned(),
-        "--config".to_owned(),
-        "features.skip_host_skill_discovery=true".to_owned(),
-    ];
-    for feature in DISABLED_FEATURES.iter().chain(OBSERVATION_DISABLED_TOOLS) {
-        arguments.extend(["--disable".to_owned(), (*feature).to_owned()]);
-    }
-    arguments.extend([
-        "--config".to_owned(),
-        mcp_servers_override(&compatibility.disabled_mcp_servers)?,
-        prompt.to_owned(),
-    ]);
-    Ok(arguments)
 }
 
 fn require_local_executor_home(codex_home: &Path) -> Result<()> {
@@ -1663,24 +1600,24 @@ mod executor_environment_tests {
 
     #[test]
     fn conversation_version_gate_preserves_existing_launch_modes() {
-        for (version, conversation, existing) in [
-            ("codex-cli 0.162.1", false, true),
-            ("codex-cli 0.166.0", false, true),
-            ("codex-cli 0.167.0", true, false),
-            ("codex-cli 0.167.1", false, false),
-            ("codex-cli 0.168.0", false, false),
-            ("0.167.0", false, false),
+        for (version, conversation, standalone, observation) in [
+            ("codex-cli 0.162.1", false, true, true),
+            ("codex-cli 0.166.0", false, true, true),
+            ("codex-cli 0.167.0", true, true, false),
+            ("codex-cli 0.167.1", false, false, false),
+            ("codex-cli 0.168.0", false, false, false),
+            ("0.167.0", false, false, false),
         ] {
             assert_eq!(
                 native_version_supported(version, NativeLaunchMode::ConversationStdio),
                 conversation,
                 "conversation version {version}"
             );
-            for mode in [
-                NativeLaunchMode::InteractiveStandalone,
-                NativeLaunchMode::ObservationExec,
+            for (mode, expected) in [
+                (NativeLaunchMode::InteractiveStandalone, standalone),
+                (NativeLaunchMode::ObservationExec, observation),
             ] {
-                assert_eq!(native_version_supported(version, mode), existing);
+                assert_eq!(native_version_supported(version, mode), expected);
                 if version != EXACT_CODEX_VERSION {
                     let error = inspect_native_compatibility(
                         Path::new("/"),

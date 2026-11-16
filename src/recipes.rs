@@ -139,11 +139,66 @@ fn current_version(
 
 pub(crate) fn apply_command(
     tx: &Transaction<'_>,
+    _bundles: &crate::provider_compatibility::BundleSet,
     command: &HumanCommand,
     now: &str,
 ) -> Result<OperationResult> {
     let operation = command.operation_id();
     match command {
+        HumanCommand::RequestRecipeScheduleOccurrenceStop { intent, .. } => {
+            visible_project(tx, &intent.project_id)?;
+            if schedule_occurrence_stop_intent_in(tx, &intent.occurrence_id)?.as_ref()
+                != Some(intent)
+            {
+                bail!("The occurrence changed; refresh before stopping the current run")
+            }
+            persist_schedule_stop_intent_in(
+                tx,
+                &intent.occurrence_id,
+                "Stop current occurrence requested",
+                now,
+            )?;
+            snapshot_schedule_stop_targets_in(tx, &intent.occurrence_id, now)?;
+            let mut result = outcome(
+                operation,
+                "recipe_schedule_occurrence",
+                intent.occurrence_id.clone(),
+                intent.expected_version,
+                "stop_requested",
+            );
+            result.detail = json!({"intent":intent});
+            Ok(result)
+        }
+        HumanCommand::StopRecipeScheduleOccurrence {
+            project_id,
+            schedule_id,
+            expected_version,
+            binding,
+            ..
+        } => {
+            let current: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM recipe_schedules s JOIN recipe_schedule_fires f ON f.schedule_id=s.id
+                 WHERE s.id=?1 AND s.project_id=?2 AND s.version=?3 AND f.id=?4)",
+                params![schedule_id,project_id,expected_version,binding.occurrence_id], |row| row.get(0),
+            )?;
+            if !current
+                || schedule_stop_binding_in(tx, &binding.occurrence_id)?.as_ref() != Some(binding)
+            {
+                bail!("The occurrence changed; refresh before stopping the current run")
+            }
+            persist_schedule_stop_in(tx, binding, "Stop current occurrence requested", now)?;
+            Ok(OperationResult {
+                operation_id: operation.into(),
+                entity_kind: "recipe_schedule_occurrence".into(),
+                entity_id: binding.occurrence_id.clone(),
+                version: Some(*expected_version),
+                state: "stop_requested".into(),
+                detail: json!({"binding":binding}),
+            })
+        }
+        HumanCommand::AuthorizeRecipeScheduleExecution { .. } => {
+            bail!("Automatic recipe execution has been retired. Create a draft schedule instead.")
+        }
         HumanCommand::UpsertSingleAgentRecipe {
             project_id,
             recipe_id,
@@ -185,7 +240,7 @@ pub(crate) fn apply_command(
             let revision_id = uuid::Uuid::new_v4().to_string();
             tx.execute("INSERT INTO task_recipe_revisions(id,recipe_id,revision,title,description,acceptance_criteria_json,priority,required_check_ids_json,configuration_hash,workflow_version,workflow_hash,created_at,family,preset,definition_id,execution_config_revision_id,primary_profile_revision_id,primary_profile_hash,reviewer_profile_revision_id,reviewer_profile_hash)
                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'single_agent',?13,?14,?15,?16,?17,?18,?19)",
-                params![revision_id,id,revision,recipe.title.trim(),recipe.description,serde_json::to_string(&recipe.acceptance_criteria)?,recipe.priority,serde_json::to_string(&selection.check_ids)?,config_hash,crate::workflow_resources::single_agent_definition(selection.preset).version,definition.1,now,selection.preset.as_str(),definition.0,selection.execution_config_revision_id,selection.profile_revision_id,primary_hash,selection.reviewer_profile_revision_id,reviewer_hash])?;
+                params![revision_id,id,revision,recipe.title.trim(),recipe.description,serde_json::to_string(&recipe.acceptance_criteria)?,recipe.priority,serde_json::to_string(&selection.check_ids)?,config_hash,crate::workflow_resources::single_agent_definition(selection.preset)?.version,definition.1,now,selection.preset.as_str(),definition.0,selection.execution_config_revision_id,selection.profile_revision_id,primary_hash,selection.reviewer_profile_revision_id,reviewer_hash])?;
             let mut result = outcome(operation, "recipe", id, version, "saved");
             result.detail = json!({"revision_id":revision_id,"revision":revision});
             Ok(result)
@@ -370,6 +425,16 @@ pub(crate) fn apply_command(
             anchor_utc,
             ..
         } => {
+            if let Some(id) = schedule_id {
+                let mode: String = tx.query_row(
+                    "SELECT mode FROM recipe_schedules WHERE id=?1 AND project_id=?2",
+                    params![id, project_id],
+                    |row| row.get(0),
+                )?;
+                if mode != "create_draft" {
+                    bail!("This automatic schedule is retired. Create a new draft schedule.")
+                }
+            }
             visible_project(tx, project_id)?;
             bounded(name, "schedule name", 100)?;
             let anchor = parse_utc(anchor_utc)?;
@@ -408,6 +473,21 @@ pub(crate) fn apply_command(
             if schedule_id.is_none() {
                 tx.execute("INSERT INTO recipe_schedules(id,project_id,name,recipe_revision_id,cadence,anchor_utc,next_fire_utc,paused,version,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,NULL,1,1,?7,?7)", params![id,project_id,name.trim(),recipe_revision_id,cadence,anchor_utc,now])?;
             } else {
+                let executing: bool = tx.query_row(
+                    "SELECT mode IN ('run_authorized_research','run_authorized_recipe') FROM recipe_schedules WHERE id=?1",
+                    [&id],
+                    |row| row.get(0),
+                )?;
+                if executing {
+                    hold_waiting_occurrences(
+                        tx,
+                        &id,
+                        "Schedule edited; authorize future runs again",
+                    )?;
+                    tx.execute("UPDATE recipe_schedules SET mode='create_draft',active_authorization_id=NULL,paused=1,next_fire_utc=NULL WHERE id=?1", [&id])?;
+                    tx.execute("UPDATE recipe_schedules SET name=?1,recipe_revision_id=?2,cadence=?3,anchor_utc=?4,version=version+1,updated_at=?5 WHERE id=?6", params![name.trim(),recipe_revision_id,cadence,anchor_utc,now,id])?;
+                    return Ok(outcome(operation, "recipe_schedule", id, version, "paused"));
+                }
                 tx.execute("UPDATE recipe_schedules SET name=?1,recipe_revision_id=?2,cadence=?3,anchor_utc=?4,next_fire_utc=?5,paused=?6,version=version+1,updated_at=?7 WHERE id=?8", params![name.trim(),recipe_revision_id,cadence,anchor_utc,next_fire,paused,now,id])?;
             }
             Ok(outcome(
@@ -440,6 +520,11 @@ pub(crate) fn apply_command(
             if changed != 1 {
                 bail!("schedule version is stale or already paused or archived")
             }
+            hold_waiting_occurrences(
+                tx,
+                schedule_id,
+                "Future runs paused; this occurrence requires fresh future authorization",
+            )?;
             Ok(outcome(
                 operation,
                 "recipe_schedule",
@@ -455,6 +540,12 @@ pub(crate) fn apply_command(
             ..
         } => {
             visible_project(tx, project_id)?;
+            let execution_mode: bool = tx.query_row("SELECT mode IN ('run_authorized_research','run_authorized_recipe') FROM recipe_schedules WHERE id=?1 AND project_id=?2", params![schedule_id,project_id], |row| row.get(0))?;
+            if execution_mode {
+                bail!(
+                    "Automatic recipe execution has been retired. Create a draft schedule instead."
+                )
+            }
             let (anchor, cadence, revision_id): (String,String,String) = tx.query_row("SELECT anchor_utc,cadence,recipe_revision_id FROM recipe_schedules WHERE id=?1 AND project_id=?2 AND version=?3 AND archived_at IS NULL AND paused=1", params![schedule_id,project_id,expected_version], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?.ok_or_else(||anyhow!("schedule version is stale or not paused"))?;
             require_recipe_revision(tx, project_id, &revision_id)?;
             if let Some(reason) = fire_ineligible(tx, project_id, &revision_id)? {
@@ -477,11 +568,642 @@ pub(crate) fn apply_command(
     }
 }
 
+fn hold_waiting_occurrences(connection: &Connection, schedule: &str, reason: &str) -> Result<()> {
+    let occurrences = {
+        let mut statement = connection.prepare(
+            "SELECT id FROM recipe_schedule_fires WHERE schedule_id=?1 AND authorization_id IS NOT NULL",
+        )?;
+        let rows = statement
+            .query_map([schedule], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for occurrence in occurrences {
+        crate::permissions::invalidate_schedule_in(
+            connection,
+            &occurrence,
+            reason,
+            &Utc::now().to_rfc3339(),
+        )?;
+    }
+    connection.execute("UPDATE recipe_schedule_fires SET outcome='held',reason=?1
+        WHERE schedule_id=?2 AND authorization_id IS NOT NULL AND outcome='waiting' AND invocations_spent=0",
+        params![reason,schedule])?;
+    Ok(())
+}
+
+impl Store {
+    pub fn recipe_schedule_execution_preview(
+        &self,
+        request: &crate::domain::RecipeSchedulePreviewRequest,
+    ) -> Result<crate::domain::RecipeScheduleExecutionPreview> {
+        let connection = self.lock()?;
+        schedule_execution_preview_in(&connection, &self.compatibility_bundles, request)
+    }
+}
+
+fn schedule_execution_preview_in(
+    _connection: &Connection,
+    _bundles: &crate::provider_compatibility::BundleSet,
+    _request: &crate::domain::RecipeSchedulePreviewRequest,
+) -> Result<crate::domain::RecipeScheduleExecutionPreview> {
+    bail!("Automatic recipe execution has been retired. Create a draft schedule instead.")
+}
+
+// Ancestry inventories uncertainty only. Every returned member must independently
+// satisfy the immutable root/receipt predicate before it can authorize an effect.
+fn schedule_member_candidates_in(connection: &Connection, occurrence: &str) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "WITH RECURSIVE lineage(id) AS (
+           SELECT attempt_id FROM recipe_schedule_fires WHERE id=?1 AND attempt_id IS NOT NULL
+           UNION SELECT a.id FROM attempts a JOIN lineage p ON a.parent_attempt_id=p.id)
+         SELECT id FROM lineage UNION SELECT g.attempt_id FROM sessions s
+           JOIN role_generations g ON g.id=s.role_generation_id WHERE s.schedule_occurrence_id=?1",
+    )?;
+    let members = statement
+        .query_map([occurrence], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(members)
+}
+
+pub(crate) fn schedule_members_in(
+    connection: &Connection,
+    occurrence: &str,
+) -> Result<Vec<String>> {
+    let members = schedule_member_candidates_in(connection, occurrence)?;
+    for member in &members {
+        if !schedule_attempt_member_in(connection, occurrence, member)? {
+            bail!("An unrecognized scheduled descendant requires recovery; no process authority can be inferred")
+        }
+    }
+    Ok(members)
+}
+
+fn schedule_occurrence_stop_intent_in(
+    connection: &Connection,
+    occurrence: &str,
+) -> Result<Option<crate::domain::ScheduleOccurrenceStopIntent>> {
+    connection
+        .query_row(
+            "SELECT s.project_id,s.id,s.version,f.id,a.id
+         FROM recipe_schedule_fires f JOIN recipe_schedules s ON s.id=f.schedule_id
+         JOIN recipe_schedule_authorizations a ON a.id=f.authorization_id
+           AND a.schedule_id=s.id AND a.project_id=s.project_id
+           AND a.recipe_revision_id=f.recipe_revision_id
+         JOIN projects p ON p.id=s.project_id AND p.internal_purpose IS NULL
+         WHERE f.id=?1 AND f.allowance_reserved=1 AND f.stop_requested_at IS NULL
+           AND f.outcome IN ('waiting','reserved','running','recovery_required')
+           AND a.restore_invalidated_at IS NULL
+           AND NOT EXISTS(SELECT 1 FROM recovery_records
+             WHERE id='database-restore-hold' AND state='attention_required')",
+            [occurrence],
+            |row| {
+                Ok(crate::domain::ScheduleOccurrenceStopIntent {
+                    project_id: row.get(0)?,
+                    schedule_id: row.get(1)?,
+                    expected_version: row.get(2)?,
+                    occurrence_id: row.get(3)?,
+                    authorization_id: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+pub(crate) fn persist_schedule_stop_intent_in(
+    tx: &Transaction<'_>,
+    occurrence: &str,
+    reason: &str,
+    now: &str,
+) -> Result<()> {
+    let changed = tx.execute(
+        "UPDATE recipe_schedule_fires SET outcome='stop_requested',
+           stop_requested_at=COALESCE(stop_requested_at,?1),stop_reason=COALESCE(stop_reason,?2)
+         WHERE id=?3 AND authorization_id IS NOT NULL AND allowance_reserved=1
+           AND outcome NOT IN ('held','missed','finished')
+           AND EXISTS(SELECT 1 FROM recipe_schedule_authorizations a WHERE a.id=authorization_id
+             AND a.restore_invalidated_at IS NULL)",
+        params![now, reason, occurrence],
+    )?;
+    if changed != 1 {
+        bail!("The occurrence cannot acquire stop authority; retain its recovery fence")
+    }
+    crate::permissions::invalidate_schedule_in(tx, occurrence, reason, now)?;
+    // Readiness is fenced in the same transaction as intent, including null-root waiting work.
+    tx.execute(
+        "UPDATE tasks SET lifecycle='cancelled',version=version+1,updated_at=?1
+        WHERE id=(SELECT task_id FROM recipe_schedule_fires WHERE id=?2 AND attempt_id IS NULL)
+          AND lifecycle IN ('backlog','draft','ready')",
+        params![now, occurrence],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn snapshot_schedule_stop_targets_in(
+    tx: &Transaction<'_>,
+    occurrence: &str,
+    now: &str,
+) -> Result<Vec<crate::domain::ScheduleNativeStopTarget>> {
+    let members = schedule_member_candidates_in(tx, occurrence)?;
+    for attempt in members {
+        match schedule_attempt_member_in(tx, occurrence, &attempt) {
+            Ok(true) => {}
+            evidence => {
+                tx.execute("UPDATE recipe_schedule_fires SET outcome='recovery_required',reason=?1 WHERE id=?2",
+                    params![format!("Unrecognized occurrence member cannot authorize a stop target: {evidence:?}"),occurrence])?;
+                continue;
+            }
+        }
+        let mut statement = tx.prepare(
+            "SELECT s.id,s.role_generation_id,s.transcript_epoch,r.id,
+                CASE WHEN s.launch_state='reserved' THEN NULL WHEN s.resume_count>0 THEN r.process_identity_json ELSE s.process_identity_json END,
+                s.schedule_authorization_id
+             FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+             LEFT JOIN resume_invocations r ON r.session_id=s.id AND r.transcript_epoch=s.transcript_epoch
+             WHERE g.attempt_id=?1 AND s.schedule_occurrence_id=?2
+               AND NOT (s.status='launch_failed' OR (s.status='exited'
+                 AND COALESCE(json_extract(s.exit_json,'$.process_group_quiescent'),0)=1))",
+        )?;
+        let sessions = statement
+            .query_map(params![attempt, occurrence], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for (session, generation, epoch, resume, process, grant) in sessions {
+            tx.execute("INSERT INTO recipe_schedule_stop_targets(id,occurrence_id,authorization_id,attempt_id,
+                target_kind,session_id,role_generation_id,resume_invocation_id,transcript_epoch,process_identity_json,created_at,observed_at)
+                VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11) ON CONFLICT DO NOTHING",
+                params![uuid::Uuid::new_v4().to_string(),occurrence,grant,attempt,
+                    if resume.is_some() { "resume" } else { "session" },session,generation,resume,epoch,process,now])?;
+        }
+        tx.execute("INSERT INTO recipe_schedule_stop_targets(id,occurrence_id,authorization_id,attempt_id,
+            target_kind,session_id,role_generation_id,resume_invocation_id,transcript_epoch,process_identity_json,created_at,observed_at)
+            SELECT lower(hex(randomblob(16))),?2,r.schedule_authorization_id,?1,'resume',s.id,s.role_generation_id,r.id,
+              r.transcript_epoch,r.process_identity_json,?3,?3 FROM resume_invocations r
+            JOIN sessions s ON s.id=r.session_id JOIN role_generations g ON g.id=s.role_generation_id
+            WHERE g.attempt_id=?1 AND r.schedule_occurrence_id=?2 AND r.transcript_epoch!=s.transcript_epoch
+              AND r.state NOT IN ('exited','proven_nondelivery') ON CONFLICT DO NOTHING",params![attempt,occurrence,now])?;
+        tx.execute("INSERT INTO recipe_schedule_stop_targets(id,occurrence_id,authorization_id,attempt_id,
+            target_kind,check_run_id,process_identity_json,created_at,observed_at)
+            SELECT lower(hex(randomblob(16))),f.id,f.authorization_id,c.attempt_id,'check',c.id,c.recovery_anchor_json,?3,?3
+            FROM check_runs c JOIN recipe_schedule_fires f ON f.id=?2 WHERE c.attempt_id=?1
+              AND c.status IN ('launch_reserved','running','recovery_required','launch_ambiguous')
+            ON CONFLICT DO NOTHING", params![attempt,occurrence,now])?;
+    }
+    // A null target owns an invocation, but grants no signal authority. Bind only
+    // its exact durable publication, including one that exited before this pass.
+    let pending = {
+        let mut statement = tx.prepare("SELECT target.id,target.attempt_id,
+            CASE target.target_kind WHEN 'check' THEN c.recovery_anchor_json
+              WHEN 'resume' THEN r.process_identity_json ELSE s.process_identity_json END
+            FROM recipe_schedule_stop_targets target
+            JOIN recipe_schedule_fires f ON f.id=target.occurrence_id
+            JOIN recipe_schedule_authorizations a ON a.id=f.authorization_id
+            LEFT JOIN sessions s ON s.id=target.session_id
+            LEFT JOIN role_generations g ON g.id=s.role_generation_id
+            LEFT JOIN resume_invocations r ON r.id=target.resume_invocation_id
+            LEFT JOIN check_runs c ON c.id=target.check_run_id
+            WHERE target.occurrence_id=?1 AND target.process_identity_json IS NULL
+              AND target.status!='quiescent' AND target.restore_invalidated_at IS NULL
+              AND a.restore_invalidated_at IS NULL AND f.authorization_id=target.authorization_id
+              AND f.stop_requested_at IS NOT NULL AND f.outcome IN ('stop_requested','recovery_required')
+              AND ((target.target_kind='check' AND c.attempt_id=target.attempt_id
+                    AND c.recovery_anchor_json IS NOT NULL)
+                OR (s.role_generation_id=target.role_generation_id AND g.attempt_id=target.attempt_id
+                  AND s.schedule_occurrence_id=f.id AND s.schedule_authorization_id=a.id
+                  AND s.transcript_epoch=target.transcript_epoch
+                  AND ((target.target_kind='session' AND s.resume_count=0
+                        AND s.launch_state!='reserved' AND s.process_identity_json IS NOT NULL)
+                    OR (target.target_kind='resume' AND r.session_id=s.id
+                      AND r.transcript_epoch=s.transcript_epoch AND r.state!='reserved'
+                      AND r.schedule_occurrence_id=f.id AND r.schedule_authorization_id=a.id
+                      AND r.process_identity_json IS NOT NULL))))")?;
+        let rows = statement
+            .query_map([occurrence], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (target, attempt, identity) in pending {
+        if schedule_attempt_member_in(tx, occurrence, &attempt)? {
+            tx.execute(
+                "UPDATE recipe_schedule_stop_targets SET process_identity_json=?1,observed_at=?2
+                WHERE id=?3 AND process_identity_json IS NULL",
+                params![identity, now, target],
+            )?;
+        }
+    }
+    tx.execute("UPDATE recipe_schedule_stop_targets SET status='quiescent',observed_at=?2
+        WHERE occurrence_id=?1 AND target_kind='check' AND restore_invalidated_at IS NULL
+          AND EXISTS(SELECT 1 FROM check_runs c WHERE c.id=check_run_id AND c.attempt_id=recipe_schedule_stop_targets.attempt_id
+            AND c.status NOT IN ('launch_reserved','running','recovery_required','launch_ambiguous')
+            AND COALESCE(json_extract(c.evidence_json,'$.capture_incomplete'),0)=0
+            AND c.recovery_anchor_json IS recipe_schedule_stop_targets.process_identity_json)",params![occurrence,now])?;
+    let mut statement = tx.prepare("SELECT id,authorization_id,attempt_id,session_id,role_generation_id,
+        transcript_epoch,resume_invocation_id,process_identity_json FROM recipe_schedule_stop_targets
+        WHERE occurrence_id=?1 AND target_kind IN ('session','resume') AND status!='quiescent'
+          AND restore_invalidated_at IS NULL ORDER BY created_at,id")?;
+    let rows = statement
+        .query_map([occurrence], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(
+            |(
+                id,
+                authorization_id,
+                attempt_id,
+                session_id,
+                role_generation_id,
+                transcript_epoch,
+                resume_invocation_id,
+                process,
+            )| {
+                Ok(crate::domain::ScheduleNativeStopTarget {
+                    id,
+                    binding: crate::domain::ScheduleStopBinding {
+                        occurrence_id: occurrence.into(),
+                        authorization_id,
+                        attempt_id,
+                        session_id,
+                        role_generation_id,
+                        transcript_epoch,
+                        resume_invocation_id,
+                        process: process
+                            .map(|value| serde_json::from_str(&value))
+                            .transpose()?,
+                    },
+                })
+            },
+        )
+        .collect()
+}
+
+pub(crate) fn schedule_native_target_quiescent_in(
+    connection: &Connection,
+    binding: &crate::domain::ScheduleStopBinding,
+) -> Result<bool> {
+    if !schedule_stop_is_current_in(connection, binding)? {
+        return Ok(false);
+    }
+    Ok(connection.query_row(
+        "SELECT status='launch_failed' OR (status='exited'
+        AND COALESCE(json_extract(exit_json,'$.process_group_quiescent'),0)=1)
+        FROM sessions WHERE id=?1 AND transcript_epoch=?2",
+        params![binding.session_id, binding.transcript_epoch],
+        |row| row.get(0),
+    )?)
+}
+
+pub(crate) fn schedule_occurrence_quiescence_in(
+    connection: &Connection,
+    occurrence: &str,
+    stopping: bool,
+) -> Result<()> {
+    for attempt in schedule_members_in(connection, occurrence)? {
+        crate::workflow::single_agent_quiescence(connection, &attempt)?;
+        crate::operations::require_schedule_member_effects_quiescent_in(connection, &attempt)?;
+        let pending: bool = connection.query_row("SELECT
+            EXISTS(SELECT 1 FROM rework_intents WHERE (parent_attempt_id=?1 OR new_attempt_id=?1)
+              AND state NOT IN ('completed','cancelled'))
+            OR EXISTS(SELECT 1 FROM single_agent_review_deliveries WHERE attempt_id=?1
+              AND state IN ('reserved','materializing','ready','launched'))
+            OR EXISTS(SELECT 1 FROM workspaces WHERE attempt_id=?1
+              AND state IN ('reserved','unknown','recovery_required'))
+            OR EXISTS(SELECT 1 FROM attempts WHERE id=?1 AND status IN ('workspace_reserved','materialization_pending','needs_recovery'))
+            OR (?2=0 AND EXISTS(SELECT 1 FROM workflow_result_bindings WHERE attempt_id=?1
+              AND state IN ('awaiting_checks','awaiting_review','review_running','review_changes_requested')))
+            OR (?2=1 AND EXISTS(SELECT 1 FROM claims WHERE attempt_id=?1
+              AND state IN ('reserved','launching','running','unknown','stopping')))",
+            params![attempt,stopping], |row| row.get(0))?;
+        if pending {
+            bail!("Occurrence preparation, transition, or workspace ownership has not settled")
+        }
+    }
+    let unbound: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM recipe_schedule_fires f
+        JOIN attempts a ON a.task_id=f.task_id WHERE f.id=?1 AND f.attempt_id IS NULL)",
+        [occurrence],
+        |row| row.get(0),
+    )?;
+    if unbound {
+        bail!("Waiting occurrence has unexpected attempt ownership; recovery is required")
+    }
+    Ok(())
+}
+
+pub(crate) fn schedule_stop_binding_in(
+    connection: &Connection,
+    occurrence: &str,
+) -> Result<Option<crate::domain::ScheduleStopBinding>> {
+    let frozen: Option<String> = connection
+        .query_row(
+            "SELECT stop_process_identity_json FROM recipe_schedule_fires WHERE id=?1",
+            [occurrence],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    if let Some(frozen) = frozen {
+        return Ok(Some(serde_json::from_str(&frozen)?));
+    }
+    let binding = connection.query_row(
+        "SELECT f.authorization_id,f.attempt_id,s.id,s.role_generation_id,s.transcript_epoch,
+                CASE WHEN s.launch_state='reserved' THEN NULL WHEN s.resume_count>0 THEN r.process_identity_json ELSE s.process_identity_json END,
+                r.id FROM recipe_schedule_fires f JOIN role_generations g ON g.attempt_id=f.attempt_id
+         JOIN sessions s ON s.role_generation_id=g.id AND s.schedule_occurrence_id=f.id
+         LEFT JOIN resume_invocations r ON r.session_id=s.id AND r.transcript_epoch=s.transcript_epoch
+         WHERE f.id=?1 AND f.invocations_spent>0
+           AND (f.stop_session_id IS NULL OR (f.stop_session_id=s.id
+             AND f.stop_transcript_epoch=s.transcript_epoch AND f.stop_resume_invocation_id IS r.id))
+         ORDER BY s.created_at DESC LIMIT 1", [occurrence],
+        |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,
+            row.get::<_,String>(4)?,row.get::<_,Option<String>>(5)?,row.get::<_,Option<String>>(6)?)),
+    ).optional()?;
+    binding
+        .map(
+            |(
+                authorization_id,
+                attempt_id,
+                session_id,
+                role_generation_id,
+                transcript_epoch,
+                process,
+                resume_invocation_id,
+            )| {
+                Ok(crate::domain::ScheduleStopBinding {
+                    occurrence_id: occurrence.into(),
+                    authorization_id,
+                    attempt_id,
+                    session_id,
+                    resume_invocation_id,
+                    role_generation_id,
+                    transcript_epoch,
+                    process: process
+                        .map(|value| serde_json::from_str(&value))
+                        .transpose()?,
+                })
+            },
+        )
+        .transpose()
+}
+
+pub(crate) fn persist_schedule_stop_in(
+    tx: &Transaction<'_>,
+    binding: &crate::domain::ScheduleStopBinding,
+    reason: &str,
+    now: &str,
+) -> Result<()> {
+    let valid: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM recipe_schedule_fires f JOIN recipe_schedule_authorizations a ON a.id=f.authorization_id
+         WHERE f.id=?1 AND a.id=?2 AND f.attempt_id=?3 AND a.restore_invalidated_at IS NULL)",
+        params![binding.occurrence_id,binding.authorization_id,binding.attempt_id], |row| row.get(0),
+    )?;
+    if !valid {
+        bail!("Restored or changed schedule authority cannot authorize process signals")
+    }
+    let stopping: bool = tx.query_row(
+        "SELECT stop_session_id IS NOT NULL FROM recipe_schedule_fires WHERE id=?1",
+        [&binding.occurrence_id],
+        |row| row.get(0),
+    )?;
+    if stopping && !schedule_stop_is_current_in(tx, binding)? {
+        bail!("The immutable scheduled stop belongs to an earlier invocation identity")
+    }
+    tx.execute(
+        "UPDATE recipe_schedule_fires SET outcome='stop_requested',
+           stop_requested_at=COALESCE(stop_requested_at,?1),stop_reason=COALESCE(stop_reason,?2),
+           stop_session_id=COALESCE(stop_session_id,?3),stop_resume_invocation_id=COALESCE(stop_resume_invocation_id,?4),
+           stop_transcript_epoch=COALESCE(stop_transcript_epoch,?5),
+           stop_process_identity_json=COALESCE(stop_process_identity_json,?6)
+         WHERE id=?7 AND outcome NOT IN ('held','missed','finished')",
+        params![now,reason,binding.session_id,binding.resume_invocation_id,binding.transcript_epoch,
+            if binding.process.is_some() { Some(serde_json::to_string(binding)?) } else { None },binding.occurrence_id],
+    )?;
+    crate::permissions::invalidate_schedule_in(tx, &binding.occurrence_id, reason, now)?;
+    Ok(())
+}
+
+pub(crate) fn schedule_stop_is_current_in(
+    connection: &Connection,
+    binding: &crate::domain::ScheduleStopBinding,
+) -> Result<bool> {
+    let target: Option<(Option<String>,Option<String>)> = connection.query_row(
+        "SELECT target.process_identity_json,
+           CASE WHEN target.target_kind='resume' THEN r.process_identity_json
+             WHEN s.launch_state='reserved' THEN NULL ELSE s.process_identity_json END
+         FROM recipe_schedule_stop_targets target
+         JOIN recipe_schedule_fires f ON f.id=target.occurrence_id
+         JOIN recipe_schedule_authorizations a ON a.id=f.authorization_id
+         JOIN sessions s ON s.id=target.session_id JOIN role_generations g ON g.id=s.role_generation_id
+         LEFT JOIN resume_invocations r ON r.id=target.resume_invocation_id
+         WHERE target.occurrence_id=?1 AND target.authorization_id=?2 AND target.attempt_id=?3
+           AND target.session_id=?4 AND target.role_generation_id=?5 AND target.transcript_epoch=?6
+           AND target.resume_invocation_id IS ?7
+           AND target.restore_invalidated_at IS NULL AND a.restore_invalidated_at IS NULL
+           AND f.authorization_id=target.authorization_id AND f.stop_requested_at IS NOT NULL
+           AND f.outcome IN ('stop_requested','recovery_required') AND g.attempt_id=target.attempt_id
+           AND s.schedule_occurrence_id=f.id AND s.schedule_authorization_id=a.id
+           AND s.transcript_epoch=target.transcript_epoch AND s.role_generation_id=target.role_generation_id
+           AND ((target.target_kind='session' AND s.resume_count=0)
+             OR (target.target_kind='resume' AND r.session_id=s.id AND r.transcript_epoch=s.transcript_epoch
+                 AND r.schedule_occurrence_id=f.id AND r.schedule_authorization_id=a.id
+                 ))",
+        params![binding.occurrence_id,binding.authorization_id,binding.attempt_id,binding.session_id,
+            binding.role_generation_id,binding.transcript_epoch,binding.resume_invocation_id],
+        |row|Ok((row.get(0)?,row.get(1)?)),
+    ).optional()?;
+    if let Some((frozen, current)) = target {
+        let parse = |value: Option<String>| -> Result<Option<crate::domain::ProcessIdentity>> {
+            Ok(value.map(|text| serde_json::from_str(&text)).transpose()?)
+        };
+        return Ok(parse(frozen)? == binding.process
+            && parse(current)? == binding.process
+            && schedule_attempt_member_in(
+                connection,
+                &binding.occurrence_id,
+                &binding.attempt_id,
+            )?);
+    }
+    // A known expanded target that failed exact validation cannot fall back to
+    // the legacy root binding, including after target-only restore invalidation.
+    let known: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM recipe_schedule_stop_targets
+        WHERE occurrence_id=?1 AND session_id=?2 AND transcript_epoch=?3)",
+        params![
+            binding.occurrence_id,
+            binding.session_id,
+            binding.transcript_epoch
+        ],
+        |row| row.get(0),
+    )?;
+    if known {
+        return Ok(false);
+    }
+    let current: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM recipe_schedule_fires f JOIN recipe_schedule_authorizations a ON a.id=f.authorization_id
+         JOIN sessions s ON s.id=f.stop_session_id JOIN role_generations g ON g.id=s.role_generation_id
+         WHERE f.id=?1 AND f.authorization_id=?2 AND f.attempt_id=?3 AND s.id=?4
+           AND g.id=?5 AND s.transcript_epoch=?6 AND s.schedule_occurrence_id=f.id
+           AND s.schedule_authorization_id=a.id AND g.attempt_id=f.attempt_id
+           AND f.stop_transcript_epoch=s.transcript_epoch AND f.stop_resume_invocation_id IS ?7
+           AND f.stop_requested_at IS NOT NULL AND a.restore_invalidated_at IS NULL
+           AND f.outcome IN ('stop_requested','recovery_required')
+           AND (?7 IS NULL OR EXISTS(SELECT 1 FROM resume_invocations r WHERE r.id=?7
+             AND r.session_id=s.id AND r.transcript_epoch=s.transcript_epoch AND r.schedule_occurrence_id=f.id)))",
+        params![binding.occurrence_id,binding.authorization_id,binding.attempt_id,binding.session_id,
+            binding.role_generation_id,binding.transcript_epoch,binding.resume_invocation_id], |row| row.get(0),
+    )?;
+    if !current {
+        return Ok(false);
+    }
+    let process: Option<String> = connection.query_row(
+        "SELECT CASE WHEN s.launch_state='reserved' THEN NULL WHEN s.resume_count>0 THEN r.process_identity_json ELSE s.process_identity_json END
+         FROM sessions s LEFT JOIN resume_invocations r ON r.session_id=s.id AND r.transcript_epoch=s.transcript_epoch WHERE s.id=?1",
+        [&binding.session_id], |row| row.get(0))?;
+    Ok(process
+        .map(|value| serde_json::from_str::<crate::domain::ProcessIdentity>(&value))
+        .transpose()?
+        == binding.process)
+}
+
+pub(crate) fn schedule_attempt_member_in(
+    connection: &Connection,
+    occurrence: &str,
+    attempt: &str,
+) -> Result<bool> {
+    let frozen: Option<(String, String, String, String, String)> = connection
+        .query_row(
+            "SELECT a.project_id,f.task_id,f.attempt_id,a.scope_json,a.scope_hash
+         FROM recipe_schedule_fires f JOIN recipe_schedule_authorizations a
+           ON a.id=f.authorization_id AND a.schedule_id=f.schedule_id
+         JOIN tasks t ON t.id=f.task_id AND t.project_id=a.project_id
+         WHERE f.id=?1 AND f.attempt_id IS NOT NULL",
+            [occurrence],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((project, task, root, scope, hash)) = frozen else {
+        return Ok(false);
+    };
+    let scope: Value = serde_json::from_str(&scope)?;
+    if crate::store::json_hash(&scope)? != hash {
+        bail!("Stored schedule authority does not match its immutable digest")
+    }
+    crate::workflow::single_agent_schedule_attempt_member(
+        connection, &project, &task, &root, attempt, &scope,
+    )
+}
+
+pub(crate) fn schedule_authority_in(
+    _connection: &Connection,
+    _bundles: &crate::provider_compatibility::BundleSet,
+    _occurrence: &str,
+    _task: &str,
+    _attempt: Option<&str>,
+    _before_reservation: bool,
+    _now: DateTime<Utc>,
+) -> Result<crate::domain::RecipeScheduleInvocationBinding> {
+    bail!("Automatic recipe execution has been retired. Create a draft schedule instead.")
+}
+
+pub(crate) fn require_root_schedule_preparation_in(
+    connection: &Connection,
+    task: &str,
+) -> Result<()> {
+    if let Some(reason) = crate::workflow::task_execution_retirement_problem(connection, task)? {
+        bail!("{reason}")
+    }
+    Ok(())
+}
+
+pub(crate) fn bind_schedule_claim_in(
+    tx: &Transaction<'_>,
+    _bundles: &crate::provider_compatibility::BundleSet,
+    task: &str,
+    _attempt: &str,
+) -> Result<()> {
+    require_root_schedule_preparation_in(tx, task)
+}
+
+pub(crate) fn reserve_schedule_invocation_in(
+    tx: &Transaction<'_>,
+    _bundles: &crate::provider_compatibility::BundleSet,
+    context: &crate::store::SingleAgentLaunchContext,
+    _launch: &crate::providers::SingleAgentLaunch,
+    _resume: bool,
+    _now: DateTime<Utc>,
+) -> Result<Option<crate::domain::RecipeScheduleInvocationBinding>> {
+    crate::workflow::require_supported_attempt_execution(tx, &context.attempt_id)?;
+    Ok(None)
+}
+
+pub(crate) fn require_schedule_spawn_in(
+    tx: &Transaction<'_>,
+    _bundles: &crate::provider_compatibility::BundleSet,
+    session: &str,
+    epoch: &str,
+) -> Result<bool> {
+    let attempt: Option<String> = tx.query_row(
+        "SELECT g.attempt_id FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+         WHERE s.id=?1 AND s.transcript_epoch=?2", params![session,epoch], |row| row.get(0),
+    ).optional()?;
+    if let Some(attempt) = attempt {
+        crate::workflow::require_supported_attempt_execution(tx, &attempt)?;
+    }
+    Ok(false)
+}
+
 fn require_recipe_revision(
     connection: &Connection,
     project_id: &str,
     revision_id: &str,
 ) -> Result<()> {
+    let preset: Option<String> = connection
+        .query_row(
+            "SELECT preset FROM task_recipe_revisions WHERE id=?1 AND family='single_agent'",
+            [revision_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(preset) = preset {
+        preset
+            .parse::<crate::domain::SingleAgentPreset>()
+            .map_err(|error| anyhow!(error))?
+            .require_supported()?;
+    }
     let eligible: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM task_recipe_revisions rr JOIN task_recipes r ON r.id=rr.recipe_id WHERE rr.id=?1 AND r.project_id=?2 AND r.archived_at IS NULL)", params![revision_id,project_id], |row| row.get(0))?;
     if !eligible {
         bail!("recipe revision is foreign, missing, or archived")
@@ -628,7 +1350,7 @@ fn single_agent_selection(
         reviewer_profile_revision_id: reviewer,
         check_ids: serde_json::from_str(&checks)?,
     };
-    let definition = crate::workflow_resources::single_agent_definition(selection.preset);
+    let definition = crate::workflow_resources::single_agent_definition(selection.preset)?;
     let stored: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM workflow_definitions WHERE id=?1 AND content_hash=?2 AND definition_text=?3)",params![definition.id,definition.hash(),definition.text],|row|row.get(0))?;
     if !stored
         || definition.id != definition_id
@@ -834,11 +1556,32 @@ fn scheduled_intake_tick_inner(
 ) -> Result<usize> {
     store.require_execution_unheld("scheduled intake")?;
     let now_text = now.to_rfc3339_opts(SecondsFormat::Secs, true);
+    {
+        let _intake = gate
+            .map(|(lock, _, _)| lock.lock().map_err(|_| anyhow!("intake mutex is poisoned")))
+            .transpose()?;
+        if let Some((_, enabled, draining)) = gate {
+            if !enabled.load(Ordering::SeqCst) || draining.load(Ordering::SeqCst) {
+                return Ok(0);
+            }
+        }
+        let mut connection = store.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let held: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE id='database-restore-hold' AND state='attention_required')",
+            [], |row| row.get(0),
+        )?;
+        if held {
+            return Ok(0);
+        }
+        tx.commit()?;
+    }
     let schedule_ids = {
         let connection = store.lock()?;
         let mut statement = connection.prepare(
             "SELECT s.id FROM recipe_schedules s JOIN projects p ON p.id=s.project_id
              WHERE p.internal_purpose IS NULL AND s.archived_at IS NULL AND s.paused=0
+               AND s.mode='create_draft' AND s.active_authorization_id IS NULL
                AND s.next_fire_utc IS NOT NULL AND s.next_fire_utc<=?1
              ORDER BY s.next_fire_utc,s.id LIMIT 32",
         )?;
@@ -874,12 +1617,12 @@ fn scheduled_intake_tick_inner(
         if held {
             break;
         }
-        let schedule: Option<(String,String,String,String)> = tx.query_row(
-            "SELECT s.project_id,s.recipe_revision_id,s.cadence,s.next_fire_utc FROM recipe_schedules s JOIN projects p ON p.id=s.project_id
-             WHERE s.id=?1 AND p.internal_purpose IS NULL AND s.paused=0 AND s.archived_at IS NULL AND s.next_fire_utc<=?2",
-            params![schedule_id,now_text],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        let schedule: Option<(String,String,String,String,Option<String>)> = tx.query_row(
+            "SELECT s.project_id,s.recipe_revision_id,s.cadence,s.next_fire_utc,s.active_authorization_id FROM recipe_schedules s JOIN projects p ON p.id=s.project_id
+             WHERE s.id=?1 AND p.internal_purpose IS NULL AND s.paused=0 AND s.archived_at IS NULL AND s.mode='create_draft' AND s.active_authorization_id IS NULL AND s.next_fire_utc<=?2",
+            params![schedule_id,now_text],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
         ).optional()?;
-        let Some((project_id, revision_id, cadence, next_text)) = schedule else {
+        let Some((project_id, revision_id, cadence, next_text, grant)) = schedule else {
             continue;
         };
         let first = parse_utc(&next_text)?;
@@ -904,24 +1647,30 @@ fn scheduled_intake_tick_inner(
         };
         let fire_time = newest.to_rfc3339_opts(SecondsFormat::Secs, true);
         let missed_first = (missed_count > 0).then_some(next_text.as_str());
-        let reason = if eligible {
+        let reason = if eligible && grant.is_none() {
             fire_ineligible(&tx, &project_id, &revision_id)?
+        } else if eligible {
+            None
         } else {
             Some("before_service_start")
         };
         let provisional = tx.execute(
-            "INSERT INTO recipe_schedule_fires(schedule_id,scheduled_for_utc,recipe_revision_id,outcome,reason,missed_first_utc,missed_last_utc,missed_count,created_at)
-             VALUES(?1,?2,?3,'missed',?4,?5,?6,?7,?8) ON CONFLICT(schedule_id,scheduled_for_utc) DO NOTHING",
-            params![schedule_id,fire_time,revision_id,reason,missed_first,missed_last,missed_count,now_text],
+            "INSERT INTO recipe_schedule_fires(schedule_id,scheduled_for_utc,recipe_revision_id,outcome,reason,missed_first_utc,missed_last_utc,missed_count,created_at,authorization_id)
+             VALUES(?1,?2,?3,CASE WHEN ?9 IS NOT NULL AND ?10 THEN
+               CASE WHEN EXISTS(SELECT 1 FROM recipe_schedule_fires WHERE schedule_id=?1
+                 AND outcome IN ('reserved','running','stop_requested','recovery_required'))
+                 THEN 'held' ELSE 'recovery_required' END ELSE 'missed' END,
+               ?4,?5,?6,?7,?8,?9) ON CONFLICT(schedule_id,scheduled_for_utc) DO NOTHING",
+            params![schedule_id,fire_time,revision_id,reason,missed_first,missed_last,missed_count,now_text,grant,eligible],
         )?;
         if provisional == 1 {
             let (outcome, task_id) = if !eligible {
-                ("missed", None)
+                ("missed".to_owned(), None)
             } else if reason.is_some() {
-                ("skipped_ineligible", None)
+                ("skipped_ineligible".to_owned(), None)
             } else {
                 (
-                    "task_created",
+                    "task_created".to_owned(),
                     Some(materialize(
                         &tx,
                         &project_id,
@@ -993,16 +1742,34 @@ pub(crate) fn projection(connection: &Connection) -> Result<(Vec<Value>, Vec<Val
          FROM task_recipes r JOIN projects p ON p.id=r.project_id AND p.internal_purpose IS NULL
          JOIN task_recipe_revisions rr ON rr.recipe_id=r.id AND rr.revision=r.current_revision
          ORDER BY r.project_id,r.name")?;
-    let schedules = json_rows(connection,
+    let mut schedules = json_rows(connection,
         "SELECT json_object('id',s.id,'project_id',s.project_id,'name',s.name,
           'version',s.version,'archived',json(CASE WHEN s.archived_at IS NULL THEN 'false' ELSE 'true' END),'paused',json(CASE WHEN s.paused=1 THEN 'true' ELSE 'false' END),
           'recipe_revision_id',s.recipe_revision_id,'recipe_name',r.name,
+          'mode',s.mode,'active_authorization_id',s.active_authorization_id,
+          'authorization',(SELECT json_object('id',a.id,'scope_hash',a.scope_hash,'scope',json(a.scope_json),
+            'created_at',a.created_at,'revoked_at',a.revoked_at,'restore_invalidated_at',a.restore_invalidated_at,
+            'max_occurrences',a.max_occurrences,'max_invocations_per_occurrence',a.max_invocations_per_occurrence,
+            'max_runtime_seconds',a.max_runtime_seconds,'start_window_seconds',a.start_window_seconds,
+            'reserved_occurrences',(SELECT count(*) FROM recipe_schedule_fires f WHERE f.authorization_id=a.id AND f.allowance_reserved=1),
+            'remaining_occurrences',a.max_occurrences-(SELECT count(*) FROM recipe_schedule_fires f WHERE f.authorization_id=a.id AND f.allowance_reserved=1))
+            FROM recipe_schedule_authorizations a WHERE a.id=s.active_authorization_id),
+          'execution_intake_enabled',json('false'),
+          'occurrences',json((SELECT json_group_array(json_object('id',f.id,'authorization_id',f.authorization_id,
+            'scheduled_for_utc',f.scheduled_for_utc,'task_id',f.task_id,'attempt_id',f.attempt_id,'outcome',f.outcome,
+            'reason',f.reason,'allowance_reserved',f.allowance_reserved,'invocations_spent',f.invocations_spent,
+            'stop_requested_at',f.stop_requested_at,'stop_reason',f.stop_reason,
+            'runtime_deadline_utc',f.runtime_deadline_utc)) FROM
+            (SELECT * FROM recipe_schedule_fires WHERE schedule_id=s.id ORDER BY scheduled_for_utc DESC LIMIT 100) f)),
           'recipe_config_revision_id',COALESCE(rr.execution_config_revision_id,rr.config_revision_id),
           'recipe_family',rr.family,'recipe_preset',rr.preset,
           'recipe_archived',json(CASE WHEN r.archived_at IS NULL THEN 'false' ELSE 'true' END),
           'cadence',s.cadence,
           'anchor_utc',s.anchor_utc,'next_fire_utc',s.next_fire_utc,
           'last_fire',(SELECT json_object('scheduled_for_utc',f.scheduled_for_utc,
+            'id',f.id,'authorization_id',f.authorization_id,'attempt_id',f.attempt_id,
+            'allowance_reserved',json(CASE WHEN f.allowance_reserved=1 THEN 'true' ELSE 'false' END),
+            'invocations_spent',f.invocations_spent,'runtime_deadline_utc',f.runtime_deadline_utc,
             'outcome',f.outcome,'task_id',f.task_id,'reason',f.reason,
             'missed_first_utc',f.missed_first_utc,'missed_last_utc',f.missed_last_utc,
             'missed_count',f.missed_count) FROM recipe_schedule_fires f
@@ -1010,6 +1777,69 @@ pub(crate) fn projection(connection: &Connection) -> Result<(Vec<Value>, Vec<Val
          FROM recipe_schedules s JOIN projects p ON p.id=s.project_id AND p.internal_purpose IS NULL
          JOIN task_recipe_revisions rr ON rr.id=s.recipe_revision_id JOIN task_recipes r ON r.id=rr.recipe_id
          ORDER BY s.project_id,s.name")?;
+    for schedule in &mut schedules {
+        schedule["execution_authorization_supported"] = json!(false);
+        schedule["execution_authorization_reason"] =
+            json!("Automatic recipe execution has been retired. Schedules create drafts only.");
+        schedule["execution_qualification_state"] = json!("unsupported");
+        if let Some(occurrences) = schedule["occurrences"].as_array_mut() {
+            for occurrence in occurrences {
+                let id = occurrence["id"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("Schedule occurrence has no identity"))?;
+                let intent = schedule_occurrence_stop_intent_in(connection, id)?;
+                let eligible: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM recipe_schedule_fires f
+                     JOIN recipe_schedule_authorizations a ON a.id=f.authorization_id
+                     WHERE f.id=?1 AND a.restore_invalidated_at IS NULL
+                     AND f.outcome IN ('reserved','running','stop_requested','recovery_required'))",
+                    [id],
+                    |row| row.get(0),
+                )?;
+                let binding = if eligible {
+                    schedule_stop_binding_in(connection, id)?
+                } else {
+                    None
+                };
+                let exact = if let Some(binding) = &binding {
+                    let stopping: bool = connection.query_row(
+                        "SELECT stop_requested_at IS NOT NULL FROM recipe_schedule_fires WHERE id=?1", [id], |row| row.get(0),
+                    )?;
+                    // Frozen stop intent may belong to an earlier resume. Never advertise it as the current target.
+                    binding.process.as_ref().is_some_and(|process| {
+                        process.pid > 0
+                            && process.process_group_id > 0
+                            && !process.native_start_marker.trim().is_empty()
+                    }) && if stopping {
+                        schedule_stop_is_current_in(connection, binding)?
+                    } else {
+                        connection.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1
+                            AND role_generation_id=?2 AND transcript_epoch=?3 AND launch_state='started'
+                            AND status IN ('running','interrupt_requested','recovery_required'))",
+                            params![binding.session_id,binding.role_generation_id,binding.transcript_epoch], |row| row.get(0))?
+                    }
+                } else {
+                    false
+                };
+                occurrence["stop_intent_available"] = json!(intent.is_some());
+                occurrence["stop_intent_reason"] = if intent.is_some() {
+                    Value::Null
+                } else if !occurrence["stop_requested_at"].is_null() {
+                    json!(
+                        "Stop has been requested; check the occurrence outcome or recovery status"
+                    )
+                } else {
+                    json!("This occurrence cannot accept Stop; refresh to check its outcome or recovery status")
+                };
+                occurrence["stop_intent"] = serde_json::to_value(intent)?;
+                occurrence["stop_binding"] = if exact {
+                    serde_json::to_value(binding)?
+                } else {
+                    Value::Null
+                };
+            }
+        }
+    }
     Ok((profiles, recipes, schedules))
 }
 

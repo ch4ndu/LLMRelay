@@ -114,7 +114,28 @@ fn browser_check_run_result(result: BrowserCheckRun) -> Result<serde_json::Value
     }
 }
 
+#[derive(Clone)]
+struct ScheduledCheckLimit {
+    occurrence: String,
+    grant: String,
+    task: String,
+    attempt: String,
+    wall_deadline: chrono::DateTime<Utc>,
+    monotonic_deadline: Instant,
+    command_deadline: Instant,
+}
+
+impl ScheduledCheckLimit {
+    fn require_runtime(&self) -> Result<()> {
+        if Utc::now() >= self.wall_deadline || Instant::now() >= self.monotonic_deadline {
+            bail!("The original scheduled runtime allowance has ended")
+        }
+        Ok(())
+    }
+}
+
 struct SelectedCheckBinding {
+    schedule_limit: Option<ScheduledCheckLimit>,
     check_id: String,
     selected_revision: i64,
     inputs_hash: String,
@@ -536,6 +557,7 @@ impl CheckService {
                 anyhow!("selected check is denied or awaiting a service-check permission decision")
             })?
         };
+        let schedule_limit = self.capture_schedule_limit(attempt, timeout as u64)?;
         let (spec, inputs_hash) = selected_check_spec(&SelectedCommand {
             workspace: &workspace,
             kind: &kind,
@@ -552,6 +574,7 @@ impl CheckService {
             check_id,
             &spec,
             Some(SelectedCheckBinding {
+                schedule_limit,
                 check_id: check_id.to_owned(),
                 selected_revision: revision,
                 inputs_hash,
@@ -587,6 +610,8 @@ impl CheckService {
         let SingleAgentCheckAuthorization::Authorized(authorization_id) = authorization else {
             bail!("the selected check is not authorized for this exact command and candidate")
         };
+        let schedule_limit =
+            self.capture_schedule_limit(attempt, identity.timeout_seconds as u64)?;
         let (spec, inputs_hash) = selected_check_spec(&SelectedCommand {
             workspace: &identity.workspace,
             kind: &identity.command_kind,
@@ -603,6 +628,7 @@ impl CheckService {
             check_id,
             &spec,
             Some(SelectedCheckBinding {
+                schedule_limit,
                 check_id: check_id.to_owned(),
                 selected_revision: identity.selected_revision,
                 inputs_hash,
@@ -615,6 +641,195 @@ impl CheckService {
             None,
         )
         .and_then(browser_check_run_result)
+    }
+
+    fn capture_schedule_limit(
+        &self,
+        attempt: &str,
+        timeout: u64,
+    ) -> Result<Option<ScheduledCheckLimit>> {
+        let connection = self.store.lock()?;
+        let scheduled: Option<(String, String, String, String)> = connection
+            .query_row(
+                "SELECT f.id,f.authorization_id,f.task_id,f.runtime_deadline_utc
+             FROM attempts run JOIN recipe_schedule_fires f ON f.task_id=run.task_id
+             WHERE run.id=?1 AND f.authorization_id IS NOT NULL",
+                [attempt],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((occurrence, grant, task, wall)) = scheduled else {
+            return Ok(None);
+        };
+        let limit = ScheduledCheckLimit {
+            monotonic_deadline: self.store.original_schedule_deadline(&occurrence)?,
+            wall_deadline: chrono::DateTime::parse_from_rfc3339(&wall)?.with_timezone(&Utc),
+            command_deadline: Instant::now()
+                .checked_add(Duration::from_secs(timeout))
+                .ok_or_else(|| anyhow!("Invalid configured check timeout"))?,
+            occurrence,
+            grant,
+            task,
+            attempt: attempt.into(),
+        };
+        self.require_schedule_check_in(&connection, &limit, true)?;
+        Ok(Some(limit))
+    }
+
+    fn require_schedule_check_in(
+        &self,
+        connection: &rusqlite::Connection,
+        limit: &ScheduledCheckLimit,
+        validate_pins: bool,
+    ) -> Result<()> {
+        let restore_hold: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE id='database-restore-hold'
+             AND state='attention_required')",
+            [],
+            |row| row.get(0),
+        )?;
+        if restore_hold {
+            bail!("Scheduled check execution is disabled by the database restore hold")
+        }
+        limit.require_runtime()?;
+        let current: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM recipe_schedule_fires f
+             JOIN recipe_schedules s ON s.id=f.schedule_id
+             JOIN recipe_schedule_authorizations a ON a.id=f.authorization_id
+             JOIN tasks t ON t.id=f.task_id JOIN projects p ON p.id=t.project_id
+             JOIN attempts run ON run.id=?4 AND run.task_id=t.id
+             JOIN task_recipe_bindings b ON b.task_id=t.id
+             WHERE f.id=?1 AND a.id=?2 AND t.id=?3 AND f.allowance_reserved=1
+               AND f.invocations_spent>0 AND julianday(f.runtime_deadline_utc)=julianday(?5)
+               AND julianday(?6)>=julianday(f.last_observed_wall_utc)
+               AND f.stop_requested_at IS NULL AND f.outcome IN ('running','review_ready','reserved')
+               AND s.active_authorization_id=a.id AND s.archived_at IS NULL
+               AND ((s.mode='run_authorized_research' AND json_extract(a.scope_json,'$.schema')=1)
+                 OR (s.mode='run_authorized_recipe' AND json_extract(a.scope_json,'$.schema')=2))
+               AND a.revoked_at IS NULL AND a.restore_invalidated_at IS NULL
+               AND b.schedule_id=s.id AND b.scheduled_for_utc=f.scheduled_for_utc
+               AND b.recipe_revision_id=f.recipe_revision_id AND s.recipe_revision_id=f.recipe_revision_id
+               AND (?7=0 OR (s.paused=0 AND p.queue_paused=0)) AND t.archived_at IS NULL AND t.lifecycle NOT IN ('cancelled','done')
+               AND run.status='running'
+               AND NOT EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id IN (
+                 SELECT ?4 UNION SELECT parent_attempt_id FROM attempts WHERE id=?4
+                 UNION SELECT attempt_id FROM recipe_schedule_fires WHERE id=?1)
+                 AND (((c.kind IN ('pause_now','cancel') OR (?7 AND c.kind='pause_after_role')) AND c.state IN ('requested','draining'))
+                   OR (c.kind IN ('manager_stop','manager_change') AND c.state NOT IN ('finished','cancelled','superseded','rejected')))))",
+            params![limit.occurrence,limit.grant,limit.task,limit.attempt,
+                limit.wall_deadline.to_rfc3339(),Utc::now().to_rfc3339(),validate_pins], |row| row.get(0),
+        )?;
+        if !current
+            || !crate::recipes::schedule_attempt_member_in(
+                connection,
+                &limit.occurrence,
+                &limit.attempt,
+            )?
+        {
+            bail!("Scheduled check authority stopped or changed; reconcile this occurrence")
+        }
+        if validate_pins {
+            if self.store.original_schedule_deadline(&limit.occurrence)? != limit.monotonic_deadline
+            {
+                bail!("The original scheduled runtime clock changed; reconcile without replay")
+            }
+            if Instant::now() >= limit.command_deadline {
+                bail!("The configured check timeout ended during preparation")
+            }
+            let binding = crate::recipes::schedule_authority_in(
+                connection,
+                &self.store.compatibility_bundles,
+                &limit.occurrence,
+                &limit.task,
+                Some(&limit.attempt),
+                false,
+                Utc::now(),
+            )?;
+            if binding.authorization_id != limit.grant {
+                bail!("Scheduled check grant changed")
+            }
+        }
+        limit.require_runtime()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn signal_owned_scheduled_check(
+        &self,
+        id: &str,
+        limit: &ScheduledCheckLimit,
+        root: u32,
+        start: &str,
+        pgid: i32,
+        live: &[ProcessInfo],
+        inspection_deadline: Instant,
+    ) -> Result<()> {
+        let boot = crate::supervisor::system_boot_identity()?;
+        let mut connection = self.store.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let held: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM recovery_records
+            WHERE id='database-restore-hold' AND state='attention_required')",
+            [],
+            |row| row.get(0),
+        )?;
+        if held {
+            bail!("Restored check bindings cannot authorize signals")
+        }
+        let anchor_text: String = tx.query_row(
+            "SELECT c.recovery_anchor_json FROM check_runs c
+             JOIN attempts run ON run.id=c.attempt_id
+             JOIN recipe_schedule_fires f ON f.task_id=run.task_id
+             JOIN recipe_schedule_authorizations a ON a.id=f.authorization_id
+             WHERE c.id=?1 AND c.attempt_id=?2 AND c.status='running'
+               AND f.id=?3 AND a.id=?4 AND a.restore_invalidated_at IS NULL
+               AND c.launch_boot_identity=?5",
+            params![id, limit.attempt, limit.occurrence, limit.grant, boot],
+            |row| row.get(0),
+        )?;
+        let anchor: crate::domain::ProcessGenerationAnchor = serde_json::from_str(&anchor_text)?;
+        if anchor.pid != root
+            || anchor.process_group_id != pgid
+            || anchor.boot_identity != boot
+            || !same_process_start(&anchor.native_start_marker, start)
+            || !crate::recipes::schedule_attempt_member_in(&tx, &limit.occurrence, &limit.attempt)?
+        {
+            bail!("Scheduled check process ownership changed before signalling")
+        }
+        let targets: Vec<_> = live
+            .iter()
+            .map(|process| {
+                serde_json::json!({
+                    "pid":process.pid,"start_marker":process.start,"process_group":process.pgid
+                })
+            })
+            .collect();
+        tx.execute("UPDATE check_runs SET evidence_json=json_set(evidence_json,
+            '$.schedule_stop_target',COALESCE(json_extract(evidence_json,'$.schedule_stop_target'),json(?2))) WHERE id=?1", params![id,serde_json::json!({
+                "occurrence_id":limit.occurrence,"authorization_id":limit.grant,
+                "attempt_id":limit.attempt,"check_run_id":id,"anchor":anchor,"targets":targets
+            }).to_string()])?;
+        tx.commit()?;
+        // Keep Store serialization through adjacent PID checks and signals; restore cannot replace this binding.
+        for process in live {
+            let current: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM check_runs c JOIN attempts run ON run.id=c.attempt_id
+                 JOIN recipe_schedule_fires f ON f.task_id=run.task_id
+                 JOIN recipe_schedule_authorizations a ON a.id=f.authorization_id
+                 WHERE c.id=?1 AND c.attempt_id=?2 AND c.status='running' AND c.recovery_anchor_json=?3
+                   AND f.id=?4 AND a.id=?5 AND a.restore_invalidated_at IS NULL
+                   AND NOT EXISTS(SELECT 1 FROM recovery_records WHERE id='database-restore-hold' AND state='attention_required'))",
+                params![id,limit.attempt,anchor_text,limit.occurrence,limit.grant], |row| row.get(0),
+            )?;
+            if !current {
+                bail!("Scheduled check binding changed before signalling")
+            }
+            self.signal_processes(
+                std::slice::from_ref(process),
+                libc::SIGKILL,
+                inspection_deadline,
+            )?;
+        }
+        Ok(())
     }
 
     pub fn selected_authorized(&self, attempt: &str, check_id: &str) -> Result<bool> {
@@ -634,6 +849,9 @@ impl CheckService {
         background: bool,
         browser_receipt: Option<BrowserLaunchReceipt<'_>>,
     ) -> Result<BrowserCheckRun> {
+        let schedule_limit = selected
+            .as_ref()
+            .and_then(|value| value.schedule_limit.clone());
         validate_spec(spec)?;
         if let crate::supervisor::ProcessInventory::Unavailable(error) =
             self.supervisor.reconcile_inventory()?
@@ -713,14 +931,34 @@ impl CheckService {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let (mut child, pgid, boot_identity) =
-            self.spawn_reserved_check(&id, suite, &mut command)?;
+        let (mut child, pgid, boot_identity) = match self.spawn_reserved_check(
+            &id,
+            suite,
+            &mut command,
+            schedule_limit.as_ref(),
+            selected.as_ref(),
+        ) {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                self.finish_failed(&id, "launch_failed", &format!("{error:#}"))?;
+                return Err(error);
+            }
+        };
         let root = child.id();
         let start = match self.start_marker(root, Instant::now() + PROCESS_INSPECTION_TIMEOUT) {
             Ok(start) => start,
             Err(error) => {
                 return self
-                    .fail_spawned(&id, attempt, child, root, pgid, None, error)
+                    .fail_spawned(
+                        &id,
+                        attempt,
+                        child,
+                        root,
+                        pgid,
+                        None,
+                        error,
+                        schedule_limit.is_some(),
+                    )
                     .map(BrowserCheckRun::Started)
             }
         };
@@ -749,18 +987,37 @@ impl CheckService {
                         pgid,
                         Some(&start),
                         anyhow!("check disappeared before its generation anchor was durable"),
+                        schedule_limit.is_some(),
                     )
                     .map(BrowserCheckRun::Started)
             }
             Err(error) => {
                 return self
-                    .fail_spawned(&id, attempt, child, root, pgid, Some(&start), error)
+                    .fail_spawned(
+                        &id,
+                        attempt,
+                        child,
+                        root,
+                        pgid,
+                        Some(&start),
+                        error,
+                        schedule_limit.is_some(),
+                    )
                     .map(BrowserCheckRun::Started)
             }
         }
         if let Err(error) = self.record_process(&id, root, &start, pgid, std::process::id()) {
             return self
-                .fail_spawned(&id, attempt, child, root, pgid, Some(&start), error)
+                .fail_spawned(
+                    &id,
+                    attempt,
+                    child,
+                    root,
+                    pgid,
+                    Some(&start),
+                    error,
+                    schedule_limit.is_some(),
+                )
                 .map(BrowserCheckRun::Started);
         }
         let running_recorded = match (|| -> Result<usize> {
@@ -770,7 +1027,16 @@ impl CheckService {
             Ok(changed) => changed,
             Err(error) => {
                 return self
-                    .fail_spawned(&id, attempt, child, root, pgid, Some(&start), error)
+                    .fail_spawned(
+                        &id,
+                        attempt,
+                        child,
+                        root,
+                        pgid,
+                        Some(&start),
+                        error,
+                        schedule_limit.is_some(),
+                    )
                     .map(BrowserCheckRun::Started)
             }
         };
@@ -784,6 +1050,7 @@ impl CheckService {
                     pgid,
                     Some(&start),
                     anyhow!("check launch reservation became stale after spawn"),
+                    schedule_limit.is_some(),
                 )
                 .map(BrowserCheckRun::Started);
         }
@@ -797,6 +1064,7 @@ impl CheckService {
                     pgid,
                     Some(&start),
                     anyhow!("check output pipe missing"),
+                    schedule_limit.is_some(),
                 )
                 .map(BrowserCheckRun::Started);
         }
@@ -821,6 +1089,7 @@ impl CheckService {
                     worker_attempt,
                     worker_suite,
                     worker_spec,
+                    schedule_limit,
                     worker_workspace,
                     worker_candidate,
                     worker_snapshot,
@@ -844,6 +1113,7 @@ impl CheckService {
             attempt.to_owned(),
             suite.to_owned(),
             spec.clone(),
+            schedule_limit,
             workspace,
             candidate,
             snapshot,
@@ -866,6 +1136,7 @@ impl CheckService {
         attempt: String,
         suite: String,
         spec: CheckSpec,
+        schedule_limit: Option<ScheduledCheckLimit>,
         workspace: String,
         candidate: String,
         snapshot: String,
@@ -882,7 +1153,11 @@ impl CheckService {
         let mut stdout = PipeCapture::new(stdout, 512 * 1024);
         let mut stderr = PipeCapture::new(stderr, 512 * 1024);
         let mut known = HashMap::from([(root, start.clone())]);
-        let deadline = execution_started + Duration::from_secs(spec.timeout_seconds);
+        let deadline = schedule_limit.as_ref().map_or(
+            execution_started + Duration::from_secs(spec.timeout_seconds),
+            |limit| limit.command_deadline.min(limit.monotonic_deadline),
+        );
+        let mut stopped_reason = None;
         let execution = (|| -> Result<_> {
             loop {
                 stdout.read_available()?;
@@ -890,11 +1165,23 @@ impl CheckService {
                 let observed = inventory()?;
                 observe_descendants(pgid, &mut known, &observed);
                 self.record_known(&id, &known, &observed)?;
-                if let Some(status) = child.try_wait()? {
-                    break Ok((Some(status), false));
+                if let Some(limit) = &schedule_limit {
+                    let connection = self.store.lock()?;
+                    if let Err(error) = self.require_schedule_check_in(&connection, limit, false) {
+                        stopped_reason = Some(format!("{error:#}"));
+                        break Ok((child.try_wait()?, false));
+                    }
+                }
+                if schedule_limit.is_none() {
+                    if let Some(status) = child.try_wait()? {
+                        break Ok((Some(status), false));
+                    }
                 }
                 if Instant::now() >= deadline {
-                    break Ok((None, true));
+                    break Ok((child.try_wait()?, true));
+                }
+                if let Some(status) = child.try_wait()? {
+                    break Ok((Some(status), false));
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
@@ -916,10 +1203,12 @@ impl CheckService {
                         stderr: Some(stderr),
                         completion_error: None,
                     },
+                    schedule_limit.is_some(),
                 )
             }
         };
         let cleanup = (|| -> Result<_> {
+            // This observation window grants no execution grace; live owned processes are killed immediately.
             let cleanup_deadline = Instant::now() + Duration::from_secs(3);
             loop {
                 stdout.read_available()?;
@@ -935,7 +1224,19 @@ impl CheckService {
                 if !unsettled && stdout.eof && stderr.eof {
                     break Ok((false, false));
                 }
-                self.signal_processes(&live, libc::SIGKILL, cleanup_deadline)?;
+                if let Some(limit) = &schedule_limit {
+                    self.signal_owned_scheduled_check(
+                        &id,
+                        limit,
+                        root,
+                        &start,
+                        pgid,
+                        &live,
+                        cleanup_deadline,
+                    )?;
+                } else {
+                    self.signal_processes(&live, libc::SIGKILL, cleanup_deadline)?;
+                }
                 if Instant::now() >= cleanup_deadline {
                     break Ok((unsettled, !stdout.eof || !stderr.eof));
                 }
@@ -959,6 +1260,7 @@ impl CheckService {
                         stderr: Some(stderr),
                         completion_error: None,
                     },
+                    schedule_limit.is_some(),
                 )
             }
         };
@@ -994,14 +1296,24 @@ impl CheckService {
                     return self.finish_capture_failed(&id, anyhow!(error.clone()));
                 }
             }
+            if let Some(limit) = &schedule_limit {
+                let connection = self.store.lock()?;
+                if let Err(error) = self.require_schedule_check_in(&connection, limit, false) {
+                    stopped_reason.get_or_insert_with(|| format!("{error:#}"));
+                }
+            }
             let candidate_validation = if recovery_required {
                 Err(anyhow!("check cleanup has not established quiescence"))
+            } else if stopped_reason.is_some() {
+                Err(anyhow!(
+                    "Scheduled check stopped before candidate freshness could be established"
+                ))
             } else {
                 self.verify_candidate(&snapshot, &workspace, &candidate)
             };
             let candidate_unchanged = candidate_validation.is_ok();
-            let evidence = serde_json::json!({
-                "suite":suite,"timed_out":timed_out,"process_group_id":pgid,
+            let mut evidence = serde_json::json!({
+                "suite":suite,"timed_out":timed_out,"schedule_stop_reason":stopped_reason,"process_group_id":pgid,
                 "tracked_processes":known.len(),"descendants_remained_after_kill":descendants_remain,
                 "capture_incomplete":capture_incomplete,"capture_write_error":capture_write_error,
                 "candidate_unchanged":candidate_unchanged,
@@ -1010,22 +1322,27 @@ impl CheckService {
                 "output_truncated":stdout_output.truncated||stderr_output.truncated,
             });
             let exit_code = status.and_then(|status| status.code());
-            let persisted = if timed_out || recovery_required || !candidate_unchanged {
+            let persisted = if timed_out
+                || stopped_reason.is_some()
+                || recovery_required
+                || !candidate_unchanged
+            {
                 None
             } else {
                 exit_code
             };
-            self.persist_completion(
+            let persisted = self.persist_completion(
                 &id,
                 &attempt,
                 persisted,
                 recovery_required,
-                &evidence,
+                &mut evidence,
                 execution_started.elapsed(),
+                schedule_limit.as_ref(),
             )?;
             Ok(serde_json::json!({
                 "check_id":id,"attempt_id":attempt,"candidate_hash":candidate,
-                "exit_code":exit_code,"timed_out":timed_out,
+                "exit_code":exit_code,"timed_out":evidence["timed_out"],
                 "passed":persisted==Some(0),"recovery_required":recovery_required,
                 "evidence":evidence,
             }))
@@ -1043,11 +1360,23 @@ impl CheckService {
         attempt: &str,
         exit_code: Option<i32>,
         recovery_required: bool,
-        evidence: &serde_json::Value,
+        evidence: &mut serde_json::Value,
         elapsed: Duration,
-    ) -> Result<()> {
+        schedule_limit: Option<&ScheduledCheckLimit>,
+    ) -> Result<Option<i32>> {
         let mut connection = self.store.lock()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut exit_code = if recovery_required { None } else { exit_code };
+        if let Some(limit) = schedule_limit {
+            if let Err(error) = self.require_schedule_check_in(&tx, limit, false) {
+                evidence["schedule_stop_reason"] = format!("{error:#}").into();
+                exit_code = None;
+            }
+            if Instant::now() >= limit.command_deadline {
+                evidence["timed_out"] = true.into();
+                exit_code = None;
+            }
+        }
         let now = Utc::now().to_rfc3339();
         let changed = tx.execute(
             "UPDATE check_runs SET status=CASE WHEN ?1 THEN 'recovery_required' ELSE 'finished' END,
@@ -1073,7 +1402,7 @@ impl CheckService {
             )?;
         }
         tx.commit()?;
-        Ok(())
+        Ok(exit_code)
     }
 
     fn reserve(
@@ -1095,6 +1424,20 @@ impl CheckService {
                 receipt.input_hash,
             )? {
                 return Ok(CheckReservation::Existing(existing));
+            }
+        }
+        if let Some(limit) = selected.and_then(|value| value.schedule_limit.as_ref()) {
+            self.require_schedule_check_in(&tx, limit, true)?;
+        } else {
+            let scheduled: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM attempts run
+                JOIN recipe_schedule_fires f ON f.task_id=run.task_id WHERE run.id=?1
+                AND f.authorization_id IS NOT NULL)",
+                [attempt],
+                |row| row.get(0),
+            )?;
+            if scheduled {
+                bail!("Scheduled check has no captured original execution bound")
             }
         }
         let single_agent = selected
@@ -1351,9 +1694,15 @@ impl CheckService {
         id: &str,
         suite: &str,
         command: &mut Command,
+        schedule_limit: Option<&ScheduledCheckLimit>,
+        selected: Option<&SelectedCheckBinding>,
     ) -> Result<(Child, i32, String)> {
         let boot_identity = crate::supervisor::system_boot_identity()?;
-        let changed = self.store.lock()?.execute(
+        let connection = self.store.lock()?;
+        if let Some(limit) = schedule_limit {
+            limit.require_runtime()?;
+        }
+        let changed = connection.execute(
             "UPDATE check_runs SET launch_state='spawning',launch_boot_identity=?1,
                 evidence_json=json_set(evidence_json,'$.capture_incomplete',json('true'))
              WHERE id=?2 AND status='launch_reserved' AND launch_state='reserved'",
@@ -1364,9 +1713,44 @@ impl CheckService {
         }
         // A crash or write failure after spawn must leave output ownership
         // unresolved until positive EOF evidence has been saved.
-        match spawn_check_process(command)
-            .with_context(|| format!("launch configured check {suite}"))
-        {
+        if let Some(limit) = schedule_limit {
+            self.require_schedule_check_in(&connection, limit, true)?;
+            let selected = selected
+                .ok_or_else(|| anyhow!("Scheduled checks require exact selected authority"))?;
+            let SelectedCheckAuthority::SingleAgent(authorization) = &selected.authority else {
+                bail!("Scheduled checks require the run's exact human authorization")
+            };
+            let current =
+                single_agent_check_identity(&connection, &limit.attempt, &selected.check_id)?
+                    .ok_or_else(|| anyhow!("Scheduled check selection changed before spawn"))?;
+            let authorized: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_check_authorizations auth
+                 WHERE auth.id=?1 AND auth.attempt_id=?2 AND auth.check_id=?3 AND auth.decision='authorized'
+                   AND auth.selected_revision=?4 AND auth.exact_command_hash=?5 AND auth.scope_hash=?6
+                   AND auth.id=(SELECT latest.id FROM workflow_check_authorizations latest
+                     WHERE latest.attempt_id=auth.attempt_id AND latest.check_id=auth.check_id
+                       AND latest.selected_revision=auth.selected_revision
+                       AND latest.exact_command_hash=auth.exact_command_hash AND latest.scope_hash=auth.scope_hash
+                     ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1))",
+                params![authorization,limit.attempt,selected.check_id,selected.selected_revision,
+                    selected.exact_command_hash,selected.scope_hash], |row| row.get(0),
+            )?;
+            if !authorized
+                || current.selected_revision != selected.selected_revision
+                || current.command_hash != selected.exact_command_hash
+                || current.scope_hash != selected.scope_hash
+            {
+                bail!("Scheduled check command, candidate or human authorization changed before spawn")
+            }
+            limit.require_runtime()?;
+            if Instant::now() >= limit.command_deadline {
+                bail!("The configured check timeout ended before spawn")
+            }
+        }
+        let spawned = spawn_check_process(command)
+            .with_context(|| format!("launch configured check {suite}"));
+        drop(connection);
+        match spawned {
             Ok((child, pgid)) => Ok((child, pgid, boot_identity)),
             Err(error) => {
                 self.finish_failed(id, "launch_failed", &format!("{error:#}"))?;
@@ -1398,6 +1782,7 @@ impl CheckService {
         pgid: i32,
         start: Option<&str>,
         error: anyhow::Error,
+        scheduled: bool,
     ) -> Result<serde_json::Value> {
         let capture = PendingCapture {
             check_id: id.to_owned(),
@@ -1411,7 +1796,9 @@ impl CheckService {
                 .map(|reader| PipeCapture::new(reader, 0)),
             completion_error: None,
         };
-        self.fail_spawned_retaining(id, attempt, child, root_pid, pgid, start, error, capture)
+        self.fail_spawned_retaining(
+            id, attempt, child, root_pid, pgid, start, error, capture, scheduled,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1425,7 +1812,31 @@ impl CheckService {
         start: Option<&str>,
         error: anyhow::Error,
         mut capture: PendingCapture,
+        scheduled: bool,
     ) -> Result<serde_json::Value> {
+        if scheduled {
+            let detail = format!("{error:#}");
+            // Lost inspection or durable identity never falls back to an unbound group kill.
+            self.retain_child(child);
+            capture.completion_error = Some(detail.clone());
+            self.retain_capture(capture);
+            let mut connection = self.store.lock()?;
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = Utc::now().to_rfc3339();
+            tx.execute("UPDATE check_runs SET status='recovery_required',launch_state='cleanup_unknown',
+                launch_error=?2,exit_code=NULL,freshness_state='failed',finished_at=NULL WHERE id=?1",
+                params![id,detail])?;
+            record_check_recovery(
+                &tx,
+                attempt,
+                &now,
+                serde_json::json!({
+                    "kind":"configured_check_cleanup_unknown","check_id":id,"reason":detail
+                }),
+            )?;
+            tx.commit()?;
+            return Err(error);
+        }
         let result = self.fail_spawned_with_inventory(
             id,
             attempt,
@@ -2479,7 +2890,7 @@ mod tests {
             [],
         )?;
         let (mut child, pgid, _) =
-            service.spawn_reserved_check("held-check", "causal", &mut command)?;
+            service.spawn_reserved_check("held-check", "causal", &mut command, None, None)?;
         let pid = child.id();
         let start = service.start_marker(pid, Instant::now() + PROCESS_INSPECTION_TIMEOUT)?;
         record_current_anchor(&service.store, "held-check", pid, pgid, &start);
@@ -2504,6 +2915,7 @@ mod tests {
                 suite_version: 1,
                 cwd: ".".into(),
             },
+            None,
             root.to_string_lossy().into_owned(),
             "candidate".into(),
             "unused-snapshot".into(),
@@ -2604,6 +3016,154 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_check_missing_or_contended_clock_never_recreates_deadline() {
+        let (root, _cleanup) = temp_root("original-check-clock");
+        let (mut store, _) = seeded_service(&root, "clock-check");
+        assert!(store.original_schedule_deadline("occurrence").is_err());
+        let clocks = Arc::new(Mutex::new(HashMap::new()));
+        store.schedule_preparation_clocks = Some(clocks.clone());
+        assert!(store.original_schedule_deadline("occurrence").is_err());
+        let origin = Instant::now();
+        clocks.lock().unwrap().insert(
+            "occurrence".into(),
+            crate::operations::ScheduleClock {
+                origin,
+                allowance: Duration::from_secs(30),
+            },
+        );
+        let held = clocks.lock().unwrap();
+        assert!(store
+            .original_schedule_deadline("occurrence")
+            .unwrap_err()
+            .to_string()
+            .contains("busy"));
+        drop(held);
+        assert_eq!(
+            store.original_schedule_deadline("occurrence").unwrap(),
+            origin + Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn scheduled_check_expired_original_bound_refuses_actual_spawn() {
+        let (root, _cleanup) = temp_root("expired-check-spawn");
+        let (store, service) = seeded_service(&root, "expired-check");
+        store
+            .lock()
+            .unwrap()
+            .execute("UPDATE check_runs SET launch_state='reserved'", [])
+            .unwrap();
+        let limit = ScheduledCheckLimit {
+            occurrence: "occurrence".into(),
+            grant: "grant".into(),
+            task: "t".into(),
+            attempt: "a".into(),
+            wall_deadline: Utc::now() + chrono::Duration::seconds(30),
+            monotonic_deadline: Instant::now(),
+            command_deadline: Instant::now() + Duration::from_secs(30),
+        };
+        let marker = root.join("spawned");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "touch \"$1\"", "check"]).arg(&marker);
+        let error = service
+            .spawn_reserved_check("expired-check", "causal", &mut command, Some(&limit), None)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("original scheduled runtime allowance has ended"));
+        assert!(!marker.exists());
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row("SELECT launch_state FROM check_runs", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "reserved"
+        );
+    }
+
+    #[test]
+    fn scheduled_check_delayed_monitor_entry_cannot_reset_original_deadline() {
+        let (root, _cleanup) = temp_root("delayed-check-monitor");
+        let (store, service) = seeded_service(&root, "delayed-check");
+        let origin = Instant::now();
+        let limit = ScheduledCheckLimit {
+            occurrence: "occurrence".into(),
+            grant: "grant".into(),
+            task: "t".into(),
+            attempt: "a".into(),
+            wall_deadline: Utc::now() + chrono::Duration::seconds(30),
+            monotonic_deadline: origin + Duration::from_millis(50),
+            command_deadline: origin + Duration::from_secs(30),
+        };
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "exit 0"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (mut child, pgid) = spawn_check_process(&mut command).unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE check_runs SET status='running' WHERE id='delayed-check'",
+                [],
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(75));
+        let result = service
+            .complete_running_check(
+                "delayed-check".into(),
+                "a".into(),
+                "causal".into(),
+                CheckSpec {
+                    executable: "/bin/sh".into(),
+                    arguments: vec!["-c".into(), "exit 0".into()],
+                    timeout_seconds: 30,
+                    suite_version: 1,
+                    cwd: ".".into(),
+                },
+                Some(limit),
+                root.to_string_lossy().into_owned(),
+                "candidate".into(),
+                "unused-snapshot".into(),
+                root,
+                pid,
+                "exited-check".into(),
+                pgid,
+                child,
+                stdout,
+                stderr,
+                || Ok(vec![]),
+            )
+            .unwrap();
+        assert_eq!(result["exit_code"], 0);
+        assert_eq!(result["passed"], false);
+        assert_eq!(result["timed_out"], false);
+        assert!(result["evidence"]["schedule_stop_reason"]
+            .as_str()
+            .unwrap()
+            .contains("original scheduled runtime allowance has ended"));
+        assert!(origin.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row("SELECT freshness_state FROM check_runs", [], |row| row
+                    .get::<_, String>(
+                    0
+                ))
+                .unwrap(),
+            "failed"
+        );
+    }
+
+    #[test]
     fn capture_marker_write_failure_prevents_spawn_and_restart_proves_nondelivery() {
         let (root, _cleanup) = temp_root("capture-before-spawn");
         let (store, service) = seeded_service(&root, "unspawned-check");
@@ -2619,7 +3179,7 @@ mod tests {
             .args(["-c", "printf spawned > \"$1\"", "check"])
             .arg(&started);
         let error = service
-            .spawn_reserved_check("unspawned-check", "causal", &mut command)
+            .spawn_reserved_check("unspawned-check", "causal", &mut command, None, None)
             .unwrap_err();
         assert!(format!("{error:#}").contains("injected capture marker failure"));
         assert!(!started.exists());
@@ -2650,7 +3210,7 @@ mod tests {
         ).unwrap();
         let mut command = Command::new(root.join("missing-executable"));
         assert!(service
-            .spawn_reserved_check("refused-check", "causal", &mut command)
+            .spawn_reserved_check("refused-check", "causal", &mut command, None, None)
             .is_err());
         let capture: Option<bool> = store.lock().unwrap().query_row(
             "SELECT json_extract(evidence_json,'$.capture_incomplete') FROM check_runs WHERE id='refused-check'",
@@ -2681,7 +3241,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let (mut child, pgid, _) = service
-            .spawn_reserved_check("interrupted-check", "causal", &mut command)
+            .spawn_reserved_check("interrupted-check", "causal", &mut command, None, None)
             .unwrap();
         let pid = child.id();
         let start = service
@@ -2748,6 +3308,7 @@ mod tests {
                         suite_version: 1,
                         cwd: ".".into(),
                     },
+                    None,
                     root.to_string_lossy().into_owned(),
                     "candidate".into(),
                     "unused-snapshot".into(),
@@ -2844,6 +3405,7 @@ mod tests {
                     suite_version: 1,
                     cwd: ".".into(),
                 },
+                None,
                 root.to_string_lossy().into_owned(),
                 "candidate".into(),
                 "unused-snapshot".into(),
@@ -2995,6 +3557,7 @@ mod tests {
                     suite_version: 1,
                     cwd: ".".into(),
                 },
+                None,
                 root.to_string_lossy().into_owned(),
                 "candidate".into(),
                 "unused-snapshot".into(),
@@ -3152,6 +3715,7 @@ mod tests {
                     suite_version: 1,
                     cwd: ".".into(),
                 },
+                None,
                 root.to_string_lossy().into_owned(),
                 "candidate".into(),
                 "unused-snapshot".into(),
@@ -3318,6 +3882,7 @@ mod tests {
                         suite_version: 1,
                         cwd: ".".into(),
                     },
+                    None,
                     root.to_string_lossy().into_owned(),
                     "candidate".into(),
                     "unused-snapshot".into(),
@@ -3441,6 +4006,7 @@ mod tests {
                     suite_version: 1,
                     cwd: ".".into(),
                 },
+                None,
                 root.to_string_lossy().into_owned(),
                 "candidate".into(),
                 "unused-snapshot".into(),
@@ -3503,7 +4069,7 @@ mod tests {
         service
             .record_process("survivor-check", pid, &start, pgid, std::process::id())
             .unwrap();
-        let evidence =
+        let mut evidence =
             serde_json::json!({"descendants_remained_after_kill":true,"capture_incomplete":false});
         store.lock().unwrap().execute_batch("CREATE TRIGGER reject_cleanup_hold BEFORE UPDATE OF attention ON tasks BEGIN SELECT RAISE(ABORT, 'injected hold failure'); END;").unwrap();
         let failed = service.persist_completion(
@@ -3511,8 +4077,9 @@ mod tests {
             "a",
             None,
             true,
-            &evidence,
+            &mut evidence,
             Duration::from_secs(3),
+            None,
         );
         assert!(format!("{:#}", failed.unwrap_err()).contains("injected hold failure"));
         assert_eq!(
@@ -3530,8 +4097,9 @@ mod tests {
                 "a",
                 Some(0),
                 true,
-                &evidence,
+                &mut evidence,
                 Duration::from_secs(3),
+                None,
             )
             .unwrap();
         let active = service.active_status().unwrap();

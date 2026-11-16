@@ -7,10 +7,6 @@ import type {
   CmuxKeyboardControlOutcome,
   CmuxViewOutcome,
   Command,
-  CompatibilityExplanation,
-  HistoryExportText,
-  HistoryPaneOutcome,
-  HistoryPaneView,
   HistorySelection,
   HistoricalSource,
   HistoricalSourceKey,
@@ -20,18 +16,14 @@ import type {
   Operation,
   ProtocolDescriptor,
   Provider,
-  ProviderValidationBatch,
   ProviderValidationPreview,
   ProviderValidationSelection,
-  ProviderValidationStartOutcome,
   RestartPreview,
   WorkflowCommand,
-  WorkflowCommandResult,
   RolePreparation,
   StateCursor,
   StateWaitResult,
   TaskContent,
-  TranscriptPage,
   UsageComparisonFilters,
   UsageComparisonPage,
   WorkflowComparisonQuery,
@@ -40,12 +32,62 @@ import type {
   ComparisonEvidencePage,
   GuidanceReauthorizationPreview,
 } from "./types";
-import { ROLES } from "./types";
 import type {
-  ConversationAdmission, ConversationDetail, ConversationMessages, ConversationMutation,
-  ConversationMutationResult, ConversationPage, ConversationProfile, ConversationRead,
-  ConversationReceipt, ConversationSummary, ConversationWorkspaceIdentity,
+  ConversationMutation,
+  ConversationMutationResult,
+  ConversationRead,
 } from "./types";
+
+import {
+  field,
+  decisionIsCurrent,
+  cursorIsCanonical,
+  hasStrings,
+  hasNullableString,
+  compatibilityIsCurrent,
+  attentionItemIsCurrent,
+  taskActionsAreCurrent,
+  providerValidationPreviewIsCurrent,
+  providerValidationBatchIsCurrent,
+  providerValidationStartOutcomeIsFor,
+  taskWorkflowIsCurrent,
+  workflowExecutionIsCurrent,
+  sessionGenerationIsCurrent,
+  workflowCommandResultIsCurrent,
+  providerValidationStateIsCurrent,
+  taskContentRecordIsCurrent,
+  currentInputIsCurrent,
+  guidanceComparisonIsCurrent,
+  conversationProfileIsCurrent,
+  conversationMutationIsCurrent,
+  conversationReadIsCurrent,
+  transcriptPageIsCurrent,
+  historyPaneOutcomeIsCurrent,
+  historyPaneViewsAreCurrent,
+  historyExportTextIsCurrent,
+  comparisonRecipeAttributionIsCurrent,
+  utf8Bytes,
+  scheduleOutcomes,
+  nonnegativeInteger,
+  scheduleExecutionCommandIsCurrent,
+  scheduleCommandResultMatches,
+  scheduleOccurrenceIsCurrent,
+  scheduleExecutionStateIsCurrent,
+  knowledgeSelectionIsCurrent,
+  knowledgeCommandIsCurrent,
+} from "./apiValidation";
+import type { ConversationReadResults } from "./apiValidation";
+export {
+  conversationMutationIsCurrent,
+  utf8Bytes,
+  scheduleLimitsAreCurrent,
+  schedulePreviewRequestIsCurrent,
+  scheduleStopBindingIsCurrent,
+  scheduleStopIntentIsCurrent,
+  scheduleExecutionCommandIsCurrent,
+  knowledgeSelectionIsCurrent,
+  knowledgeCommandIsCurrent,
+} from "./apiValidation";
 
 export class ApiError extends Error {
   constructor(
@@ -328,431 +370,6 @@ export async function bootstrap(): Promise<void> {
     body: JSON.stringify({ token }),
   }, transportTimeouts.mutation);
 }
-const field = (value: unknown, name: string): unknown =>
-  typeof value === "object" && value !== null && !Array.isArray(value)
-    ? Reflect.get(value, name)
-    : undefined;
-const decisionIsCurrent = (value: unknown): boolean => {
-  const prerequisites = field(value, "prerequisites");
-  const policyControls = field(
-    field(value, "control_policy"),
-    "allowed_controls",
-  );
-  const action = field(value, "next_action");
-  const owner = field(field(value, "ownership"), "owner");
-  const blocker = field(value, "primary_blocker");
-  return field(value, "decision_schema") === 1 &&
-    typeof field(value, "reason_code") === "string" &&
-    ["ready", "waiting", "held", "retry_deferred", "terminal"].includes(
-      String(field(value, "disposition")),
-    ) &&
-    ["service", "human", "provider", "external"].includes(String(owner)) &&
-    field(value, "subject") !== undefined &&
-    Array.isArray(prerequisites) &&
-    prerequisites.every((item: unknown) =>
-      typeof field(item, "code") === "string" &&
-      ["satisfied", "missing", "stale", "pending", "uncertain", "unknown"]
-        .includes(String(field(item, "state")))
-    ) &&
-    (blocker === undefined || blocker === null ||
-      ["satisfied", "missing", "stale", "pending", "uncertain", "unknown"]
-        .includes(String(field(blocker, "state")))) &&
-    Array.isArray(policyControls) &&
-    policyControls.every((control: unknown) => typeof control === "string") &&
-    (action === undefined || action === null ||
-      (typeof field(action, "operation") === "string" &&
-        typeof field(action, "enabled") === "boolean" &&
-        field(action, "binding") !== undefined));
-};
-const MAX_REVISION = "9223372036854775807";
-const MAX_INCARNATION_BYTES = 128;
-// The service spells each revision one way (no sign or leading zero) within
-// SQLite's signed 64-bit range, so clients may order revisions as strings.
-const cursorIsCanonical = (incarnation: string, revision: string) =>
-  incarnation.length > 0 &&
-  new TextEncoder().encode(incarnation).length <= MAX_INCARNATION_BYTES &&
-  /^(0|[1-9][0-9]*)$/.test(revision) &&
-  (revision.length < MAX_REVISION.length ||
-    (revision.length === MAX_REVISION.length && revision <= MAX_REVISION));
-const hasStrings = (value: unknown, names: string[]) =>
-  names.every((name) => typeof field(value, name) === "string");
-const hasNullableString = (value: unknown, name: string) => {
-  const item = field(value, name);
-  return item === null || typeof item === "string";
-};
-const taskTargetIsCurrent = (value: unknown) =>
-  hasStrings(value, ["project_id", "task_id"]) &&
-  Number.isInteger(field(value, "task_version"));
-const attentionTargetIsCurrent = (value: unknown): boolean => {
-  switch (field(value, "kind")) {
-    case "conversation":
-      return hasStrings(value, ["project_id", "conversation_id", "generation"]) &&
-        ["request_id", "turn_id", "operation_id"].every((key) => hasNullableString(value, key));
-    case "task":
-      return taskTargetIsCurrent(value);
-    case "attempt":
-      return hasStrings(value, [
-        "project_id",
-        "task_id",
-        "attempt_id",
-        "phase",
-      ]) &&
-        hasNullableString(value, "plan_hash") &&
-        hasNullableString(value, "candidate_hash");
-    case "session":
-      return hasStrings(value, [
-        "project_id",
-        "task_id",
-        "attempt_id",
-        "session_id",
-        "role_generation_id",
-      ]);
-    case "permission_request":
-      return hasStrings(value, [
-        "project_id",
-        "task_id",
-        "attempt_id",
-        "session_id",
-        "request_id",
-      ]) && Number.isInteger(field(value, "request_revision"));
-    case "recovery_record":
-      return hasStrings(value, [
-        "project_id",
-        "task_id",
-        "attempt_id",
-        "recovery_id",
-      ]);
-    case "project_setup":
-      return hasStrings(value, ["project_id"]) &&
-        hasNullableString(value, "setup_operation_id");
-    case "role_settings":
-      return hasStrings(value, ["project_id", "task_id", "role"]) &&
-        Number.isInteger(field(value, "settings_revision"));
-    case "diagnostics":
-      return true;
-    default:
-      return false;
-  }
-};
-const attentionCategories = [
-  "permission",
-  "decision",
-  "recovery",
-  "compatibility",
-  "blocked",
-  "awaiting_acceptance",
-];
-const compatibilityStatuses: CompatibilityExplanation["status"][] = [
-  "matched",
-  "unknown_version",
-  "ambiguous_manifest",
-  "contract_changed",
-  "evidence_stale",
-  "manifest_invalid",
-];
-const compatibilityActions: CompatibilityExplanation["action"][] = [
-  "install_supported_provider_version",
-  "update_llmrelay_release",
-  "requalify_exact_profile",
-  "inspect_local_provider_configuration",
-  "contact_operator",
-];
-const compatibilityIsCurrent = (value: unknown) => {
-  if (value == null) return true;
-  const status = field(value, "status");
-  const action = field(value, "action");
-  const missing = field(value, "missing_evidence");
-  return compatibilityStatuses.some((value) => value === status) &&
-    compatibilityActions.some((value) => value === action) &&
-    typeof field(value, "message") === "string" &&
-    Array.isArray(missing) && missing.every((item) => typeof item === "string");
-};
-const attentionActionIsCurrent = (value: unknown) =>
-  value === undefined || value === null ||
-  (hasStrings(value, ["kind", "label"]) &&
-    [
-      "review_plan",
-      "review_request",
-      "review_result",
-      "answer_question",
-      "open_task",
-      "open_agent_output",
-      "open_project_setup",
-      "open_agent_settings",
-      "open_diagnostics",
-      "resolve_issue",
-    ].includes(String(field(value, "kind"))));
-const attentionItemIsCurrent = (value: unknown) => {
-  const target = field(value, "target");
-  const held = field(value, "held_tasks");
-  const details = field(value, "details");
-  return hasStrings(value, ["id", "title", "reason"]) &&
-    (details === undefined || details === null || typeof details === "string") &&
-    attentionActionIsCurrent(field(value, "action")) &&
-    attentionCategories.includes(String(field(value, "category"))) &&
-    (target === null || attentionTargetIsCurrent(target)) &&
-    Array.isArray(held) && held.every(taskTargetIsCurrent);
-};
-// A task action must name one of the snapshot's attention items for its task,
-// so a card or header can never route anywhere the inbox would not.
-const taskActionsAreCurrent = (state: AppState) => {
-  const actions: unknown = state.task_actions;
-  if (actions === undefined) return true;
-  return Array.isArray(actions) && actions.every((value) => {
-    const ids = field(value, "item_ids");
-    const primary = state.attention.find((item) =>
-      item.id === field(value, "item_id")
-    );
-    return hasStrings(value, ["task_id", "item_id"]) &&
-      attentionActionIsCurrent(field(value, "action")) &&
-      field(value, "action") != null &&
-      Array.isArray(ids) && ids.length > 0 &&
-      ids.every((id) => typeof id === "string") &&
-      ids[0] === field(value, "item_id") &&
-      primary !== undefined &&
-      primary.target !== null &&
-      "task_id" in primary.target &&
-      primary.target.task_id === field(value, "task_id") &&
-      ids.every((id) =>
-        state.attention.some((item) =>
-          item.id === id && item.target !== null && "task_id" in item.target &&
-          item.target.task_id === field(value, "task_id")
-        )
-      );
-  });
-};
-const validationProviders = ["codex", "claude"];
-const providerCheckStates = [
-  "pending",
-  "reserved",
-  "running",
-  "succeeded",
-  "failed",
-  "delivery_unknown",
-  "cancel_requested",
-  "cancelled",
-  "skipped",
-];
-const isNonNegativeInteger = (value: unknown) =>
-  Number.isSafeInteger(value) && Number(value) >= 0;
-const providerInstallationIsCurrent = (value: unknown) =>
-  validationProviders.includes(String(field(value, "provider"))) &&
-  typeof field(value, "ready") === "boolean" &&
-  [
-    "executable_path",
-    "executable_version",
-    "account_identity",
-    "authentication",
-    "model_calls_disabled_reason",
-    "guidance",
-  ].every((name) => hasNullableString(value, name));
-const providerCheckPreviewIsCurrent = (value: unknown) => {
-  const listed = field(value, "model_listed");
-  return hasStrings(value, ["model", "effort", "reason"]) &&
-    validationProviders.includes(String(field(value, "provider"))) &&
-    ["reuse_proof", "model_call", "unavailable"].includes(
-      String(field(value, "plan")),
-    ) &&
-    isNonNegativeInteger(field(value, "ordinal")) &&
-    hasNullableString(value, "proof_observed_at") &&
-    hasNullableString(value, "proof_expires_at") &&
-    (listed === null || typeof listed === "boolean");
-};
-const providerValidationPreviewIsCurrent = (
-  value: unknown,
-): value is ProviderValidationPreview => {
-  const installations = field(value, "installations");
-  const checks = field(value, "checks");
-  return typeof field(value, "preview_hash") === "string" &&
-    isNonNegativeInteger(field(value, "model_calls_required")) &&
-    Array.isArray(installations) &&
-    installations.every(providerInstallationIsCurrent) &&
-    Array.isArray(checks) && checks.every(providerCheckPreviewIsCurrent);
-};
-const providerCheckIsCurrent = (value: unknown) =>
-  hasStrings(value, ["id", "model", "effort", "updated_at"]) &&
-  validationProviders.includes(String(field(value, "provider"))) &&
-  providerCheckStates.includes(String(field(value, "state"))) &&
-  isNonNegativeInteger(field(value, "ordinal")) &&
-  typeof field(value, "reused_proof") === "boolean" &&
-  ["reason", "proof_observed_at", "proof_expires_at"].every((name) =>
-    hasNullableString(value, name)
-  );
-const providerValidationBatchIsCurrent = (
-  value: unknown,
-): value is ProviderValidationBatch => {
-  const checks = field(value, "checks");
-  return hasStrings(value, ["id", "operation_id", "created_at", "updated_at"]) &&
-    ["running", "cancel_requested", "finished", "cancelled"].includes(
-      String(field(value, "state")),
-    ) &&
-    typeof field(value, "model_calls_authorized") === "boolean" &&
-    isNonNegativeInteger(field(value, "max_model_calls")) &&
-    hasNullableString(value, "finished_at") &&
-    Array.isArray(checks) && checks.every(providerCheckIsCurrent);
-};
-// An outcome counts only for the exact operation it was requested for.
-const providerValidationStartOutcomeIsFor = (operation: string) =>
-(
-  value: unknown,
-): value is ProviderValidationStartOutcome => {
-  const outcome = field(value, "outcome");
-  if (outcome === "started") {
-    const batch = field(value, "batch");
-    return providerValidationBatchIsCurrent(batch) &&
-      batch.operation_id === operation;
-  }
-  return outcome === "closed_without_start" &&
-    field(value, "operation_id") === operation &&
-    typeof field(value, "closed_at") === "string";
-};
-const singleAgentStages = [
-  "waiting_to_start",
-  "writing",
-  "result_submitted_waiting_for_stop",
-  "awaiting_selected_checks",
-  "awaiting_review", "review_running", "review_blocked",
-  "awaiting_human",
-  "accepted",
-  "probe_evidence_recorded",
-  "changes_requested",
-  "needs_action",
-  "blocked",
-];
-const singleAgentCheckIsCurrent = (value: unknown) =>
-  hasStrings(value, [
-    "check_id",
-    "check_key",
-    "original_text",
-    "cwd",
-    "exact_command_hash",
-    "scope_hash",
-  ]) &&
-  ["exact_argv", "exact_shell"].includes(String(field(value, "command_kind"))) &&
-  ["authorized", "denied", "missing"].includes(
-    String(field(value, "authorization")),
-  ) &&
-  Array.isArray(field(value, "arguments")) &&
-  hasNullableString(value, "latest_run_id") &&
-  hasNullableString(value, "latest_run_status");
-const acceptanceRowIsCurrent = (value: unknown) => {
-  const evidence = field(value, "evidence");
-  return typeof field(value, "criterion") === "string" &&
-    ["met", "unmet"].includes(String(field(value, "status"))) &&
-    Array.isArray(evidence) && evidence.every((item) =>
-      ["source", "check", "manual", "not_run"].includes(String(field(item, "kind"))) &&
-      typeof field(item, "detail") === "string"
-    );
-};
-const singleAgentRunIsCurrent = (value: unknown) => {
-  if (value === null) return true;
-  const actions = field(value, "available_actions");
-  const checks = field(value, "selected_check_ids");
-  const runChecks = field(value, "checks");
-  const result = field(value, "result");
-  const rows = field(result, "acceptance_rows");
-  const review = field(value, "review");
-  const findings = field(review, "findings");
-  return hasStrings(value, ["attempt_id", "definition_state", "stage_reason"]) &&
-    singleAgentStages.includes(String(field(value, "stage"))) &&
-    (field(value, "preset") === undefined || ["single_agent", "repository_research", "build_and_review"].includes(String(field(value, "preset")))) &&
-    (review == null || (hasStrings(review, ["delivery_id", "state", "candidate_hash", "result_binding_id"]) &&
-      Number.isSafeInteger(field(review, "ordinal")) && Number.isSafeInteger(field(review, "remaining_deliveries")) &&
-      typeof field(review, "repair_used") === "boolean" && hasNullableString(review, "reason") &&
-      hasNullableString(review, "summary") && hasNullableString(review, "verdict") &&
-      Array.isArray(findings) && findings.every((finding) => typeof finding === "string"))) &&
-    typeof field(value, "integration_recorded") === "boolean" &&
-    Array.isArray(actions) && actions.every((action) =>
-      [
-        "accept_result",
-        "request_rework",
-        "authorize_check",
-        "resume_run",
-        "cancel",
-      ].includes(String(action))
-    ) &&
-    (field(value, "resume") === null ||
-      (hasStrings(field(value, "resume"), ["session_id", "transcript_epoch"]) &&
-        typeof field(field(value, "resume"), "available") === "boolean")) &&
-    Array.isArray(checks) && checks.every((id) => typeof id === "string") &&
-    Array.isArray(runChecks) && runChecks.every(singleAgentCheckIsCurrent) &&
-    Array.isArray(field(value, "guidance_changes")) &&
-    hasNullableString(value, "guidance_change_hash") &&
-    (result === null ||
-      (hasStrings(result, ["id", "state", "summary", "created_at"]) &&
-        Array.isArray(rows) && rows.every(acceptanceRowIsCurrent) &&
-        hasNullableString(result, "candidate_hash") &&
-        hasNullableString(result, "snapshot_id")));
-};
-// Absent for tasks without a selection; a present selection must be current.
-const taskWorkflowIsCurrent = (value: unknown) => {
-  if (value === undefined) return true;
-  const checks = field(value, "check_ids");
-  return ["trip", "single_agent"].includes(String(field(value, "family"))) &&
-    ["draft", "admitted", "invalidated"].includes(
-      String(field(value, "admission_state")),
-    ) &&
-    isNonNegativeInteger(field(value, "selection_revision")) &&
-    Array.isArray(checks) && checks.every((id) => typeof id === "string") &&
-    singleAgentRunIsCurrent(field(value, "run") ?? null);
-};
-// A probe is offered only with an explicit availability and, when it is
-// unavailable, the reason the command would give.
-const profileAdmissionIsCurrent = (value: unknown) => {
-  const available = field(value, "probe_available");
-  const reason = field(value, "probe_unavailable_reason");
-  return typeof available === "boolean" &&
-    (available ? reason === null : typeof reason === "string");
-};
-const workflowExecutionIsCurrent = (value: unknown) =>
-  value === undefined ||
-  (Array.isArray(value) && value.every((project) => {
-    const admissions = field(project, "admissions");
-    return typeof field(project, "project_id") === "string" &&
-      ["trip", "single_agent"].includes(String(field(project, "default_family"))) &&
-      ["configurations", "profiles"].every((name) =>
-        Array.isArray(field(project, name))
-      ) &&
-      Array.isArray(admissions) && admissions.every(profileAdmissionIsCurrent);
-  }));
-const roleGenerationStatuses = [
-  "launch_reserved",
-  "running",
-  "stopping",
-  "exited",
-  "launch_failed",
-  "recovery_required",
-  "replaced",
-  "revoked",
-];
-// Both fields are absent from older services; a present value must be known.
-const sessionGenerationIsCurrent = (value: unknown) => {
-  const status = field(value, "generation_status");
-  const newer = field(value, "has_newer_generation");
-  return (status === undefined || roleGenerationStatuses.includes(String(status))) &&
-    (newer === undefined || typeof newer === "boolean" || newer === 0 || newer === 1);
-};
-const workflowCommandResultIsCurrent = (
-  value: unknown,
-): value is WorkflowCommandResult =>
-  hasStrings(value, ["operation_id", "entity_kind", "entity_id", "state"]) &&
-  (field(value, "version") === null ||
-    Number.isSafeInteger(field(value, "version")));
-// Absent from older services; when present every part must be current.
-const providerValidationStateIsCurrent = (value: unknown) => {
-  if (value === undefined) return true;
-  const batches = field(value, "batches");
-  const proofs = field(value, "proofs");
-  return Array.isArray(batches) &&
-    batches.every(providerValidationBatchIsCurrent) &&
-    Array.isArray(proofs) && proofs.every((proof) =>
-      hasStrings(proof, ["model", "effort", "observed_at", "expires_at"]) &&
-      validationProviders.includes(String(field(proof, "provider"))) &&
-      hasNullableString(proof, "executable_version") &&
-      hasNullableString(proof, "account_identity") &&
-      typeof field(proof, "expired") === "boolean"
-    );
-};
 const currentSnapshot = (state: AppState): AppState => {
   const recipePins = (value: unknown) => {
     const family = field(value, "family");
@@ -794,13 +411,15 @@ const currentSnapshot = (state: AppState): AppState => {
     ) ||
     !recipeArray(state.recipe_schedules, ["id", "project_id", "name", "recipe_revision_id", "recipe_name", "recipe_config_revision_id", "cadence", "anchor_utc"]) ||
     !state.recipe_schedules.every((item) =>
-      typeof item.paused === "boolean" && typeof item.recipe_archived === "boolean" &&
+      scheduleExecutionStateIsCurrent(item) && typeof item.paused === "boolean" && typeof item.recipe_archived === "boolean" &&
       ["daily", "weekly"].includes(item.cadence) &&
       (item.next_fire_utc === null || typeof item.next_fire_utc === "string") &&
       (item.last_fire === null ||
-        (["task_created", "skipped_ineligible", "missed"].includes(item.last_fire.outcome) &&
+        (scheduleOutcomes.includes(item.last_fire.outcome) &&
           typeof item.last_fire.scheduled_for_utc === "string" &&
-          Number.isSafeInteger(item.last_fire.missed_count)))
+          nonnegativeInteger(item.last_fire.missed_count) &&
+          ["task_id", "reason", "missed_first_utc", "missed_last_utc"].every((key) => hasNullableString(item.last_fire, key)) &&
+          (item.mode === undefined || scheduleOccurrenceIsCurrent(item.last_fire, item))))
     )
     || !Array.isArray(state.tasks) || !state.tasks.every((task) => {
       if (typeof task.can_archive !== "boolean") return false;
@@ -989,58 +608,6 @@ export const getRolePreparations = async (taskId: string) => {
   }
   return preparations;
 };
-const taskContentRecordIsCurrent = (value: unknown) =>
-  ["report", "rework_request"].includes(String(field(value, "kind"))) &&
-  hasStrings(value, ["id", "created_at", "summary"]) &&
-  ["plan", "role", "outcome", "review_kind"].every((name) => {
-    const item = field(value, name);
-    return item === undefined || item === null || typeof item === "string";
-  });
-const executionActors: string[] = [...ROLES, "single_agent", "single_agent_reviewer"];
-const currentInputOutcome = (kind: unknown) =>
-  kind === "question" ? "needs_input" : kind === "blocked" ? "blocked" : undefined;
-const currentInputUnavailableReasons = [
-  "not_recorded",
-  "missing",
-  "mismatched",
-  "superseded",
-  "generation_replaced",
-];
-// Absent from older services. A present source must be bound to the same
-// attempt, and an available report must be exactly the one the hold names:
-// same ID, actor and outcome, never retired by a later native turn.
-const currentInputIsCurrent = (value: unknown, attemptId: string | null) => {
-  if (value === undefined || value === null) return true;
-  const outcome = currentInputOutcome(field(value, "kind"));
-  const role = field(value, "role");
-  if (
-    attemptId === null || field(value, "attempt_id") !== attemptId ||
-    outcome === undefined ||
-    !(role === null || executionActors.includes(String(role))) ||
-    !hasNullableString(value, "result_id") ||
-    !hasNullableString(value, "role_generation_id")
-  ) return false;
-  const report = field(value, "report");
-  switch (field(value, "state")) {
-    case "available":
-      return field(value, "unavailable_reason") === undefined &&
-        taskContentRecordIsCurrent(report) &&
-        field(report, "kind") === "report" &&
-        typeof field(value, "result_id") === "string" &&
-        field(report, "id") === field(value, "result_id") &&
-        typeof field(value, "role_generation_id") === "string" &&
-        role !== null && field(report, "role") === role &&
-        field(report, "outcome") === outcome &&
-        field(report, "superseded_by_native_turn") == null;
-    case "unavailable":
-      return report === undefined &&
-        currentInputUnavailableReasons.includes(
-          String(field(value, "unavailable_reason")),
-        );
-    default:
-      return false;
-  }
-};
 /** Plans, reports and feedback for the task's current attempt. */
 export const getTaskContent = async (taskId: string, signal?: AbortSignal) => {
   const content = await json<TaskContent>(
@@ -1062,33 +629,6 @@ export const getTaskContent = async (taskId: string, signal?: AbortSignal) => {
     );
   }
   return content;
-};
-// Older services send neither part. A present comparison must be complete:
-// a pinned baseline hashes to the reviewed pin, and a diff exists exactly
-// when a baseline was available.
-const guidanceComparisonIsCurrent = (file: unknown) => {
-  const baseline = field(file, "baseline");
-  const diff = field(file, "diff");
-  if (baseline === undefined) return diff === undefined;
-  const source = field(baseline, "source");
-  const sha256 = field(baseline, "sha256");
-  const reason = field(baseline, "reason");
-  if (
-    typeof field(baseline, "revision") !== "string" ||
-    !["pinned", "base_commit", "unavailable"].includes(String(source))
-  ) return false;
-  if (source === "unavailable") {
-    return sha256 === null && typeof reason === "string" && diff === null;
-  }
-  return typeof sha256 === "string" && /^[0-9a-f]{64}$/.test(sha256) &&
-    (source === "pinned") === (sha256 === field(file, "previous_sha256")) &&
-    reason === null && Array.isArray(diff) && diff.every((line) => {
-      const kind = field(line, "kind");
-      return kind === "unchanged"
-        ? Number.isSafeInteger(field(line, "lines")) && Number(field(line, "lines")) > 0
-        : ["context", "removed", "added"].includes(String(kind)) &&
-          typeof field(line, "text") === "string";
-    });
 };
 export const getGuidanceReauthorization = async (taskId: string) => {
   const preview = await json<GuidanceReauthorizationPreview>(
@@ -1132,23 +672,35 @@ const preserveMutationIdentity = <T>(
     }
     throw cause;
   });
-export const command = (body: Command) =>
-  preserveMutationIdentity(
+export const command = async (body: Command) => {
+  if (body.kind === "authorize_recipe_schedule_execution") throw new Error("Automatic recipe execution has been retired. Create a draft schedule instead.");
+  const scheduleCommand = ["authorize_recipe_schedule_execution", "stop_recipe_schedule_occurrence", "request_recipe_schedule_occurrence_stop"].includes(body.kind);
+  const scheduleFeatures = ["schedule_execution_authorization_v1", "project_knowledge_v1", ...(body.kind === "request_recipe_schedule_occurrence_stop" ? ["schedule_occurrence_stop_intent_v1"] : [])];
+  if (scheduleCommand && !scheduleExecutionCommandIsCurrent(body)) return Promise.reject(new Error("Refresh the schedule and review its exact authorization or stop target before sending."));
+  if (scheduleCommand) {
+    const descriptor = negotiated ?? await negotiate();
+    if (!scheduleFeatures.every((feature) => descriptor.supported_features.includes(feature))) throw new ProtocolError("This service cannot authorize or stop this scheduled run. Reload with a supporting service.", "missing_required_feature");
+  }
+  // The journal keeps project context; typed intent commands have no top-level project on the wire.
+  const response = await preserveMutationIdentity(
     json<{ result: Record<string, unknown> }>(
       "/api/command",
       {
         method: "POST",
-        body: JSON.stringify(body),
+        body: JSON.stringify(body.kind === "request_recipe_schedule_occurrence_stop" ? { kind: body.kind, operation_id: body.operation_id, intent: body.intent } : body.kind === "prepare_next_run_knowledge" ? { kind: body.kind, request: body.request } : body),
       },
       transportTimeouts.mutation,
       ["add_task_comment", "edit_guidance", "cancel_guidance"].includes(
           String(body.kind),
         )
         ? ["task_interactions_v1"]
-        : body.kind === "upsert_single_agent_recipe" ? ["single_agent_presets_v1"] : [],
+        : scheduleCommand ? scheduleFeatures : ["set_task_knowledge", "prepare_next_run_knowledge"].includes(body.kind) ? ["project_knowledge_v1"] : body.kind === "upsert_single_agent_recipe" ? ["single_agent_presets_v1"] : [],
     ),
     body.operation_id,
   );
+  if (scheduleCommand && !scheduleCommandResultMatches(body, field(response, "result"))) throw new ApiError("The schedule response could not be matched to the saved operation. Its outcome is uncertain. Refresh and check the schedule before recovering the exact request.", 0, body.operation_id, true);
+  return response;
+};
 export const operation = async <T = Record<string, unknown>>(
   body: Operation | CapabilityRecordFunctionalProofOperation,
 ): Promise<T> => {
@@ -1232,101 +784,18 @@ const featureOperation = async <T>(
   return response.result;
 };
 
-const nullableText = (value: unknown): boolean => value === null || typeof value === "string";
-const conversationProfileIsCurrent = (value: unknown): value is ConversationProfile =>
-  hasStrings(value, ["id", "project_id", "execution_config_revision_id", "model", "effort", "instructions", "instructions_hash", "profile_hash"]);
-const conversationAdmissionIsCurrent = (value: unknown): value is ConversationAdmission =>
-  hasStrings(value, ["id", "profile_revision_id", "recorded_state"]) &&
-  ["evidence_hash", "probe_invocation_id"].every((key) => nullableText(field(value, key))) &&
-  typeof field(value, "live_eligibility_checked") === "boolean";
-const conversationSummaryIsCurrent = (value: unknown): value is ConversationSummary =>
-  hasStrings(value, ["id", "project_id", "admission_id", "state", "generation", "created_at", "updated_at"]) &&
-  ["session_id", "reservation_state", "active_turn_id"].every((key) => nullableText(field(value, key))) &&
-  ["binding_valid", "is_probe"].every((key) => typeof field(value, key) === "boolean");
-
-export function conversationMutationIsCurrent(value: unknown): value is ConversationMutation {
-  const action = field(value, "action");
-  if (action === "create_profile") return hasStrings(field(value, "input"),
-    ["operation_id", "project_id", "execution_config_revision_id", "model", "effort", "instructions"]);
-  if (!hasStrings(value, ["operation_id"])) return false;
-  switch (action) {
-    case "prepare": return hasStrings(value, ["profile_revision_id"]);
-    case "probe": return hasStrings(value, ["admission_id"]);
-    case "activate": return hasStrings(value, ["admission_id", "evidence_hash"]);
-    case "start": return hasStrings(value, ["admission_id", "input"]);
-    case "submit": return hasStrings(value, ["conversation_id", "input"]);
-    case "steer": return hasStrings(value, ["conversation_id", "expected_turn_id", "input"]);
-    case "interrupt_turn": return hasStrings(value, ["conversation_id", "expected_session_id", "expected_generation", "expected_turn_id"]);
-    case "disconnect_idle": return hasStrings(value, ["conversation_id", "expected_session_id", "expected_generation"]);
-    case "resume": case "reconcile": return hasStrings(value, ["conversation_id"]);
-    default: return false;
-  }
-}
-interface ConversationReadResults {
-  workspace_identity: ConversationWorkspaceIdentity;
-  list: ConversationPage<ConversationSummary>;
-  profiles: ConversationPage<ConversationProfile>;
-  admissions: ConversationPage<ConversationAdmission>;
-  detail: ConversationDetail;
-  messages: ConversationMessages;
-  task_sources: import("./types").TaskSources;
-  receipt: ConversationReceipt;
-}
-function conversationReadIsCurrent(action: ConversationRead["action"], value: unknown): boolean {
-  if (action === "workspace_identity") return hasStrings(value, ["project_id", "storage_scope"]) &&
-    /^[a-f0-9]{64}$/.test(String(field(value, "storage_scope")));
-  if (action === "list" || action === "profiles" || action === "admissions") {
-    const items = field(value, "items");
-    const valid = action === "list" ? conversationSummaryIsCurrent : action === "profiles" ? conversationProfileIsCurrent : conversationAdmissionIsCurrent;
-    return Array.isArray(items) && items.length <= 50 && items.every(valid) && nullableText(field(value, "next_cursor"));
-  }
-  if (action === "receipt") return hasStrings(value, ["operation_id", "request_hash"]) &&
-    typeof field(value, "found") === "boolean" &&
-    ["kind", "delivery_state", "conversation_id", "generation", "profile_revision_id", "admission_id", "state", "quiescence"].every((key) => nullableText(field(value, key))) &&
-    (field(value, "retained_uncertainty_session_id") === undefined || nullableText(field(value, "retained_uncertainty_session_id")));
-  if (action === "task_sources") {
-    const frozen = field(value, "conversation_source");
-    if (!hasStrings(value, ["project_id", "task_id"])) return false;
-    if (frozen === null) return true;
-    const bundle = field(frozen, "bundle"), messages = field(bundle, "messages");
-    return hasStrings(frozen, ["bundle_hash"]) && hasStrings(bundle, ["project_id", "conversation_id", "history_coverage"]) &&
-      isNonNegativeInteger(field(bundle, "format_revision")) && isNonNegativeInteger(field(bundle, "through_sequence")) &&
-      hasStrings(field(bundle, "attribution"), ["identity_hash", "profile_revision_id", "profile_hash", "model", "effort", "executable_version", "adapter_revision", "adapter_hash", "schema_hash"]) &&
-      Array.isArray(messages) && messages.length <= 16 && messages.every((message) =>
-        hasStrings(message, ["id", "text", "content_hash", "coverage"]) &&
-        ["first_sequence", "last_sequence"].every((key) => isNonNegativeInteger(field(message, key))) &&
-        hasStrings(field(message, "source"), ["conversation_id"]) &&
-        (field(field(message, "source"), "kind") === "user" ? hasStrings(field(message, "source"), ["operation_id"]) :
-          field(field(message, "source"), "kind") === "assistant" && ["turn_id", "item_id"].every((key) => nullableText(field(field(message, "source"), key)))));
-  }
-  if (action === "messages") {
-    const messages = field(value, "messages");
-    return Array.isArray(messages) && messages.every((message) => {
-      const source = field(message, "source");
-      return hasStrings(message, ["id", "text", "content_hash", "coverage"]) &&
-        ["first_sequence", "last_sequence"].every((key) => isNonNegativeInteger(field(message, key))) &&
-        typeof field(message, "selectable") === "boolean" && hasStrings(source, ["conversation_id"]) &&
-        (field(source, "kind") === "user" ? hasStrings(source, ["operation_id"]) :
-          field(source, "kind") === "assistant" && ["turn_id", "item_id"].every((key) => nullableText(field(source, key))));
-    }) && isNonNegativeInteger(field(value, "through_sequence")) && hasStrings(value, ["history_coverage"]);
-  }
-  const events = field(value, "events"), requests = field(value, "requests");
-  return conversationSummaryIsCurrent(field(value, "conversation")) &&
-    conversationProfileIsCurrent(field(value, "profile")) && conversationAdmissionIsCurrent(field(value, "admission")) &&
-    typeof field(value, "unresolved_operation") === "boolean" && nullableText(field(value, "unresolved_operation_id")) && typeof field(value, "has_more") === "boolean" &&
-    isNonNegativeInteger(field(value, "next_after")) && hasStrings(value, ["history_coverage"]) &&
-    Array.isArray(requests) && requests.every((request) => hasStrings(request, ["generation", "thread_id", "turn_id", "request_id", "method", "state"])) &&
-    Array.isArray(events) && events.length <= 50 && events.every((event) =>
-      isNonNegativeInteger(field(event, "sequence")) && hasStrings(event, ["kind", "observed_at"]) &&
-      ["turn_id", "operation_id"].every((key) => nullableText(field(event, key))) &&
-      typeof field(event, "payload") === "object" && field(event, "payload") !== null && !Array.isArray(field(event, "payload")));
-}
 export function conversationRead<T extends ConversationRead>(operation: T): Promise<ConversationReadResults[T["action"]]> {
   return featureOperation("conversation_v1", { kind: "conversation", operation },
     (value): value is ConversationReadResults[T["action"]] => conversationReadIsCurrent(operation.action, value));
 }
 export async function prepareConversationMutation(operation: ConversationMutation): Promise<void> {
   if (!conversationMutationIsCurrent(operation)) throw new Error("The conversation request is invalid. Review its fields before sending.");
+  if (operation.action === "with_knowledge") {
+    await prepareConversationMutation(operation.operation);
+    await requireKnowledgeFeature();
+    if (utf8Bytes(JSON.stringify({ kind: "conversation", operation })) > 16384) throw new Error("Select fewer entries or shorten the message; the conversation request exceeds 16 KiB.");
+    return;
+  }
   const encoder = new TextEncoder();
   if (encoder.encode(JSON.stringify(operation)).length > 16384) throw new Error("The serialized conversation request exceeds 16 KiB. Shorten the input before sending.");
   const fields = operation.action === "create_profile" ? operation.input : operation;
@@ -1345,71 +814,13 @@ export async function prepareConversationMutation(operation: ConversationMutatio
   }
 }
 export function conversationMutate(operation: ConversationMutation): Promise<ConversationMutationResult> {
+  if (operation.action === "with_knowledge") return knowledgeConversationMutate(operation);
   return preserveMutationIdentity(featureOperation("conversation_v1", { kind: "conversation", operation },
     (value): value is ConversationMutationResult => typeof value === "object" && value !== null && !Array.isArray(value) &&
       ["state", "conversation_id", "admission_id"].every((key) => field(value, key) === undefined || typeof field(value, key) === "string") &&
       (field(value, "profile") === undefined || conversationProfileIsCurrent(field(value, "profile")))),
     operation.action === "create_profile" ? operation.input.operation_id : operation.operation_id);
 }
-const transcriptPageIsCurrent = (value: unknown): value is TranscriptPage => {
-  const frames = field(value, "frames");
-  return Array.isArray(frames) &&
-    frames.every((frame) =>
-      hasStrings(frame, ["epoch", "captured_at", "data"]) &&
-      ["base64", "utf8"].includes(String(field(frame, "encoding"))) &&
-      isNonNegativeInteger(field(frame, "sequence")) &&
-      typeof field(frame, "gap") === "boolean"
-    ) &&
-    isNonNegativeInteger(field(value, "next_sequence")) &&
-    typeof field(value, "has_more") === "boolean";
-};
-const historyPaneStates = ["reserved", "opened", "unknown", "failed", "closed"];
-const historyPaneViewIsCurrent = (value: unknown): value is HistoryPaneView =>
-  hasStrings(value, [
-    "id",
-    "operation_id",
-    "session_id",
-    "transcript_epoch",
-    "service_boot_id",
-    "created_at",
-    "updated_at",
-  ]) &&
-  historyPaneStates.includes(String(field(value, "state"))) &&
-  typeof field(value, "retry_allowed") === "boolean" &&
-  isNonNegativeInteger(field(value, "high_water_sequence")) &&
-  [
-    "role_generation_id",
-    "export_hash",
-    "workspace_id",
-    "surface_id",
-    "failure_reason",
-  ].every((name) => hasNullableString(value, name));
-const historyPaneOutcomeIsCurrent = (
-  value: unknown,
-): value is HistoryPaneOutcome =>
-  typeof field(value, "message") === "string" &&
-  historyPaneViewIsCurrent(field(value, "view"));
-const historyPaneViewsAreCurrent = (
-  value: unknown,
-): value is HistoryPaneView[] =>
-  Array.isArray(value) && value.every(historyPaneViewIsCurrent);
-const historyExportTextIsCurrent = (
-  value: unknown,
-): value is HistoryExportText => {
-  const retention = field(value, "retention");
-  const first = field(retention, "first_retained_sequence");
-  return hasStrings(value, [
-    "session_id",
-    "transcript_epoch",
-    "export_hash",
-    "text",
-  ]) &&
-    isNonNegativeInteger(field(value, "high_water_sequence")) &&
-    (first === null || isNonNegativeInteger(first)) &&
-    isNonNegativeInteger(field(retention, "high_water_sequence")) &&
-    isNonNegativeInteger(field(retention, "gap_count")) &&
-    typeof field(retention, "complete") === "boolean";
-};
 
 /** One page of one exact epoch; follow `next_sequence` while `has_more`. */
 export const readHistoryPage = (
@@ -1620,5 +1031,43 @@ export async function comparisonEvidence(query: ComparisonEvidenceQuery, signal?
   await requireWorkflowComparisons(signal);
   const params = new URLSearchParams({ selection: query.selection, snapshot: query.snapshot, group: query.group, metric: query.metric });
   if (query.cursor) params.set("cursor", query.cursor);
-  return json<ComparisonEvidencePage>(`/api/history/comparisons/evidence?${params}`, { signal }, transportTimeouts.read, ["workflow_comparisons_v1"]);
+  const page = await json<ComparisonEvidencePage>(`/api/history/comparisons/evidence?${params}`, { signal }, transportTimeouts.read, ["workflow_comparisons_v1"]);
+  if (!Array.isArray(page.rows) || !page.rows.every((row) => comparisonRecipeAttributionIsCurrent(field(row, "recipe_attribution")))) {
+    throw new ProtocolError("Saved schedule attribution could not be read. Refresh and apply the comparison again.", "invalid_comparison_attribution");
+  }
+  return page;
+}
+
+export async function recipeScheduleExecutionPreview(_request: import("./types").RecipeSchedulePreviewRequest): Promise<import("./types").RecipeScheduleExecutionPreview> {
+  throw new Error("Automatic recipe execution has been retired. Create a draft schedule instead.");
+}
+async function requireKnowledgeFeature(): Promise<void> {
+  const descriptor = negotiated ?? await negotiate();
+  if (!descriptor.supported_features.includes("project_knowledge_v1")) throw new ProtocolError(`Reload the dashboard with a service supporting project knowledge. ${PROTOCOL_GUIDANCE}`, "missing_required_feature");
+}
+async function knowledgeRequest<T>(path: string, body: unknown, mutation = false, id?: string, features: readonly string[] = []): Promise<T> {
+  await requireKnowledgeFeature();
+  const serialized = JSON.stringify(body);
+  if (utf8Bytes(serialized) > 32768) throw new Error("Shorten the input or select fewer entries; knowledge requests allow at most 32 KiB.");
+  return preserveMutationIdentity(json<T>(path, { method: "POST", body: serialized }, mutation ? transportTimeouts.mutation : transportTimeouts.read, ["project_knowledge_v1", ...features]), id);
+}
+export function knowledgeRead<T extends import("./types").KnowledgeRead>(projectId: string, read: T): Promise<import("./types").KnowledgeReadResults[T["kind"]]> {
+  return knowledgeRequest("/api/knowledge/read", { project_id: projectId, read });
+}
+export async function knowledgePreview(request: import("./types").KnowledgePreviewRequest): Promise<import("./types").KnowledgePreview> {
+  if (request.selection.length > 16 || !request.selection.every(knowledgeSelectionIsCurrent)) return Promise.reject(new Error("Select at most 16 exact revisions with bounded identifiers and current observation fingerprints."));
+  if (request.consumer.kind === "schedule") {
+    const descriptor = negotiated ?? await negotiate();
+    if (!descriptor.supported_features.includes("schedule_execution_authorization_v1")) throw new ProtocolError("This service cannot preview schedule Knowledge. Reload with a supporting service.", "missing_required_feature");
+  }
+  return knowledgeRequest("/api/knowledge/preview", request, false, undefined, request.consumer.kind === "schedule" ? ["schedule_execution_authorization_v1"] : []);
+}
+export function knowledgeCommand(request: import("./types").KnowledgeCommand): Promise<import("./types").KnowledgeEntry | import("./types").KnowledgeObservation> {
+  if (!knowledgeCommandIsCurrent(request)) return Promise.reject(new Error("Review the exact knowledge request before sending."));
+  return knowledgeRequest("/api/knowledge/command", request, true, request.kind === "mutate" ? request.request.operation_id : request.operation_id);
+}
+async function knowledgeConversationMutate(operation: Extract<ConversationMutation, { action: "with_knowledge" }>): Promise<ConversationMutationResult> {
+  await requireKnowledgeFeature();
+  const response = await preserveMutationIdentity(json<{ result: ConversationMutationResult }>("/api/operation", { method: "POST", body: JSON.stringify({ kind: "conversation", operation }) }, transportTimeouts.mutation, ["conversation_v1", "project_knowledge_v1"]), operation.operation_id);
+  return response.result;
 }

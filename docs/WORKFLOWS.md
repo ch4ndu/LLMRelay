@@ -12,10 +12,9 @@
 For a first small task, start with [Single agent](#single-agent-workflow).
 For the full planning and review process, use [TRIP](#required-trip-workflow).
 A project can offer both. Neither workflow requires you to use both providers.
-Single agent also offers **Repository research** and **Build and review** presets.
-Their exact provider policies must be qualified before they can run; the setup
-screen shows any blocker. Recipes and schedules can retain any of these choices.
-Custom workflow editing is not available.
+The unqualified **Repository research** and **Build and review** Single agent presets
+are retired. Their historical records remain readable. This does not remove the
+Explorer or reviewer roles in the separate TRIP workflow.
 
 **Ready** means queued. **Your review** means the app is waiting for your decision.
 **Done** means you accepted the result; it does not mean the changes were merged
@@ -154,35 +153,17 @@ Follow [Single agent setup](PROJECT_SETUP.md#single-agent-setup).
 
 ### Research and independent review presets
 
-Choose the preset in the task's workflow settings. **Repository research** uses
-an admitted repository-reader profile in an isolated worktree. It can read the
-repository and submit an authenticated report, but cannot edit it, use Main
-checkout, select service checks or acquire writer permissions. Its retained
-conversation can continue only through the offered resume action. The result
-still requires your acceptance.
+Repository research and Build and review never completed their required native
+qualification and no longer accept new tasks, profile admissions, launches,
+resumes or repair runs. Stored identifiers, result reports and review receipts
+remain historical evidence; they do not grant execution authority. Old clients
+receive an explicit refusal rather than silently creating a different workflow.
 
-**Build and review** uses a writer and a separately admitted fresh reviewer.
-After the writer stops, LLMRelay captures the candidate and runs any selected,
-authorized checks. The reviewer receives a verified copy of that exact candidate,
-its report and check receipts. Both the checked and no-check paths require
-independent review before **Your review**. An approved verdict does not accept
-the task; the reviewer must stop and the same evidence must still be current
-before **Accept result** becomes available.
-
-The task has two independent review deliveries and one repair allowance across
-its entire run history. A changes-requested verdict can create one linked repair
-run from the rejected candidate, retaining the original configuration and
-profiles. The repaired candidate gets fresh checks and the remaining review.
-Restarting, changing profiles or requesting another child cannot reset the
-allowance. An uncertain delivery stays spent. Malformed, failed or exhausted
-reviews leave the task incomplete with a reason; no approval is inferred.
-Pausing before review starts keeps the pending candidate. **Continue** resumes
-that review without using an extra delivery.
-
-These presets require their own qualified provider policies and project
-admissions. A writer's proof never qualifies a reader or reviewer. The new reader
-and reviewer policies currently remain unavailable pending native qualification;
-see [Single agent setup](PROJECT_SETUP.md#single-agent-setup).
+The ordinary Single agent writer and the six-role TRIP workflow remain supported
+for both Codex and Claude under their existing exact-version contracts. The
+TRIP Explorer and reviewers are separate from these retired presets. Existing
+processes still require truthful stop/recovery settlement before cleanup; a
+retired task label is not proof that a process stopped.
 
 ## Stop or change the task manager
 
@@ -434,8 +415,8 @@ contract candidate alone is not a qualified role profile.
 Select a project, then open **Recipes** and choose its workflow. For TRIP,
 save a profile set containing the six role configurations, then a recipe with
 task content, acceptance criteria, priority, an exact profile revision and
-required checks. For Single agent presets, select the preset, execution
-configuration, primary profile and any reviewer and checks it requires. Saved configurations are not capability
+required checks. For Single agent, select the execution
+configuration, writer profile and required checks. Saved configurations are not capability
 proofs; ordinary task-specific activation and Ready admission still apply. Templates
 are literal editable text, with no executable substitution language.
 
@@ -446,6 +427,15 @@ impersonating that selection. Single agent recipes pin the definition, execution
 configuration, primary and reviewer profile revisions and selected check IDs;
 they copy no check authorization or acceptance authority. Revisions of recipes and profile sets
 do not silently change existing tasks or schedules.
+
+Schedules create drafts only; they never start agents or authorize checks.
+Former automatic execution schedules remain paused with revoked authority and
+historical mode/grant references. They are not converted into active draft
+schedules. Create a new supported recipe/schedule when needed. See
+[foreground schedules](OPERATIONS.md#foreground-recipe-schedules) for retirement
+and recovery behavior. Comparison evidence retains historical recipe revisions,
+occurrences and grants through recorded attempt lineage; held or missed
+occurrences do not create fictional runs or usage.
 
 If project reactivation supersedes a recipe's configuration pin, re-save its profile
 set and recipe using the active configuration and explicitly select current checks.
@@ -517,3 +507,15 @@ Send a first message, follow up while idle, steer the active turn, or use **Inte
 Select up to 16 eligible recorded messages and 24 KiB of text, then choose **Create task from conversation**. Review the title, description, criteria and Single agent or TRIP selection in the existing task form. An empty selection saves the conversation link without excerpts. Promoted TRIP tasks use project role defaults. Save creates a draft and opens the returned task; **Make Ready** is a separate explicit action with the normal setup checks. Capacity can delay an admitted Ready task; disconnecting a conversation may let queued work start when pickup is enabled.
 
 The task’s Conversation source section shows the frozen excerpts, coverage and attribution, and links to the source conversation. The server validates selection identities and hashes and stores the bundle atomically with the task. Both workflow contexts receive the same bundle as untrusted reference material. Editing task text does not alter its evidence. Unknown create outcomes retain the original request for exact reconciliation.
+
+## Project knowledge with explicit provenance
+
+Knowledge is scoped to a project. Create a direct note or choose **Save as knowledge** on a supported report, finding, historical source or confirmed conversation message. Write the statement and save a draft, then approve the named revision explicitly. Direct notes are labeled user assertions. Source references identify the original record or committed file; opening an unavailable source never substitutes a newer record.
+
+Editing creates an immutable draft revision while the current approval remains effective. Replacement approval names the previous approved revision. Archive excludes the entry from future selection and retains its history. Revalidation records a new scoped source observation; it neither changes the statement nor approves it.
+
+For tasks, save the draft, select exact approved revisions, preview and confirm the attachment, then use the existing Make Ready action. A failed attachment leaves the draft available for correction. Attempt admission freezes the selected block atomically with the attempt. Rework inherits exact selectors; changed or unavailable evidence can hold continuation. Task detail offers **Save next-run knowledge only** and **Save and continue rework** with current parent/result/version checks. Automatic review settlement remains recorded while a knowledge hold prevents child creation or allowance consumption. Material knowledge changes invalidate TRIP plan-approval carry; freshness-only acknowledgement can preserve otherwise eligible carry.
+
+Conversation Start, Submit and Steer each require their own explicit selection and preview. Confirmation binds the original operation and input. Resume alone adds no knowledge. The displayed user message stays separate from its attachment; an uncertain operation retains its original identity and is not automatically resent.
+
+Preview allows at most 16 selections and an 8 KiB wrapped knowledge block. Whole entries that do not fit are listed as omitted; a selection with no fitting entry is refused. Conversation input remains bounded by its existing limits, including the complete serialized mutation. Task context retains its 1 MiB limit and existing paging. **Frozen and available in context** describes retained task reference bytes, not provider receipt or understanding. Conversation reservation and confirmed delivery are also separate states.

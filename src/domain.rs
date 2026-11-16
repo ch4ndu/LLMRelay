@@ -422,6 +422,15 @@ pub enum SingleAgentPreset {
 }
 
 impl SingleAgentPreset {
+    pub fn require_supported(self) -> anyhow::Result<()> {
+        match self {
+            Self::SingleAgent => Ok(()),
+            Self::RepositoryResearch | Self::BuildAndReview => anyhow::bail!(
+                "Research and Build and review have been retired. Choose Single agent writer or TRIP."
+            ),
+        }
+    }
+
     pub fn is_legacy(&self) -> bool {
         *self == Self::SingleAgent
     }
@@ -695,35 +704,6 @@ pub struct SingleAgentResultMetadata {
     pub acceptance_rows: Vec<AcceptanceRow>,
     #[serde(default)]
     pub claimed_changes: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SingleAgentReviewMetadata {
-    pub delivery_id: String,
-    pub result_binding_id: String,
-    pub candidate_hash: String,
-    pub selected_check_revision: i64,
-    pub verdict: SingleAgentReviewVerdict,
-    pub findings: Vec<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SingleAgentReviewVerdict {
-    Approved,
-    ChangesRequested,
-    NeedsRework,
-}
-
-impl SingleAgentReviewVerdict {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Approved => "approved",
-            Self::ChangesRequested => "changes_requested",
-            Self::NeedsRework => "needs_rework",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1949,6 +1929,8 @@ pub struct TaskDto {
     pub id: String,
     pub project_id: String,
     #[serde(default)]
+    pub knowledge: serde_json::Value,
+    #[serde(default)]
     pub workspace_mode: WorkspaceMode,
     pub title: String,
     pub description: String,
@@ -2471,12 +2453,27 @@ pub enum ComparisonEvidenceFact {
     },
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ComparisonRecipeAttribution {
+    pub recipe_revision_id: String,
+    pub recipe_title: String,
+    pub schedule_id: Option<String>,
+    pub scheduled_for_utc: Option<String>,
+    pub occurrence_id: Option<String>,
+    pub authorization_id: Option<String>,
+    pub root_attempt_id: Option<String>,
+    pub occurrence_outcome: Option<String>,
+    pub occurrence_reason: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ComparisonEvidenceRow {
     pub key: String,
     pub unit_id: String,
     pub task_id: String,
     pub attempt_id: Option<String>,
+    #[serde(default)]
+    pub recipe_attribution: Option<ComparisonRecipeAttribution>,
     pub source: Option<HistoricalSourceKey>,
     pub fact: ComparisonEvidenceFact,
     pub truncated: bool,
@@ -3908,6 +3905,138 @@ pub enum DesktopTarget {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecipeScheduleMode {
+    CreateDraft,
+    RunAuthorizedResearch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecipeScheduleOutcome {
+    TaskCreated,
+    SkippedIneligible,
+    Missed,
+    Waiting,
+    Held,
+    Reserved,
+    Running,
+    StopRequested,
+    ReviewReady,
+    Finished,
+    RecoveryRequired,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecipeScheduleExecutionLimits {
+    pub max_occurrences: u32,
+    pub max_invocations_per_occurrence: u32,
+    pub max_runtime_seconds: u32,
+    pub start_window_seconds: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecipeSchedulePreviewRequest {
+    pub project_id: String,
+    pub schedule_id: String,
+    pub expected_version: i64,
+    pub limits: RecipeScheduleExecutionLimits,
+    pub knowledge_selection: Vec<KnowledgeSelection>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecipeScheduleExecutionPreview {
+    pub scope: serde_json::Value,
+    pub digest: String,
+    pub expected_version: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecipeScheduleAuthorization {
+    pub id: String,
+    pub project_id: String,
+    pub schedule_id: String,
+    pub recipe_revision_id: String,
+    pub scope: serde_json::Value,
+    pub scope_hash: String,
+    pub limits: RecipeScheduleExecutionLimits,
+    pub created_by: String,
+    pub created_at: String,
+    pub revoked_at: Option<String>,
+    pub revoked_by: Option<String>,
+    pub revocation_reason: Option<String>,
+    pub restore_invalidated_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecipeScheduleInvocationBinding {
+    pub occurrence_id: String,
+    pub authorization_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleOccurrenceStopIntent {
+    pub project_id: String,
+    pub schedule_id: String,
+    pub expected_version: i64,
+    pub occurrence_id: String,
+    pub authorization_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleStopBinding {
+    pub occurrence_id: String,
+    pub authorization_id: String,
+    pub attempt_id: String,
+    pub session_id: String,
+    pub resume_invocation_id: Option<String>,
+    pub role_generation_id: String,
+    pub transcript_epoch: String,
+    pub process: Option<ProcessIdentity>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScheduleNativeStopTarget {
+    pub(crate) id: String,
+    pub(crate) binding: ScheduleStopBinding,
+}
+
+impl ScheduleStopBinding {
+    pub(crate) fn matches_process(
+        &self,
+        owner: &SessionOwner,
+        epoch: &str,
+        process: &ProcessIdentity,
+    ) -> bool {
+        owner.is_role_generation(&self.role_generation_id)
+            && self.transcript_epoch == epoch
+            && self.process.as_ref() == Some(process)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecipeScheduleOccurrence {
+    pub id: String,
+    pub schedule_id: String,
+    pub scheduled_for_utc: String,
+    pub recipe_revision_id: String,
+    pub authorization_id: Option<String>,
+    pub outcome: RecipeScheduleOutcome,
+    pub task_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub reason: Option<String>,
+    pub allowance_reserved: bool,
+    pub invocations_spent: u32,
+    pub first_reserved_at: Option<String>,
+    pub runtime_deadline_utc: Option<String>,
+    pub last_observed_wall_utc: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppStateDto {
     pub schema: u8,
@@ -4211,6 +4340,22 @@ pub enum HumanCommand {
         recipe_revision_id: String,
         expected_recipe_version: i64,
     },
+    AuthorizeRecipeScheduleExecution {
+        operation_id: String,
+        request: RecipeSchedulePreviewRequest,
+        preview_digest: String,
+    },
+    RequestRecipeScheduleOccurrenceStop {
+        operation_id: String,
+        intent: ScheduleOccurrenceStopIntent,
+    },
+    StopRecipeScheduleOccurrence {
+        operation_id: String,
+        project_id: String,
+        schedule_id: String,
+        expected_version: i64,
+        binding: ScheduleStopBinding,
+    },
     UpsertRecipeSchedule {
         operation_id: String,
         project_id: String,
@@ -4277,6 +4422,14 @@ pub enum HumanCommand {
         manual_order: i64,
         #[serde(default)]
         role_overrides: serde_json::Value,
+    },
+    SetTaskKnowledge {
+        operation_id: String,
+        request: KnowledgePreviewRequest,
+        preview_fingerprint: String,
+    },
+    PrepareNextRunKnowledge {
+        request: PrepareNextRunKnowledge,
     },
     DeleteDraftTask {
         operation_id: String,
@@ -4549,6 +4702,8 @@ pub enum HumanCommand {
 impl HumanCommand {
     pub fn operation_id(&self) -> &str {
         match self {
+            Self::PrepareNextRunKnowledge { request } => &request.operation_id,
+            Self::SetTaskKnowledge { operation_id, .. } => operation_id,
             Self::EditGuidance { operation_id, .. }
             | Self::CancelGuidance { operation_id, .. }
             | Self::AddTaskComment { operation_id, .. }
@@ -4558,6 +4713,9 @@ impl HumanCommand {
             | Self::UpsertSingleAgentRecipe { operation_id, .. }
             | Self::ArchiveTaskRecipe { operation_id, .. }
             | Self::CreateDraftFromRecipe { operation_id, .. }
+            | Self::AuthorizeRecipeScheduleExecution { operation_id, .. }
+            | Self::RequestRecipeScheduleOccurrenceStop { operation_id, .. }
+            | Self::StopRecipeScheduleOccurrence { operation_id, .. }
             | Self::UpsertRecipeSchedule { operation_id, .. }
             | Self::PauseRecipeSchedule { operation_id, .. }
             | Self::ResumeRecipeSchedule { operation_id, .. }
@@ -5021,4 +5179,318 @@ pub struct TaskActivityPage {
     pub events: Vec<serde_json::Value>,
     pub next_cursor: Option<String>,
     pub historical_associations_incomplete: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum KnowledgeSourceSelector {
+    Historical {
+        source: HistoricalSourceKey,
+    },
+    Conversation {
+        source: crate::providers::codex_app_server::ConversationSourceInput,
+    },
+    Finding {
+        parent: KnowledgeFindingParent,
+        field: KnowledgeFindingField,
+        index: Option<usize>,
+        content_hash: String,
+    },
+    Repository {
+        commit: String,
+        path: String,
+    },
+    UserAssertion,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum KnowledgeFindingParent {
+    Explorer {
+        decision_id: String,
+        attempt_id: String,
+    },
+    SingleAgentReview {
+        delivery_id: String,
+        role_result_id: String,
+        attempt_id: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeFindingField {
+    Summary,
+    Evidence,
+    Findings,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KnowledgeSource {
+    pub selector: KnowledgeSourceSelector,
+    pub content_hash: String,
+    pub identity_hash: String,
+    pub repository_scope: Option<KnowledgeRepositoryScope>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeRepositoryScope {
+    pub repository_path: String,
+    pub repository_identity: String,
+    pub registered_revision: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeDraftBody {
+    pub title: String,
+    pub statement: String,
+    pub category: String,
+    pub tags: Vec<String>,
+    pub sources: Vec<KnowledgeSourceSelector>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KnowledgeRevision {
+    pub id: String,
+    pub entry_id: String,
+    pub parent_revision_id: Option<String>,
+    pub title: String,
+    pub statement: String,
+    pub category: String,
+    pub tags: Vec<String>,
+    pub sources: Vec<KnowledgeSource>,
+    pub author: String,
+    pub content_hash: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KnowledgeEntry {
+    pub id: String,
+    pub project_id: String,
+    pub version: i64,
+    pub latest_draft_id: Option<String>,
+    pub approved_revision_id: Option<String>,
+    pub archived_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum KnowledgeMutation {
+    Draft {
+        entry_id: Option<String>,
+        expected_version: Option<i64>,
+        body: KnowledgeDraftBody,
+    },
+    Approve {
+        entry_id: String,
+        expected_version: i64,
+        revision_id: String,
+        replaces_revision_id: Option<String>,
+    },
+    Archive {
+        entry_id: String,
+        expected_version: i64,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeMutationRequest {
+    pub operation_id: String,
+    pub project_id: String,
+    pub mutation: KnowledgeMutation,
+}
+
+// Construct from authenticated human control, never from a role or provider report.
+#[derive(Clone, Debug, Serialize)]
+pub struct KnowledgeUserActor {
+    pub user_id: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeFreshness {
+    Verified,
+    NeedsRevalidation,
+    SourceUnavailable,
+    UserAssertion,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KnowledgeSourceObservation {
+    pub identity_hash: String,
+    pub original_content_hash: String,
+    pub observed_content_hash: Option<String>,
+    pub checked_scope: Option<KnowledgeRepositoryScope>,
+    pub state: KnowledgeFreshness,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KnowledgeObservation {
+    pub revision_id: String,
+    pub check_started_at: String,
+    pub checked_at: String,
+    pub sources: Vec<KnowledgeSourceObservation>,
+    pub state: KnowledgeFreshness,
+    pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_operation_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeSelection {
+    pub entry_id: String,
+    pub revision_id: String,
+    pub expected_entry_version: i64,
+    pub observation_fingerprint: String,
+    pub acknowledged_warning: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgePreparationAction {
+    SaveOnly,
+    SaveAndContinueRework,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareNextRunKnowledge {
+    pub operation_id: String,
+    pub project_id: String,
+    pub task_id: String,
+    pub parent_attempt_id: String,
+    pub continuation_kind: String,
+    pub expected_task_version: i64,
+    pub expected_preparation_version: Option<i64>,
+    pub parent_result_binding_id: String,
+    pub parent_review_binding_id: Option<String>,
+    pub selection: Vec<KnowledgeSelection>,
+    pub preview_fingerprint: String,
+    pub action: KnowledgePreparationAction,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum KnowledgeConsumer {
+    Schedule {
+        schedule_id: String,
+    },
+    Task {
+        task_id: String,
+        parent_attempt_id: Option<String>,
+        continuation: Option<String>,
+        parent_binding_id: Option<String>,
+    },
+    Conversation {
+        conversation_id: Option<String>,
+        operation_kind: String,
+        operation: Box<crate::providers::codex_app_server::ConversationOperation>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgePreviewRequest {
+    pub project_id: String,
+    pub consumer: KnowledgeConsumer,
+    pub expected_consumer_version: i64,
+    pub user_text: String,
+    pub selection: Vec<KnowledgeSelection>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeDisposition {
+    Included,
+    OmittedByteLimit,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KnowledgePreviewItem {
+    pub selection: KnowledgeSelection,
+    pub content_hash: String,
+    pub source_identity_hash: String,
+    pub freshness: KnowledgeFreshness,
+    pub checked_at: String,
+    pub warning: Option<String>,
+    pub disposition: KnowledgeDisposition,
+    pub text_hash: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KnowledgePreview {
+    pub block: String,
+    pub block_hash: String,
+    pub block_serialized_bytes: usize,
+    pub block_limit: usize,
+    pub selected_count: usize,
+    pub included_count: usize,
+    pub omitted_count: usize,
+    pub items: Vec<KnowledgePreviewItem>,
+    pub effective_digest: String,
+    pub fingerprint: String,
+    pub requires_consumer_validation: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum KnowledgeManifestBinding {
+    TaskAttempt {
+        attempt_id: String,
+    },
+    ConversationOperation {
+        operation_id: String,
+        assembled_input_hash: String,
+        complete_operation_hash: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KnowledgeManifest {
+    pub id: String,
+    pub project_id: String,
+    pub binding: KnowledgeManifestBinding,
+    pub request: KnowledgePreviewRequest,
+    pub preview: KnowledgePreview,
+    pub sources: Vec<Vec<KnowledgeSource>>,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeSearch {
+    pub query: String,
+    pub include_drafts: bool,
+    pub include_archived: bool,
+    pub after_entry_id: Option<String>,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KnowledgeSearchHit {
+    pub entry: KnowledgeEntry,
+    pub revision_id: String,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KnowledgeSourceRead {
+    pub source: KnowledgeSource,
+    pub text: String,
+    pub checked_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KnowledgeLifecycleEvent {
+    pub revision_id: Option<String>,
+    pub replaced_revision_id: Option<String>,
+    pub kind: String,
+    pub actor: String,
+    pub entry_version: i64,
+    pub created_at: String,
 }

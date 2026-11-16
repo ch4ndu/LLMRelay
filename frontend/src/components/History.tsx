@@ -51,7 +51,7 @@ export function History(
             {view === "tasks"
               ? "Accepted, cancelled and archived tasks. Their results and evidence stay available here."
               : view === "search"
-              ? "Find saved text across projects, tasks and attempts."
+              ? "Find saved text across projects, tasks and attempts. Open an exact source to save a knowledge draft with its original provenance."
               : "Compare saved task and run outcomes, execution evidence and observed session usage."}
           </p>
         </div>

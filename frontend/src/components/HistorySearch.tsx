@@ -8,6 +8,7 @@ import type {
   Project,
   Task,
 } from "../types";
+import { SaveKnowledgeSource } from "./Knowledge";
 import { ErrorNotice } from "./ErrorNotice";
 
 const sourceKinds: { value: HistorySourceKind; label: string }[] = [
@@ -277,9 +278,10 @@ export function HistorySearch(
             <p>Attempt: {source.hit.source.attempt_id}</p>
           )}
           <p>
-            This saved evidence does not grant approval or change current work.
+            This saved evidence does not grant approval or change current work. Opening the current task keeps this exact historical source separate.
           </p>
           <pre>{source.text}</pre>
+          <SaveKnowledgeSource key={JSON.stringify(source.hit.source)} projectId={source.hit.project_id} source={{ kind: "historical", source: source.hit.source }} title={source.hit.task_title} />
           {source.truncated && (
             <p>
               Only a bounded excerpt is shown. This source was truncated for

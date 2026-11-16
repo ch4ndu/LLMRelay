@@ -1,3 +1,6 @@
+import { FindingKnowledgeSource, knowledgeFindingText } from "./TaskReports";
+import { TaskKnowledgePanel } from "./KnowledgeSelector";
+import { SaveKnowledgeSource } from "./Knowledge";
 import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
 import {
   type KeyboardEvent as ReactKeyboardEvent,
@@ -951,6 +954,7 @@ export function TaskDetail(
   const overview = (
     <div className="task-overview">
       <div className="task-overview-main">
+        {task.knowledge && <TaskKnowledgePanel task={task} content={content} onChanged={onChanged} />}
         {guidance.length > 0 && (
           <section className="panel">
             <h4>Your replies</h4>
@@ -1672,9 +1676,13 @@ export function TaskDetail(
       </section>
       <section className="panel">
         <h3 id="task-activity-reports">Reports</h3>
+        {singleAgentRun?.review && content?.records.filter((record) => record.role === "single_agent_reviewer" && record.outcome === "review_complete" && record.summary === singleAgentRun.review?.summary).map((record) => <section key={record.id} aria-label="Reviewer finding sources"><h4>Reviewer findings · report {record.id}</h4>{singleAgentRun.review!.findings.slice(0, 256).map((finding, index) => <div key={index}><p>{finding}</p><FindingKnowledgeSource projectId={task.project_id} parent={{ kind: "single_agent_review", delivery_id: singleAgentRun.review!.delivery_id, role_result_id: record.id, attempt_id: singleAgentRun.attempt_id }} field="findings" index={index} text={finding} title={`Reviewer finding ${index + 1}`} /></div>)}</section>)}
         <ReportList
           content={content}
           error={contentError}
+          projectId={task.project_id}
+          taskId={task.id}
+          attemptId={attempt?.id}
           started={!!attempt}
         />
       </section>
@@ -1916,6 +1924,9 @@ export function TaskDetail(
                 Explorer findings inform the manager; they never approve a plan,
                 change, review or result.
               </small>
+              {typeof decision.outcome?.summary === "string" && <FindingKnowledgeSource projectId={task.project_id} parent={{ kind: "explorer", decision_id: decision.id, attempt_id: decision.attempt_id }} field="summary" index={null} text={decision.outcome.summary} title="Explorer summary" />}
+              {Array.isArray(decision.outcome?.evidence) && decision.outcome.evidence.slice(0, 256).map((value: unknown, index: number) => knowledgeFindingText(value) !== undefined ? <div key={index}><pre>{knowledgeFindingText(value)}</pre><FindingKnowledgeSource projectId={task.project_id} parent={{ kind: "explorer", decision_id: decision.id, attempt_id: decision.attempt_id }} field="evidence" index={index} text={knowledgeFindingText(value)!} title={`Explorer evidence ${index + 1}`} /></div> : null)}
+              {decision.outcome && <SaveKnowledgeSource projectId={task.project_id} source={{ kind: "historical", source: { task_id: task.id, attempt_id: decision.attempt_id, kind: "explorer_decision", id: decision.id } }} title="Explorer decision metadata" />}
               <TechnicalDetails>
                 <pre>
                 {JSON.stringify(

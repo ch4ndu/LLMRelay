@@ -214,6 +214,9 @@ where
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[serde(deny_unknown_fields)]
 enum WebOperation {
+    RecipeScheduleExecutionPreview {
+        request: crate::domain::RecipeSchedulePreviewRequest,
+    },
     Conversation {
         operation: crate::providers::codex_app_server::ConversationOperation,
     },
@@ -379,6 +382,9 @@ enum WebOperation {
 impl WebOperation {
     fn required_feature(&self) -> Option<&'static str> {
         match self {
+            Self::RecipeScheduleExecutionPreview { .. } => {
+                Some(protocol::SCHEDULE_EXECUTION_AUTHORIZATION_FEATURE)
+            }
             Self::Conversation { .. } => Some(protocol::CONVERSATION_FEATURE),
             Self::Workflow { command } => Some(if command.uses_single_agent_presets() {
                 protocol::SINGLE_AGENT_PRESETS_FEATURE
@@ -1111,6 +1117,9 @@ fn web_router(web_state: WebState) -> Router {
             get(api_comparison_evidence),
         )
         .route("/api/permission-coverage", post(api_permission_coverage))
+        .route("/api/knowledge/preview", post(api_knowledge_preview))
+        .route("/api/knowledge/read", post(api_knowledge_read))
+        .route("/api/knowledge/command", post(api_knowledge_command))
         .route("/api/command", post(api_command))
         .route("/api/operation", post(api_operation))
         .route("/api/diagnostics", get(api_diagnostics))
@@ -1657,6 +1666,49 @@ async fn api_command_with_executor(
     if let Err(response) = require_browser(&state, &headers) {
         return response;
     }
+    if matches!(
+        command,
+        HumanCommand::RequestRecipeScheduleOccurrenceStop { .. }
+    ) && !declared_features(&headers)
+        .iter()
+        .any(|feature| feature == protocol::SCHEDULE_OCCURRENCE_STOP_INTENT_FEATURE)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error":"Reload the dashboard to stop this scheduled occurrence."
+            })),
+        )
+            .into_response();
+    }
+    if matches!(
+        command,
+        HumanCommand::AuthorizeRecipeScheduleExecution { .. }
+    ) && !declared_features(&headers)
+        .iter()
+        .any(|feature| feature == protocol::SCHEDULE_EXECUTION_AUTHORIZATION_FEATURE)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error":"Reload the dashboard to review and authorize scheduled execution."
+            })),
+        )
+            .into_response();
+    }
+    if matches!(
+        command,
+        HumanCommand::SetTaskKnowledge { .. } | HumanCommand::PrepareNextRunKnowledge { .. }
+    ) && !declared_features(&headers)
+        .iter()
+        .any(|feature| feature == crate::knowledge::TASK_KNOWLEDGE_FEATURE)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":"Reload the dashboard to prepare task knowledge."})),
+        )
+            .into_response();
+    }
     if matches!(command, HumanCommand::UpsertSingleAgentRecipe { .. })
         && !declared_features(&headers)
             .iter()
@@ -1715,6 +1767,257 @@ async fn api_diagnostics(State(state): State<WebState>, headers: HeaderMap) -> R
     }
 }
 
+fn require_knowledge(state: &WebState, headers: &HeaderMap) -> Result<(), Response> {
+    require_browser(state, headers)?;
+    if !declared_features(headers)
+        .iter()
+        .any(|feature| feature == crate::knowledge::TASK_KNOWLEDGE_FEATURE)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error":"Reload the dashboard to use project knowledge."
+            })),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KnowledgeReadRequest {
+    project_id: String,
+    read: KnowledgeRead,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum KnowledgeRead {
+    Search {
+        search: crate::domain::KnowledgeSearch,
+    },
+    Entry {
+        entry_id: String,
+    },
+    Revision {
+        entry_id: String,
+        revision_id: String,
+    },
+    Source {
+        entry_id: String,
+        revision_id: String,
+        index: usize,
+    },
+    History {
+        entry_id: String,
+        after_version: i64,
+    },
+    Freshness {
+        entry_id: String,
+        revision_id: String,
+    },
+    Manifest {
+        manifest_id: String,
+    },
+    ConversationConsumer {
+        conversation_id: String,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum KnowledgeCommand {
+    Mutate {
+        request: crate::domain::KnowledgeMutationRequest,
+    },
+    Revalidate {
+        project_id: String,
+        operation_id: String,
+        entry_id: String,
+        revision_id: String,
+        expected_version: i64,
+        expected_observation: String,
+    },
+}
+
+async fn knowledge_body<T: serde::de::DeserializeOwned>(
+    state: &WebState,
+    request: Request,
+) -> Result<T, Response> {
+    if let Err(response) = require_knowledge(state, request.headers()) {
+        return Err(response);
+    }
+    let body = axum::body::to_bytes(request.into_body(), crate::knowledge::PREVIEW_REQUEST_BYTES).await
+        .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, Json(serde_json::json!({
+            "error":"Shorten the input or select fewer entries; knowledge requests allow at most 32 KiB."
+        }))).into_response())?;
+    serde_json::from_slice(&body).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error":format!("Review the knowledge request and try again. {error}")
+            })),
+        )
+            .into_response()
+    })
+}
+
+async fn knowledge_work(
+    state: WebState,
+    limit: usize,
+    work: impl FnOnce(&Store) -> Result<serde_json::Value> + Send + 'static,
+) -> Response {
+    let permit = match Arc::clone(&state.app.blocking_operations)
+        .acquire_owned()
+        .await
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Refresh and try again when the service is available",
+            )
+                .into_response()
+        }
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let value = work(&state.app.store)?;
+        if serde_json::to_vec(&value)?.len() > limit {
+            bail!(
+                "The knowledge response is too large; narrow the search or open one exact revision"
+            )
+        }
+        Ok::<_, anyhow::Error>(value)
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error":format!("Review the project knowledge selection, refresh its preview and try again. {error:#}")
+        }))).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error":format!("The knowledge request outcome is unavailable. Refresh and check its outcome before retrying. {error}")
+        }))).into_response(),
+    }
+}
+
+async fn api_knowledge_preview(State(state): State<WebState>, request: Request) -> Response {
+    let request =
+        match knowledge_body::<crate::domain::KnowledgePreviewRequest>(&state, request).await {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
+    knowledge_work(
+        state,
+        crate::knowledge::PREVIEW_RESPONSE_BYTES,
+        move |store| Ok(serde_json::to_value(store.knowledge_preview(&request)?)?),
+    )
+    .await
+}
+
+async fn api_knowledge_read(State(state): State<WebState>, request: Request) -> Response {
+    let request = match knowledge_body::<KnowledgeReadRequest>(&state, request).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let limit = match &request.read {
+        KnowledgeRead::Manifest { .. } => crate::knowledge::MANIFEST_BYTES,
+        KnowledgeRead::Revision { .. } | KnowledgeRead::Source { .. } => {
+            crate::knowledge::REVISION_DETAIL_BYTES
+        }
+        _ => crate::knowledge::PREVIEW_RESPONSE_BYTES,
+    };
+    knowledge_work(state, limit, move |store| {
+        let project = &request.project_id;
+        Ok(match request.read {
+            KnowledgeRead::Search { search } => {
+                serde_json::to_value(store.knowledge_search(project, &search)?)?
+            }
+            KnowledgeRead::Entry { entry_id } => {
+                serde_json::to_value(store.knowledge_entry(project, &entry_id)?)?
+            }
+            KnowledgeRead::Revision {
+                entry_id,
+                revision_id,
+            } => {
+                serde_json::to_value(store.knowledge_revision(project, &entry_id, &revision_id)?)?
+            }
+            KnowledgeRead::Source {
+                entry_id,
+                revision_id,
+                index,
+            } => serde_json::to_value(store.knowledge_source(
+                project,
+                &entry_id,
+                &revision_id,
+                index,
+            )?)?,
+            KnowledgeRead::History {
+                entry_id,
+                after_version,
+            } => {
+                serde_json::to_value(store.knowledge_history(project, &entry_id, after_version)?)?
+            }
+            KnowledgeRead::Freshness {
+                entry_id,
+                revision_id,
+            } => serde_json::to_value(store.knowledge_freshness(
+                project,
+                &entry_id,
+                &revision_id,
+            )?)?,
+            KnowledgeRead::Manifest { manifest_id } => {
+                serde_json::to_value(store.knowledge_manifest(project, &manifest_id)?)?
+            }
+            KnowledgeRead::ConversationConsumer { conversation_id } => {
+                store.knowledge_conversation_consumer(project, &conversation_id)?
+            }
+        })
+    })
+    .await
+}
+
+async fn api_knowledge_command(State(state): State<WebState>, request: Request) -> Response {
+    let request = match knowledge_body::<KnowledgeCommand>(&state, request).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    // Only the authenticated browser control path creates this actor; the wire has no actor field.
+    let actor = crate::domain::KnowledgeUserActor {
+        user_id: "human_control".into(),
+    };
+    knowledge_work(
+        state,
+        crate::knowledge::PREVIEW_RESPONSE_BYTES,
+        move |store| {
+            Ok(match request {
+                KnowledgeCommand::Mutate { request } => {
+                    serde_json::to_value(store.knowledge_mutate(&actor, &request)?)?
+                }
+                KnowledgeCommand::Revalidate {
+                    project_id,
+                    operation_id,
+                    entry_id,
+                    revision_id,
+                    expected_version,
+                    expected_observation,
+                } => serde_json::to_value(store.knowledge_revalidate(
+                    &actor,
+                    &project_id,
+                    &operation_id,
+                    &entry_id,
+                    &revision_id,
+                    expected_version,
+                    &expected_observation,
+                )?)?,
+            })
+        },
+    )
+    .await
+}
+
 async fn api_operation(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -1739,6 +2042,16 @@ async fn api_operation(
                 .into_response();
         }
     }
+    if matches!(
+        &operation,
+        WebOperation::Conversation {
+            operation: crate::providers::codex_app_server::ConversationOperation::WithKnowledge { .. }
+        }
+    ) {
+        if let Err(response) = require_knowledge(&state, &headers) {
+            return response;
+        }
+    }
     let permit = match Arc::clone(&state.app.blocking_operations)
         .acquire_owned()
         .await
@@ -1757,6 +2070,8 @@ async fn api_operation(
         let _permit = permit;
         let state = blocking_state;
         match operation {
+            WebOperation::RecipeScheduleExecutionPreview { request } =>
+                Ok(serde_json::to_value(state.app.store.recipe_schedule_execution_preview(&request)?)?),
             WebOperation::Conversation { operation } => state.app.conversation_operation(operation),
             WebOperation::SchedulerRunOnce => state.app.coordinator_tick(),
             WebOperation::SnapshotFreeze {
@@ -2734,6 +3049,244 @@ mod web_operation_tests {
     }
 
     #[tokio::test]
+    async fn knowledge_manifest_api_reads_large_persisted_provenance_and_rejects_overbound() {
+        use crate::domain::*;
+        let (root, app, _, _) = server_test_application();
+        let (state, mut headers, _shutdown) = browser_state(app);
+        headers.insert(HeaderName::from_static(protocol::HTTP_HEADER), HeaderValue::from_static(
+            r#"{"generation":1,"client_kind":"browser","required_features":["http_operational_v1","project_knowledge_v1"]}"#));
+        let actor = KnowledgeUserActor {
+            user_id: "human_control".into(),
+        };
+        let mut sources = Vec::new();
+        for index in 0..16 {
+            let id = format!("comment-{index}-{}", "c".repeat(100));
+            state.app.store.lock().unwrap().execute(
+                "INSERT INTO task_comments(id,task_id,body,actor_kind,created_at) VALUES(?1,'task','Exact evidence','human','now')",
+                [&id],
+            ).unwrap();
+            sources.push(KnowledgeSourceSelector::Historical {
+                source: HistoricalSourceKey {
+                    task_id: "task".into(),
+                    attempt_id: None,
+                    kind: HistorySourceKind::Comment,
+                    id,
+                },
+            });
+        }
+        let mut selection = Vec::new();
+        for index in 0..16 {
+            let draft = state
+                .app
+                .store
+                .knowledge_mutate(
+                    &actor,
+                    &KnowledgeMutationRequest {
+                        operation_id: format!("manifest-draft-{index}"),
+                        project_id: "project".into(),
+                        mutation: KnowledgeMutation::Draft {
+                            entry_id: None,
+                            expected_version: None,
+                            body: KnowledgeDraftBody {
+                                title: format!("Evidence {index}"),
+                                statement: "Bound reference".into(),
+                                category: "design".into(),
+                                tags: vec![],
+                                sources: sources.clone(),
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+            let entry = state
+                .app
+                .store
+                .knowledge_mutate(
+                    &actor,
+                    &KnowledgeMutationRequest {
+                        operation_id: format!("manifest-approve-{index}"),
+                        project_id: "project".into(),
+                        mutation: KnowledgeMutation::Approve {
+                            entry_id: draft.id.clone(),
+                            expected_version: draft.version,
+                            revision_id: draft.latest_draft_id.unwrap(),
+                            replaces_revision_id: None,
+                        },
+                    },
+                )
+                .unwrap();
+            let revision = entry.approved_revision_id.unwrap();
+            let observation = state
+                .app
+                .store
+                .knowledge_freshness("project", &entry.id, &revision)
+                .unwrap();
+            selection.push(KnowledgeSelection {
+                entry_id: entry.id,
+                revision_id: revision,
+                expected_entry_version: entry.version,
+                observation_fingerprint: observation.fingerprint,
+                acknowledged_warning: false,
+            });
+        }
+        let request = KnowledgePreviewRequest {
+            project_id: "project".into(),
+            consumer: KnowledgeConsumer::Task {
+                task_id: "task".into(),
+                parent_attempt_id: None,
+                continuation: None,
+                parent_binding_id: None,
+            },
+            expected_consumer_version: 1,
+            user_text: "Exact task input".into(),
+            selection,
+        };
+        let preview = state.app.store.knowledge_preview(&request).unwrap();
+        let manifest = {
+            let mut connection = state.app.store.lock().unwrap();
+            let tx = connection.transaction().unwrap();
+            let manifest = crate::knowledge::prepare_knowledge_manifest_in(
+                &tx,
+                &request,
+                &preview.fingerprint,
+                KnowledgeManifestBinding::TaskAttempt {
+                    attempt_id: "attempt".into(),
+                },
+            )
+            .unwrap();
+            let bytes = serde_json::to_vec(&manifest).unwrap();
+            assert!(bytes.len() > crate::knowledge::PREVIEW_RESPONSE_BYTES);
+            assert!(bytes.len() <= crate::knowledge::MANIFEST_BYTES);
+            crate::knowledge::insert_knowledge_manifest_in(&tx, &manifest).unwrap();
+            tx.commit().unwrap();
+            manifest
+        };
+        let read = serde_json::json!({"project_id":"project","read":{"kind":"manifest","manifest_id":manifest.id}});
+        let mut request = Request::new(Body::from(read.to_string()));
+        *request.headers_mut() = headers;
+        let response = api_knowledge_read(State(state.clone()), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), crate::knowledge::MANIFEST_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            serde_json::to_value(&manifest).unwrap()
+        );
+        let mut overbound = manifest.clone();
+        overbound.id = "overbound-manifest".into();
+        overbound.created_at = "x".repeat(crate::knowledge::MANIFEST_BYTES);
+        let oversized_response = serde_json::to_value(&overbound).unwrap();
+        let response = knowledge_work(state.clone(), crate::knowledge::MANIFEST_BYTES, move |_| {
+            Ok(oversized_response)
+        })
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        {
+            let mut connection = state.app.store.lock().unwrap();
+            let tx = connection.transaction().unwrap();
+            let error =
+                crate::knowledge::insert_knowledge_manifest_in(&tx, &overbound).unwrap_err();
+            assert!(
+                error.to_string().contains("serialized data exceeds"),
+                "{error:#}"
+            );
+        }
+        assert_eq!(
+            state
+                .app
+                .store
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM knowledge_manifests", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn knowledge_api_auth_bounds_project_isolation_and_human_actor() {
+        let (root, app, _, _) = server_test_application();
+        let (state, headers, _shutdown) = browser_state(app);
+        let body = serde_json::json!({"kind":"mutate","request":{
+            "operation_id":"knowledge-draft","project_id":"project","mutation":{"kind":"draft",
+            "entry_id":null,"expected_version":null,"body":{"title":"Decision","statement":"Human assertion",
+            "category":"design","tags":[],"sources":[{"kind":"user_assertion"}]}}}});
+        let make_request = |headers: HeaderMap, body: String| {
+            let mut request = Request::new(Body::from(body));
+            *request.headers_mut() = headers;
+            request
+        };
+        let mut anonymous = headers.clone();
+        anonymous.remove(header::COOKIE);
+        let response = api_knowledge_command(
+            State(state.clone()),
+            make_request(anonymous, body.to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = api_knowledge_command(
+            State(state.clone()),
+            make_request(headers.clone(), body.to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let mut headers = headers;
+        headers.insert(HeaderName::from_static(protocol::HTTP_HEADER), HeaderValue::from_static(
+            r#"{"generation":1,"client_kind":"browser","required_features":["http_operational_v1","project_knowledge_v1"]}"#));
+        let response = api_knowledge_preview(
+            State(state.clone()),
+            make_request(headers.clone(), " ".repeat(32 * 1024 + 1)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            state
+                .app
+                .store
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM knowledge_entries", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let mut forged = body.clone();
+        forged["actor"] = serde_json::json!({"user_id":"provider"});
+        let response = api_knowledge_command(
+            State(state.clone()),
+            make_request(headers.clone(), forged.to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = api_knowledge_command(
+            State(state.clone()),
+            make_request(headers.clone(), body.to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let entry: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let (author, events): (String,i64) = state.app.store.lock().unwrap().query_row(
+            "SELECT json_extract(r.body_json,'$.author'),(SELECT COUNT(*) FROM knowledge_events WHERE actor='human_control')
+             FROM knowledge_revisions r WHERE r.entry_id=?1", [entry["id"].as_str().unwrap()], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(author, "human_control");
+        assert_eq!(events, 1);
+        let foreign = serde_json::json!({"project_id":"missing","read":{"kind":"entry","entry_id":entry["id"]}});
+        let response = api_knowledge_read(
+            State(state.clone()),
+            make_request(headers, foreign.to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn stage_a_permission_preview_handler_is_read_only_and_bound_to_revision() {
         let (root, app, binding, _) = server_test_application();
         let repository_path = root.join("preview-repository");
@@ -3661,6 +4214,89 @@ mod web_operation_tests {
                 .contains("Refresh and check"));
         }
         drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn occurrence_stop_intent_requires_its_feature_and_preserves_legacy_command() {
+        let (root, app, _, _) = server_test_application();
+        let (state, mut headers, _) = browser_state(app);
+        headers.insert(protocol::HTTP_HEADER, HeaderValue::from_static(
+            r#"{"generation":1,"client_kind":"browser","required_features":["http_operational_v1"]}"#,
+        ));
+        let command = HumanCommand::RequestRecipeScheduleOccurrenceStop {
+            operation_id: "typed-stop".into(),
+            intent: crate::domain::ScheduleOccurrenceStopIntent {
+                project_id: "project".into(),
+                schedule_id: "schedule".into(),
+                expected_version: 1,
+                occurrence_id: "occurrence".into(),
+                authorization_id: "grant".into(),
+            },
+        };
+        let response =
+            api_command_with_executor(state.clone(), headers.clone(), command.clone(), |_, _| {
+                StatusCode::ACCEPTED.into_response()
+            })
+            .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let legacy = HumanCommand::StopRecipeScheduleOccurrence {
+            operation_id: "legacy-stop".into(),
+            project_id: "project".into(),
+            schedule_id: "schedule".into(),
+            expected_version: 1,
+            binding: crate::domain::ScheduleStopBinding {
+                occurrence_id: "occurrence".into(),
+                authorization_id: "grant".into(),
+                attempt_id: "attempt".into(),
+                session_id: "session".into(),
+                resume_invocation_id: None,
+                role_generation_id: "generation".into(),
+                transcript_epoch: "epoch".into(),
+                process: None,
+            },
+        };
+        assert_eq!(
+            api_command_with_executor(state.clone(), headers.clone(), legacy, |_, _| {
+                StatusCode::ACCEPTED.into_response()
+            })
+            .await
+            .status(),
+            StatusCode::ACCEPTED
+        );
+        headers.insert(protocol::HTTP_HEADER, HeaderValue::from_str(&serde_json::json!({
+            "generation":1,"client_kind":"browser",
+            "required_features":["http_operational_v1",protocol::SCHEDULE_OCCURRENCE_STOP_INTENT_FEATURE]
+        }).to_string()).unwrap());
+        assert_eq!(
+            api_command_with_executor(state.clone(), headers.clone(), command.clone(), |_, _| {
+                StatusCode::ACCEPTED.into_response()
+            })
+            .await
+            .status(),
+            StatusCode::ACCEPTED
+        );
+        headers.remove(header::COOKIE);
+        assert_eq!(
+            api_command_with_executor(state.clone(), headers, command, |_, _| {
+                StatusCode::ACCEPTED.into_response()
+            })
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            state
+                .app
+                .store
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM operation_receipts", [], |row| row
+                    .get::<_, i64>(0),)
+                .unwrap(),
+            0
+        );
+        drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }
 

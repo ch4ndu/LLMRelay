@@ -192,6 +192,23 @@ fn evaluate_ready_task(
         compatibility_bundles: runtime.compatibility_bundles.clone(),
     });
     let mut prerequisites = Vec::new();
+    if let Err(error) = crate::knowledge::task_knowledge_confirmation_in(connection, &task.task_id)
+    {
+        return Ok(blocked_scheduler_evaluation(
+            &task,
+            "scheduler.knowledge_hold",
+            DecisionEvidenceState::Stale,
+            DecisionOwner::Human,
+            serde_json::json!({"remedy":"preview_and_confirm_task_knowledge"}),
+            Some(format!(
+                "Review the task's selected knowledge and confirm a current preview: {error}"
+            )),
+            prerequisites,
+            SchedulerMutation::NeedsInput,
+            None,
+            Vec::new(),
+        ));
+    }
     if crate::workflow::task_workspace_mode(connection, &task.task_id)?
         == crate::domain::WorkspaceMode::MainCheckout
         && crate::workflow::require_workspace_execution_supported(connection, &task.task_id)
@@ -1106,6 +1123,7 @@ impl Scheduler {
             ..
         } = candidate;
         crate::workflow::require_workspace_execution_supported(&transaction, &task_id)?;
+        let knowledge = crate::knowledge::task_knowledge_confirmation_in(&transaction, &task_id)?;
         let attempt_id = uuid::Uuid::new_v4().to_string();
         let workspace_id = uuid::Uuid::new_v4().to_string();
         let claim_id = uuid::Uuid::new_v4().to_string();
@@ -1169,6 +1187,15 @@ impl Scheduler {
                 &now,
             )?;
         }
+        if let Some(knowledge) = &knowledge {
+            crate::knowledge::freeze_task_knowledge_in(&transaction, knowledge, &attempt_id)?;
+        }
+        crate::recipes::bind_schedule_claim_in(
+            &transaction,
+            &runtime.compatibility_bundles,
+            &task_id,
+            &attempt_id,
+        )?;
         transaction.execute("INSERT INTO claims(id,task_id,attempt_id,repository_identity,state,created_at,updated_at) VALUES(?1,?2,?3,?4,'reserved',?5,?5)",
             params![claim_id,task_id,attempt_id,repository_identity,now])?;
         if let Some((operation_id, detail)) = verification {
@@ -1259,6 +1286,7 @@ impl Scheduler {
     }
 
     fn create_workspace(&self, mut plan: DispatchPlan) -> Result<Option<DispatchPlan>> {
+        let _preparation = self.store.root_preparation_guard()?;
         let policy: serde_json::Value = {
             let connection = self.store.lock()?;
             let json: String = connection.query_row(
@@ -1742,6 +1770,11 @@ impl Scheduler {
         expected_version: i64,
         before_promotion: impl FnOnce(),
     ) -> Result<OperationResult> {
+        {
+            let connection = self.store.lock()?;
+            crate::workflow::require_supported_attempt_execution(&connection, attempt_id)?;
+        }
+        let _preparation = self.store.try_root_preparation_guard()?;
         let request = serde_json::json!({
             "operation":"retry_workspace_reservation","task_id":task_id,
             "attempt_id":attempt_id,"workspace_id":workspace_id,
@@ -2025,6 +2058,7 @@ impl Scheduler {
         workspace_id: &str,
         expected_version: i64,
     ) -> Result<OperationResult> {
+        let _preparation = self.store.try_root_preparation_guard()?;
         let request = serde_json::json!({
             "operation":"cancel_workspace_reservation","task_id":task_id,
             "attempt_id":attempt_id,"workspace_id":workspace_id,
@@ -2453,6 +2487,18 @@ pub(crate) fn record_workspace_reservation_recovery_in(
     reason: &str,
     observation: serde_json::Value,
 ) -> Result<()> {
+    // A late producer must not reopen an already committed cancellation.
+    let cancelled: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attempts a JOIN workspaces w ON w.attempt_id=a.id
+         JOIN claims c ON c.attempt_id=a.id WHERE a.id=?1 AND w.id=?2
+           AND (?3 IS NULL OR a.task_id=?3) AND a.status='cancelled'
+           AND w.state='abandoned' AND c.state='cancelled')",
+        params![attempt_id, workspace_id, expected_task_id],
+        |row| row.get(0),
+    )?;
+    if cancelled {
+        return Ok(());
+    }
     let now = Utc::now().to_rfc3339();
     let (task_id, claim_id, identity, path, base, repository_path): (
         String,

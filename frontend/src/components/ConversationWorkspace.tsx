@@ -1,7 +1,10 @@
+import { KnowledgeSelector } from "./KnowledgeSelector";
+import { KnowledgeManifestDetail, SaveKnowledgeSource } from "./Knowledge";
+import type { KnowledgeConfirmation, KnowledgeConversationOperation, KnowledgePreviewRequest, KnowledgeSelection } from "../types";
 import { useEffect, useRef, useState } from "react";
 import {
   conversationMutate, conversationMutationIsCurrent,
-  conversationRead, operationId, prepareConversationMutation,
+  conversationRead, knowledgeRead, operationId, prepareConversationMutation,
 } from "../api";
 import type {
   ConversationAttentionTarget, ConversationPromotion, ConversationAdmission, ConversationDetail, ConversationEvent, ConversationMessages,
@@ -43,7 +46,7 @@ const record = (value: unknown): value is Record<string, unknown> => typeof valu
 // Rust serde_json::Value orders object keys by UTF-8 bytes. These requests contain
 // string values and ASCII field names only; default JS key sorting is identical.
 function canonical(value: unknown): string {
-  if (typeof value === "string" || value === null || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "string" || value === null || typeof value === "boolean" || (typeof value === "number" && Number.isSafeInteger(value))) return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
   if (record(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`;
   throw new Error("The retained request contains an unsupported value. Keep it for inspection.");
@@ -75,7 +78,7 @@ function readJournal(key: string): Journal | undefined {
 const sameRequest = (left: Journal | undefined, right: Journal) => left?.id === right.id && left.body === right.body && left.hash === right.hash;
 const settledReceipt = (receipt: ConversationReceipt, request: ConversationMutation) =>
   receipt.found && (receipt.delivery_state === "completed" ||
-    (["start", "submit", "steer", "probe"].includes(request.action) && receipt.delivery_state === "bound"));
+    (["start", "submit", "steer", "probe"].includes(request.action === "with_knowledge" ? request.operation.action : request.action) && receipt.delivery_state === "bound"));
 
 export function ConversationWorkspace(props: ConversationWorkspaceProps) {
   const [identity, setIdentity] = useState<ConversationWorkspaceIdentity>();
@@ -126,6 +129,17 @@ function ProjectConversationWorkspace({ projectId, storageScope, revision, execu
   const [configId, setConfigId] = useState("");
   const [instructions, setInstructions] = useState("");
   const [input, setInput] = useState("");
+  const [knowledgeSelection, setKnowledgeSelection] = useState<KnowledgeSelection[]>([]);
+  const [knowledgeConfirmation, setKnowledgeConfirmation] = useState<KnowledgeConfirmation>();
+  const [knowledgeConsumer, setKnowledgeConsumer] = useState<Omit<KnowledgePreviewRequest, "selection">>();
+  const [knowledgeGeneration, setKnowledgeGeneration] = useState(0);
+  const knowledgeDispatchIdentity = useRef("");
+  knowledgeDispatchIdentity.current = JSON.stringify([knowledgeSelection, knowledgeConfirmation, knowledgeConsumer]);
+  const knowledgeEpoch = useRef(0);
+  const knowledgeLive = useRef("");
+  knowledgeLive.current = JSON.stringify([selected, input, admissionId, detail?.next_after, detail?.conversation.generation, detail?.conversation.active_turn_id]);
+  useEffect(() => { setKnowledgeConsumer(undefined); setKnowledgeConfirmation(undefined); knowledgeEpoch.current++; }, [selected, input, admissionId, detail?.next_after, detail?.conversation.generation, detail?.conversation.active_turn_id]);
+  useEffect(() => { setKnowledgeSelection([]); setKnowledgeGeneration((value) => value + 1); }, [selected]);
   const mounted = useRef(true);
   const lifetime = useRef(new AbortController());
   const restoredInput = useRef(false);
@@ -176,6 +190,7 @@ function ProjectConversationWorkspace({ projectId, storageScope, revision, execu
           else { setInstructions(saved.request.input.instructions); setConfigId(saved.request.input.execution_config_revision_id); }
         }
         if (saved?.request.action === "start") setAdmissionId(saved.request.admission_id);
+        if (saved?.request.action === "with_knowledge") { setInput(saved.request.operation.input); if (saved.request.operation.action === "start") setAdmissionId(saved.request.operation.admission_id); }
       }
     }
     catch (cause) { setJournalError(errorText(cause)); }
@@ -321,7 +336,7 @@ function ProjectConversationWorkspace({ projectId, storageScope, revision, execu
     setBusy(true); setError(""); setNotice("");
     try {
       await prepareConversationMutation(request);
-      const original: Journal = { id: mutationId(request), body: JSON.stringify(request), hash: await requestHash(request), conversation: "conversation_id" in request ? request.conversation_id : null, status: "published", request };
+      const original: Journal = { id: mutationId(request), body: JSON.stringify(request), hash: await requestHash(request), conversation: "conversation_id" in request ? request.conversation_id : request.action === "with_knowledge" && "conversation_id" in request.operation ? request.operation.conversation_id : null, status: "published", request };
       if (!mounted.current) return;
       const fresh = await withStorageLock(journalKey, () => {
         requireNoLegacyJournal();
@@ -336,9 +351,48 @@ function ProjectConversationWorkspace({ projectId, storageScope, revision, execu
       if (!fresh) throw new Error("A saved request already owns this project. Refresh and check its outcome before continuing.");
       if (mounted.current) syncJournal();
       if (!mounted.current) return;
+      if (["start", "submit", "steer", "with_knowledge"].includes(request.action)) { setKnowledgeSelection([]); setKnowledgeConfirmation(undefined); setKnowledgeConsumer(undefined); setKnowledgeGeneration((value) => value + 1); }
       await deliver(original);
     } catch (cause) { if (mounted.current && currentSelection.current === selectionAtSend) setError(errorText(cause)); }
     finally { if (mounted.current) { setBusy(false); syncJournal(); setRefresh((value) => value + 1); } }
+  }
+  async function prepareKnowledgeOperation(action: "start" | "submit" | "steer"): Promise<void> {
+    const before = knowledgeLive.current; const epoch = ++knowledgeEpoch.current;
+    setBusy(true); setError(""); setKnowledgeConfirmation(undefined);
+    try {
+      const existing = knowledgeConsumer?.consumer.kind === "conversation" ? knowledgeConsumer.consumer.operation : undefined;
+      const candidate: KnowledgeConversationOperation = action === "start" ? { action, operation_id: existing?.action === action ? existing.operation_id : operationId(), admission_id: admissionId, input } : action === "submit" ? { action, operation_id: existing?.action === action ? existing.operation_id : operationId(), conversation_id: selected, input } : { action, operation_id: existing?.action === action ? existing.operation_id : operationId(), conversation_id: selected, expected_turn_id: detail?.conversation.active_turn_id || "", input };
+      await prepareConversationMutation(candidate);
+      const consumer = action === "start" ? undefined : await knowledgeRead(projectId, { kind: "conversation_consumer", conversation_id: selected });
+      if (!mounted.current || epoch !== knowledgeEpoch.current || before !== knowledgeLive.current) return;
+      if (consumer && (!consumer.binding_valid || (action === "steer" && candidate.action === "steer" && candidate.expected_turn_id !== consumer.active_turn_id))) throw new Error("The conversation changed. Refresh and prepare the operation again.");
+      setKnowledgeConsumer({ project_id: projectId, user_text: input, expected_consumer_version: consumer?.expected_consumer_version ?? 0, consumer: { kind: "conversation", conversation_id: action === "start" ? null : selected, operation_kind: action, operation: candidate } });
+    } catch (cause) { if (mounted.current && before === knowledgeLive.current) setError(errorText(cause)); }
+    finally { if (mounted.current) setBusy(false); }
+  }
+  async function sendInput(action: "start" | "submit" | "steer"): Promise<void> {
+    if (!knowledgeSelection.length) {
+      if (action === "start") await send({ action, operation_id: operationId(), admission_id: admissionId, input });
+      else if (action === "submit") await send({ action, operation_id: operationId(), conversation_id: selected, input });
+      else if (detail?.conversation.active_turn_id) await send({ action, operation_id: operationId(), conversation_id: selected, expected_turn_id: detail.conversation.active_turn_id, input });
+      return;
+    }
+    const confirmed = knowledgeConfirmation;
+    const consumer = knowledgeConsumer;
+    if (!confirmed || !consumer || consumer.consumer.kind !== "conversation" || consumer.consumer.operation_kind !== action || consumer.user_text !== input || JSON.stringify(confirmed.request) !== JSON.stringify({ ...consumer, selection: knowledgeSelection })) {
+      setError("Prepare this exact operation, then preview and confirm its knowledge before sending. Changed input or conversation state requires a new preview."); return;
+    }
+    // Re-read the consumer before sending; refusal never constructs another operation.
+    const before = knowledgeLive.current;
+    const selectionBefore = knowledgeDispatchIdentity.current;
+    try {
+      if (action !== "start") {
+        const currentConsumer = await knowledgeRead(projectId, { kind: "conversation_consumer", conversation_id: selected });
+        if (currentConsumer.expected_consumer_version !== confirmed.request.expected_consumer_version) { setKnowledgeConfirmation(undefined); setKnowledgeConsumer(undefined); throw new Error("The conversation changed. Prepare, preview and confirm again; nothing new was sent."); }
+      }
+      if (!mounted.current || before !== knowledgeLive.current || selectionBefore !== knowledgeDispatchIdentity.current || JSON.stringify(confirmed.request) !== JSON.stringify({ ...knowledgeConsumer, selection: knowledgeSelection })) return;
+      await send({ action: "with_knowledge", operation_id: consumer.consumer.operation.operation_id, operation: consumer.consumer.operation, project_id: projectId, expected_consumer_version: consumer.expected_consumer_version, selection: confirmed.request.selection, preview_fingerprint: confirmed.preview_fingerprint });
+    } catch (cause) { if (mounted.current) setError(errorText(cause)); }
   }
   async function inspectPending(original: Journal) {
     setBusy(true); setError("");
@@ -466,6 +520,7 @@ function ProjectConversationWorkspace({ projectId, storageScope, revision, execu
     </section>)}
     {[journal, recoveryJournal].filter((item): item is Journal => !!item).map((pending) => <section key={pending.id} className="panel" aria-label="Saved request outcome"><h2>Saved request: {pending.request.action.replaceAll("_", " ")}</h2>
       <p>{pending.status === "published" || pending.status === "unknown" ? "This request may have reached the service. Reload never sends it again. Check its outcome before continuing." : pending.status === "refused" ? "The service refused this request. Your original input is retained." : "The service recorded this request. Review its outcome before releasing it."}</p>
+      {pending.request.action === "with_knowledge" && <p>Knowledge selected for operation {pending.id}. {pending.status === "succeeded" ? "Delivery is confirmed only by the recorded operation receipt shown below." : "Reservation or delivery is unconfirmed. Check the exact operation outcome; do not send a replacement."}</p>}
       <details><summary>Original request and technical details</summary><pre>{pending.body}</pre>{pending.receipt && <pre>{JSON.stringify(pending.receipt, null, 2)}</pre>}</details>
       <div className="button-row"><button disabled={busy} onClick={() => void inspectPending(pending)}>Refresh / check outcome</button>
         {pending.conversation && <button disabled={busy} onClick={() => choose(pending.conversation || "")}>Open recorded conversation</button>}
@@ -487,8 +542,24 @@ function ProjectConversationWorkspace({ projectId, storageScope, revision, execu
           <details><summary>Session and admission details</summary><p>Generation: {current.generation} · Session: {current.session_id || "none"} · Active turn: {current.active_turn_id || "none"} · Reservation: {current.reservation_state || "none"} · Binding: {current.binding_valid ? "valid" : "history only"}</p><p>Admission recorded as {detail.admission.recorded_state}; this is not a live readiness guarantee.</p></details>
           {(!current.binding_valid || detail.unresolved_operation || current.state === "recovery_required") && <p role="status">Recovery is required or a control is unresolved. Check the saved request and refresh. Reconcile only checks recorded process quiescence; Resume requires unchanged identity and confirmed history. A history-only conversation cannot resume.</p>}
           <ol className="conversation-history" aria-label="Recorded messages and tool summaries">
-            {historyEntries(messages, detail.events).map((entry) => <li key={entry.id}><strong>{entry.label}</strong><p>{entry.text}</p>{entry.incomplete && <small>Visible history; unavailable as a completed source message.</small>}</li>)}
+            {historyEntries(messages, detail.events).map((entry) => {
+              const message = messages?.messages.find((item) => item.id === entry.id);
+              return <li key={entry.id}><strong>{entry.label}</strong><p>{entry.text}</p>{entry.incomplete && <small>Visible history; unavailable as a completed source message.</small>}
+                {message?.selectable && <SaveKnowledgeSource projectId={projectId} source={{ kind: "conversation", source: { conversation_id: current.id, messages: [{ message_id: message.id, content_hash: message.content_hash }] } }} title={message.source.kind === "user" ? "Conversation user statement" : "Conversation finding"} />}
+              </li>;
+            })}
           </ol>
+          {detail.events.filter((event) => event.kind === "user_message" && typeof event.payload.knowledge_manifest_id === "string").map((event) => {
+            const confirmed = !!event.operation_id && messages?.messages.some((message) =>
+              message.source.kind === "user" &&
+              message.source.conversation_id === current.id &&
+              message.source.operation_id === event.operation_id &&
+              message.selectable
+            );
+            return <KnowledgeManifestDetail key={event.sequence} projectId={projectId} manifestId={String(event.payload.knowledge_manifest_id)} delivery={confirmed
+              ? "Operation delivery confirmed; provider reading and understanding unverified"
+              : "Reserved input recorded; delivery unverified. Refresh and check the exact operation outcome."} />;
+          })}
           {!current.is_probe && <section className="conversation-promotion" aria-label="Select task source messages">
             <h3>Create task from conversation</h3>
             <p>Select recorded messages to freeze as task reference material. Excerpts cannot be edited here. Server validation is authoritative.</p>
@@ -515,8 +586,10 @@ function ProjectConversationWorkspace({ projectId, storageScope, revision, execu
         </>}
       </section> : <section className="panel"><h2>New conversation</h2><label>Admitted conversation profile<select value={admissionId} onChange={(event) => setAdmissionId(event.target.value)}><option value="">Choose a recorded active admission</option>{activeAdmissions.map((item) => { const profile = profiles.find((saved) => saved.id === item.profile_revision_id); return <option key={item.id} value={item.id}>{profile?.model} · {profile?.effort} · profile {profile?.id}</option>; })}</select></label><p>Active is a historical recorded state. Starting rechecks current eligibility and may refuse. Selecting a profile does not start a provider.</p>{!activeAdmissions.length && <p>No admitted profile is loaded. Use the setup steps below, or load more profiles and admissions.</p>}</section>}
       <section className="panel"><label htmlFor="conversation-input">{selected ? "Follow-up or steering message" : "First message"}</label><textarea id="conversation-input" rows={5} value={input} onChange={(event) => setInput(event.target.value)} aria-describedby="conversation-input-limit" /><small id="conversation-input-limit">{bytes(input)} / {MAX_INPUT} UTF-8 bytes. Ordinary textual questions can be answered with a follow-up.</small>
-        <div className="button-row"><button className="primary" disabled={blocked || !inputValid || (selected ? !liveIdle : !selectedAdmission)} onClick={() => void send(selected ? { action: "submit", operation_id: operationId(), conversation_id: selected, input } : { action: "start", operation_id: operationId(), admission_id: admissionId, input })}>{selected ? "Send follow-up" : "Ask / start conversation"}</button>
-          {selected && <button disabled={blocked || !running || !inputValid} onClick={() => current?.active_turn_id && void send({ action: "steer", operation_id: operationId(), conversation_id: current.id, expected_turn_id: current.active_turn_id, input })}>Steer active turn</button>}</div>
+        <KnowledgeSelector key={`${selected}:${knowledgeGeneration}`} projectId={projectId} consumer={knowledgeConsumer} disabled={busy || !!journal || !!recoveryJournal || !!journalError} invalidationKey={knowledgeLive.current} onSelectionChange={setKnowledgeSelection} onConfirm={setKnowledgeConfirmation} />
+        {knowledgeSelection.length > 0 && <div className="button-row"><button type="button" disabled={blocked || !inputValid || (selected ? !liveIdle : !selectedAdmission)} onClick={() => void prepareKnowledgeOperation(selected ? "submit" : "start")}>Prepare {selected ? "follow-up" : "start"} with knowledge</button>{selected && <button type="button" disabled={blocked || !running || !inputValid} onClick={() => void prepareKnowledgeOperation("steer")}>Prepare steer with knowledge</button>}<p>Prepare reserves the original operation identity for preview only. Preview and confirm before sending. Resume alone adds no attachment.</p></div>}
+        <div className="button-row"><button className="primary" disabled={blocked || !inputValid || (selected ? !liveIdle : !selectedAdmission)} onClick={() => void sendInput(selected ? "submit" : "start")}>{selected ? "Send follow-up" : "Ask / start conversation"}</button>
+          {selected && <button disabled={blocked || !running || !inputValid} onClick={() => void sendInput("steer")}>Steer active turn</button>}</div>
       </section>
     </div></div>
     <details className="panel"><summary>Conversation setup: save profile → Prepare → Probe → inspect evidence → Activate</summary>

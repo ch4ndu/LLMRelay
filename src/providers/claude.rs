@@ -27,46 +27,6 @@ pub fn inspect_observation_account() -> super::ProviderAccountObservation {
     }
 }
 
-/// Candidate arguments for the provider-observation contract: one print-mode
-/// turn in safe mode with every tool denied, an explicitly empty MCP
-/// configuration, no slash commands, browser or saved session, and updates
-/// disabled through the environment rather than user settings. Whether safe
-/// mode also suppresses every user hook and customization in the pinned build
-/// is unproven until native qualification.
-pub(crate) fn observation_arguments(model: &str, effort: &str, prompt: &str) -> Vec<String> {
-    let settings = serde_json::json!({
-        "permissions": {
-            "defaultMode": "dontAsk",
-            "allow": [],
-            "deny": [
-                "Bash", "Read", "Edit", "Write", "Glob", "Grep", "NotebookEdit",
-                "WebFetch", "WebSearch", "Task", "Agent"
-            ]
-        }
-    });
-    vec![
-        "--print".to_owned(),
-        "--safe-mode".to_owned(),
-        "--no-session-persistence".to_owned(),
-        "--model".to_owned(),
-        model.to_owned(),
-        "--effort".to_owned(),
-        effort.to_owned(),
-        "--permission-mode".to_owned(),
-        "dontAsk".to_owned(),
-        "--tools".to_owned(),
-        String::new(),
-        "--settings".to_owned(),
-        settings.to_string(),
-        "--strict-mcp-config".to_owned(),
-        "--mcp-config".to_owned(),
-        serde_json::json!({"mcpServers": {}}).to_string(),
-        "--disable-slash-commands".to_owned(),
-        "--no-chrome".to_owned(),
-        prompt.to_owned(),
-    ]
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn prepare(
     role: RoleKind,
@@ -415,10 +375,12 @@ pub(crate) fn single_agent_native(
     request: &super::SingleAgentLaunchRequest<'_>,
 ) -> Result<super::SingleAgentNative> {
     use sha2::Digest;
+    if !request.purpose.is_writer() {
+        bail!(
+            "Single agent reader and reviewer execution has been retired; select a writer purpose"
+        );
+    }
     let scope = super::single_agent_read_scope(request)?;
-    let writer = request.purpose.is_writer();
-    let mut write_denials = scope.denied_roots.clone();
-    write_denials.push(scope.worktree.clone());
     let (executable, version) = if request.bundles.is_synthetic() {
         (
             request.executable_path.to_path_buf(),
@@ -429,14 +391,10 @@ pub(crate) fn single_agent_native(
     };
     let canonical_role_socket = canonical_role_socket(request.role_socket)?;
     let settings_argument = native_sandbox_settings_argument(
-        if writer {
-            &request.assets.claude_implementer_settings
-        } else {
-            &request.assets.claude_settings
-        },
+        &request.assets.claude_implementer_settings,
         &canonical_role_socket,
         &scope.denied_roots,
-        if writer { None } else { Some(&write_denials) },
+        None,
         Some(&scope),
     )?;
     let channel = request.executable_path.display();
@@ -445,26 +403,16 @@ pub(crate) fn single_agent_native(
         .strip_prefix("/")
         .unwrap_or(&scope.worktree)
         .display();
-    let tools = if writer {
-        "Read,Grep,Glob,Edit,Write,Bash"
-    } else {
-        "Read,Grep,Glob,Bash"
-    };
-    let denied = if writer {
-        "NotebookEdit,WebFetch,WebSearch,Task,Agent"
-    } else {
-        "Edit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent"
-    };
-    let mut allowed = vec![
+    let tools = "Read,Grep,Glob,Edit,Write,Bash";
+    let denied = "NotebookEdit,WebFetch,WebSearch,Task,Agent";
+    let allowed = vec![
         format!("Read(//{relative}/**)"),
         format!("Grep(//{relative}/**)"),
         format!("Glob(//{relative}/**)"),
+        format!("Edit(//{relative}/**)"),
         format!("Bash({channel} role context)"),
         format!("Bash({channel} role report:*)"),
     ];
-    if writer {
-        allowed.insert(3, format!("Edit(//{relative}/**)"));
-    }
     let mut arguments = vec![
         "--model".to_owned(),
         request.model.to_owned(),
@@ -529,7 +477,7 @@ pub(crate) fn single_agent_native(
         .pointer_mut("/sandbox/filesystem/allowRead/0")
         .context("Claude Single agent settings lack the current worktree read grant")? =
         serde_json::json!("<worktree>");
-    let mut security_policy = serde_json::json!({
+    let security_policy = serde_json::json!({
         "restricted": true,
         "permission_mode": "default",
         "permission_request_timeout_seconds": crate::permissions::PROVIDER_PERMISSION_TIMEOUT_SECONDS,
@@ -551,12 +499,6 @@ pub(crate) fn single_agent_native(
         "additional_directories": [],
         "hooks": "native_explicit_trust",
     });
-    if !writer {
-        security_policy["native_sandbox"]["policy_revision"] =
-            "claude-single-agent-read-only-v1".into();
-        security_policy["native_sandbox"]["filesystem_deny_write"] =
-            serde_json::json!(write_denials);
-    }
     Ok(super::SingleAgentNative {
         executable,
         executable_version: version,
@@ -571,11 +513,7 @@ pub(crate) fn single_agent_native(
         security_policy,
         hook_revision: format!(
             "{CLAUDE_HOOK_REVISION}:{}",
-            if writer {
-                &request.assets.claude_implementer_revision_hash
-            } else {
-                &request.assets.claude_revision_hash
-            }
+            &request.assets.claude_implementer_revision_hash
         ),
     })
 }

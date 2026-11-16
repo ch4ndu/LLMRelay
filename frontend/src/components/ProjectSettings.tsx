@@ -476,6 +476,12 @@ function AgentProfileEditor(
     }
     setRecovered({ id: created.entity_id, version: created.version });
   };
+  if (value.purpose && value.purpose !== "workspace_writer") {
+    return <div className="agent-profile-editor">
+      <p>Historical {value.purpose.replaceAll("_", " ")} profile request. This purpose is retired and cannot be edited or admitted. Refresh Project settings to inspect its recorded outcome.</p>
+      <button type="button" onClick={onDone}>Close profile editor</button>
+    </div>;
+  }
   return (
     <fieldset className="agent-profile-editor" disabled={commands.busy}>
       <legend>
@@ -520,14 +526,7 @@ function AgentProfileEditor(
             setValue({ ...value, display_name: event.target.value })}
         />
       </label>
-      <label>Purpose
-        <select value={value.purpose ?? "workspace_writer"} onChange={(event) => setValue({ ...value, purpose: event.target.value as ProfilePurpose })}>
-          <option value="workspace_writer">Workspace writer · retained conversation</option>
-          <option value="repository_reader">Repository reader · retained conversation</option>
-          <option value="repository_reviewer">Independent reviewer · fresh conversation</option>
-        </select>
-      </label>
-      <p className="hint">{value.purpose === "repository_reader" ? "Reads repository files and returns research. Initial and resumed turns are read-only." : value.purpose === "repository_reviewer" ? "Reads a frozen candidate in a fresh isolated conversation. Cannot edit files or grant acceptance." : "May edit files in the task's authorized workspace."} Admission below shows whether this exact purpose and provider version are qualified.</p>
+      <p className="hint">Workspace writer · retained conversation. May edit files in the task's authorized workspace.</p>
       <label>
         Provider
         <select
@@ -621,15 +620,18 @@ function SingleAgentProjectSettings(
   const [editingConfiguration, setEditingConfiguration] = useState(false);
   const latestConfiguration = execution.configurations[0];
   const defaultKey = `default:${project.id}`;
-  const saveDefault = () =>
+  const unsupportedDefault = defaultFamily === "single_agent" &&
+    defaultPreset !== "single_agent";
+  const saveDefault = () => {
+    if (unsupportedDefault) return;
     void commands.submit(defaultKey, (operation_id) => ({
       kind: "set_project_workflow_default",
       operation_id,
       project_id: project.id,
       expected_version: execution.default_version,
       family: defaultFamily,
-      ...(defaultFamily === "single_agent" && defaultPreset !== "single_agent" ? { preset: defaultPreset } : {}),
     }));
+  };
   return (
     <div className="single-agent-project">
       <fieldset className="workflow-default" disabled={commands.busy}>
@@ -645,14 +647,41 @@ function SingleAgentProjectSettings(
             {option === "trip" ? "TRIP" : "Single agent"}
           </label>
         ))}
-        {defaultFamily === "single_agent" && <label>Default task type<select value={defaultPreset} onChange={(event) => setDefaultPreset(event.target.value as SingleAgentPreset)}><option value="single_agent">Build with one agent</option><option value="repository_research">Repository research</option><option value="build_and_review">Build and review</option></select></label>}
+        {defaultFamily === "single_agent" && (
+          <label>
+            Default task type
+            <select
+              value={defaultPreset}
+              onChange={(event) => {
+                if (event.target.value === "single_agent") {
+                  setDefaultPreset("single_agent");
+                }
+              }}
+            >
+              <option value="single_agent">Build with one agent</option>
+              {defaultPreset !== "single_agent" && (
+                <option value={defaultPreset} disabled>
+                  {defaultPreset === "repository_research"
+                    ? "Repository research"
+                    : "Build and review"} (historical, retired)
+                </option>
+              )}
+            </select>
+          </label>
+        )}
+        {unsupportedDefault && (
+          <p className="hint">
+            This saved default is retired and kept as history. Choose Build with
+            one agent or TRIP, then save to replace it for new tasks.
+          </p>
+        )}
         <small>
           Only tasks created later start with this choice. Existing tasks,
           recipes and schedules keep their workflow.
         </small>
         <button
           type="button"
-          disabled={defaultFamily === execution.default_family && (defaultFamily === "trip" || defaultPreset === (execution.default_preset ?? "single_agent"))}
+          disabled={unsupportedDefault || (defaultFamily === execution.default_family && (defaultFamily === "trip" || defaultPreset === (execution.default_preset ?? "single_agent")))}
           onClick={saveDefault}
         >
           Save default workflow
@@ -715,7 +744,7 @@ function SingleAgentProjectSettings(
                 </span>
               )
               : <span>No current revision</span>}
-            <button
+            {(profile.current_revision?.purpose ?? "workspace_writer") === "workspace_writer" && <button
               type="button"
               onClick={() =>
                 setProfileDraft({
@@ -729,8 +758,8 @@ function SingleAgentProjectSettings(
                 })}
             >
               Edit<span className="visually-hidden">: {profile.display_name}</span>
-            </button>
-            {profile.current_revision && latestConfiguration && (
+            </button>}
+            {profile.current_revision && (profile.current_revision.purpose ?? "workspace_writer") === "workspace_writer" && latestConfiguration && (
               <AdmissionControls
                 projectId={project.id}
                 execution={execution}
@@ -739,6 +768,9 @@ function SingleAgentProjectSettings(
                 tasks={tasks}
                 commands={commands}
               />
+            )}
+            {profile.current_revision?.purpose && profile.current_revision.purpose !== "workspace_writer" && (
+              <p className="hint">Historical profile · this purpose is retired and cannot be edited or admitted.</p>
             )}
             <TechnicalDetails>
               <p>

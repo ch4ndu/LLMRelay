@@ -250,6 +250,14 @@ pub struct ConversationReceiptLookup {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ConversationOperation {
+    WithKnowledge {
+        operation_id: String,
+        operation: Box<ConversationOperation>,
+        project_id: String,
+        expected_consumer_version: i64,
+        selection: Vec<crate::domain::KnowledgeSelection>,
+        preview_fingerprint: String,
+    },
     WorkspaceIdentity {
         project_id: String,
     },
@@ -377,6 +385,29 @@ impl ConversationOperation {
             }
         }
         match self {
+            Self::WithKnowledge {
+                operation_id,
+                operation,
+                project_id,
+                expected_consumer_version,
+                selection,
+                preview_fingerprint,
+            } => {
+                operation.validate()?;
+                bounded(project_id, 128, "project ID")?;
+                bounded(preview_fingerprint, 128, "preview fingerprint")?;
+                let request = crate::knowledge::conversation_preview_request(
+                    operation,
+                    project_id,
+                    *expected_consumer_version,
+                    selection.clone(),
+                )?;
+                let value = serde_json::to_value(operation)?;
+                if value["operation_id"].as_str() != Some(operation_id.as_str()) {
+                    bail!("Keep the same operation identity when confirming knowledge")
+                }
+                crate::knowledge::validate_preview_request(&request)
+            }
             Self::WorkspaceIdentity { project_id } => bounded(project_id, 128, "project ID"),
             Self::TaskSources {
                 project_id,

@@ -703,6 +703,14 @@ function WorkflowComparisons({ projects, initialProjectId, tasks, onOpen, cohort
         {evidence.rows.map((row: ComparisonEvidenceRow) => {
           const task = tasks.find((t) => t.id === row.task_id);
           return <article key={row.key} className="comparison-fact"><FactFields fields={[["Unit", row.unit_id], ["Task", row.task_id], ["Exact attempt", row.attempt_id]]} />
+            {row.recipe_attribution ? <><h4>Recorded recipe and schedule origin</h4><FactFields fields={[
+              ["Recipe title", row.recipe_attribution.recipe_title], ["Recipe revision", row.recipe_attribution.recipe_revision_id],
+              ["Schedule", row.recipe_attribution.schedule_id], ["Scheduled for (UTC)", row.recipe_attribution.scheduled_for_utc],
+              ["Occurrence", row.recipe_attribution.occurrence_id], ["Execution authorization", row.recipe_attribution.authorization_id],
+              ["Claimed root attempt", row.recipe_attribution.root_attempt_id], ["Occurrence outcome", row.recipe_attribution.occurrence_outcome],
+              ["Occurrence reason", row.recipe_attribution.occurrence_reason],
+            ]} /><p>Origin records do not establish execution, usage or success. Occurrences without a task remain in schedule history.</p></> :
+              <p>Recipe and schedule attribution unavailable for this historical fact.</p>}
             <EvidenceFact fact={row.fact} />
             {row.truncated && <p>Truncated: this fact contains a bounded excerpt; some text is omitted.</p>}
             {row.source && <><FactFields fields={[["Source kind", words(row.source.kind)], ["Source ID", row.source.id], ["Source task", row.source.task_id], ["Source attempt", row.source.attempt_id]]} />

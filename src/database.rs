@@ -1053,6 +1053,7 @@ fn establish_restore_hold(paths: &InstancePaths, journal: &RestoreJournal) -> Re
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let now = Utc::now().to_rfc3339();
+    let mut scheduled_repair_deliveries = Vec::<String>::new();
     let detail = serde_json::json!({
         "kind":"database_restore_hold",
         "operation_id":journal.operation_id.as_str(),
@@ -1079,7 +1080,7 @@ fn establish_restore_hold(paths: &InstancePaths, journal: &RestoreJournal) -> Re
          WHERE id!=?2 AND state='attention_required'
            AND json_extract(detail_json,'$.kind') IN (
              'database_restore_session','database_restore_check',
-             'database_restore_claim','database_restore_freeze')
+             'database_restore_claim','database_restore_freeze','database_restore_preparation')
            AND COALESCE(json_extract(detail_json,'$.operation_id'),'')!=?3",
         rusqlite::params![now, HOLD_ID, journal.operation_id],
     )?;
@@ -1091,6 +1092,115 @@ fn establish_restore_hold(paths: &InstancePaths, journal: &RestoreJournal) -> Re
          WHERE s.status IN ('launch_reserved','launching','running','recovery_required')",
         rusqlite::params![journal.operation_id, now],
     )?;
+    if require_maintenance_schema(&tx)? >= 48 {
+        // Spent schedule fences need fresh recovery even after exit or failed launch,
+        // independently of terminal attempt state or a surviving claim.
+        tx.execute(
+            "INSERT OR IGNORE INTO recovery_records(id,session_id,attempt_id,state,process_identity_json,detail_json,created_at,updated_at)
+             SELECT ?1 || ':session:' || s.id,s.id,rg.attempt_id,'attention_required',s.process_identity_json,
+                    json_object('kind','database_restore_session','operation_id',?1,'automatic_signal',0),?2,?2
+             FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
+             JOIN recipe_schedule_fires f ON f.id=s.schedule_occurrence_id
+               AND f.attempt_id=rg.attempt_id AND f.authorization_id=s.schedule_authorization_id
+             WHERE f.authorization_id IS NOT NULL AND f.invocations_spent>0
+               AND f.outcome IN ('waiting','reserved','running','stop_requested','recovery_required')",
+            rusqlite::params![journal.operation_id, now],
+        )?;
+        if require_maintenance_schema(&tx)? >= 49 {
+            let repairs = {
+                let mut statement = tx.prepare(
+                    "SELECT f.id,r.child_attempt_id,r.delivery_id,r.rework_intent_id,i.state,
+                            json_object('operation_id',?1,'occurrence_id',f.id,'intent_id',i.id,
+                              'parent_attempt_id',i.parent_attempt_id,'child_attempt_id',i.new_attempt_id,
+                              'delivery_id',r.delivery_id,'snapshot_id',r.snapshot_id)
+                     FROM single_agent_repair_receipts r JOIN rework_intents i ON i.id=r.rework_intent_id
+                     JOIN recipe_schedule_fires f ON f.attempt_id=r.root_attempt_id
+                     WHERE f.invocations_spent>0
+                       AND f.outcome IN ('waiting','reserved','running','stop_requested','recovery_required')",
+                )?;
+                let rows = statement
+                    .query_map([&journal.operation_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
+            for (occurrence, child, delivery, intent, state, preparation) in repairs {
+                if !crate::recipes::schedule_attempt_member_in(&tx, &occurrence, &child)? {
+                    continue;
+                }
+                scheduled_repair_deliveries.push(delivery);
+                let preparation =
+                    serde_json::from_str::<serde_json::Value>(&preparation)?.to_string();
+                if !matches!(
+                    state.as_str(),
+                    "reserved" | "materializing" | "recovery_required"
+                ) {
+                    continue;
+                }
+                tx.execute(
+                    "INSERT OR IGNORE INTO recovery_records(id,attempt_id,state,detail_json,created_at,updated_at)
+                     VALUES(?1||':preparation:'||?2,?3,'attention_required',
+                       json_object('kind','database_restore_preparation','operation_id',?1,
+                         'preparation',json(?4),'automatic_signal',0),?5,?5)",
+                    rusqlite::params![journal.operation_id,intent,child,preparation,now],
+                )?;
+                tx.execute(
+                    "UPDATE rework_intents SET state='recovery_required',
+                       result_json=json_set(result_json,'$.cancellation_pending',json('true'),
+                         '$.restore_preparation',json(?1)),updated_at=?2 WHERE id=?3",
+                    rusqlite::params![preparation, now, intent],
+                )?;
+            }
+            let submissions = {
+                let mut statement = tx.prepare(
+                    "SELECT s.id,rg.attempt_id,f.id FROM sessions s
+                     JOIN role_generations rg ON rg.id=s.role_generation_id
+                     JOIN recipe_schedule_fires f ON f.id=s.schedule_occurrence_id
+                       AND f.authorization_id=s.schedule_authorization_id
+                     WHERE f.invocations_spent>0
+                       AND f.outcome IN ('waiting','reserved','running','stop_requested','recovery_required')",
+                )?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
+            for (session, attempt, occurrence) in submissions {
+                // Copied occurrence bindings cannot establish repair membership.
+                if crate::recipes::schedule_attempt_member_in(&tx, &occurrence, &attempt)? {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO recovery_records(id,session_id,attempt_id,state,
+                             process_identity_json,detail_json,created_at,updated_at)
+                         SELECT ?1||':session:'||id,id,?3,'attention_required',process_identity_json,
+                             json_object('kind','database_restore_session','operation_id',?1,'automatic_signal',0),?4,?4
+                         FROM sessions WHERE id=?2",
+                        rusqlite::params![journal.operation_id, session, attempt, now],
+                    )?;
+                }
+            }
+        }
+        tx.execute(
+            "UPDATE sessions SET status='recovery_required',desired_running=0,updated_at=?2
+             WHERE status NOT IN ('exited','recovery_required','launch_reserved','launching','running') AND EXISTS(
+               SELECT 1 FROM recovery_records r WHERE r.id=?1 || ':session:' || sessions.id
+                 AND r.session_id=sessions.id AND r.state='attention_required')",
+            rusqlite::params![journal.operation_id, now],
+        )?;
+    }
     tx.execute(
         "INSERT OR IGNORE INTO recovery_records(id,session_id,attempt_id,state,detail_json,created_at,updated_at)
          SELECT ?1 || ':check:' || c.id,NULL,c.attempt_id,'attention_required',
@@ -1109,7 +1219,10 @@ fn establish_restore_hold(paths: &InstancePaths, journal: &RestoreJournal) -> Re
            AND NOT EXISTS(
              SELECT 1 FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
              WHERE rg.attempt_id=c.attempt_id
-               AND s.status IN ('launch_reserved','launching','running','recovery_required'))
+               AND (s.status IN ('launch_reserved','launching','running','recovery_required')
+                 OR EXISTS(SELECT 1 FROM recovery_records r
+                   WHERE r.id=?1 || ':session:' || s.id AND r.session_id=s.id
+                     AND r.state='attention_required')))
            AND NOT EXISTS(
              SELECT 1 FROM check_runs check_run WHERE check_run.attempt_id=c.attempt_id
                AND check_run.status IN ('launch_reserved','running','recovery_required','launch_ambiguous'))",
@@ -1127,6 +1240,22 @@ fn establish_restore_hold(paths: &InstancePaths, journal: &RestoreJournal) -> Re
     tx.execute("UPDATE claims SET state='unknown',updated_at=?1 WHERE state IN ('reserved','launching','running','stopping')", [&now])?;
     tx.execute("UPDATE attempts SET status='needs_recovery',updated_at=?1 WHERE id IN (SELECT attempt_id FROM recovery_records WHERE state='attention_required' AND attempt_id IS NOT NULL)", [&now])?;
     tx.execute("UPDATE tasks SET attention='needs_recovery',updated_at=?1 WHERE id IN (SELECT task_id FROM attempts WHERE status='needs_recovery')", [&now])?;
+    if require_maintenance_schema(&tx)? >= 48 {
+        if require_maintenance_schema(&tx)? >= 49 {
+            tx.execute(
+                "UPDATE recipe_schedule_stop_targets SET restore_invalidated_at=COALESCE(restore_invalidated_at,?1)",
+                [&now],
+            )?;
+        }
+        tx.execute("UPDATE recipe_schedule_authorizations SET restore_invalidated_at=COALESCE(restore_invalidated_at,?1),
+            revoked_at=COALESCE(revoked_at,?1),revoked_by=COALESCE(revoked_by,'database_restore'),
+            revocation_reason=COALESCE(revocation_reason,'Database restore invalidated prior schedule authority')", [&now])?;
+        // Preserve the historical mode and grant reference without renewing authority.
+        tx.execute("UPDATE recipe_schedules SET paused=1,next_fire_utc=NULL,version=version+1,updated_at=?1 WHERE mode IN ('run_authorized_research','run_authorized_recipe') OR active_authorization_id IS NOT NULL", [&now])?;
+        tx.execute("UPDATE recipe_schedule_fires SET outcome=CASE WHEN invocations_spent=0 THEN 'held' ELSE 'recovery_required' END,
+            reason='Database restore invalidated launch and signal authority; reconcile exact identities before recovery'
+            WHERE authorization_id IS NOT NULL AND outcome IN ('waiting','reserved','running','stop_requested','recovery_required')", [])?;
+    }
     tx.execute(
         "UPDATE role_credentials SET revoked_at=COALESCE(revoked_at,?1)",
         [&now],
@@ -1184,7 +1313,7 @@ fn establish_restore_hold(paths: &InstancePaths, journal: &RestoreJournal) -> Re
         [&now],
     )?;
     tx.execute("UPDATE switch_intents SET state='cancelled',updated_at=?1 WHERE state NOT IN ('finished','cancelled','superseded','rejected')", [&now])?;
-    tx.execute("UPDATE rework_intents SET state='failed',result_json=json_set(result_json,'$.restore_hold','database restore invalidated prior transition authority'),updated_at=?1 WHERE state NOT IN ('completed','failed','cancelled')", [&now])?;
+    tx.execute("UPDATE rework_intents SET state='failed',result_json=json_set(result_json,'$.restore_hold','database restore invalidated prior transition authority'),updated_at=?1 WHERE state NOT IN ('completed','failed','cancelled') AND COALESCE(json_extract(result_json,'$.restore_preparation.operation_id'),'')!=?2", rusqlite::params![now,journal.operation_id])?;
     tx.execute("UPDATE trip_setup_permits SET state='revoked',consumed_at=COALESCE(consumed_at,?1) WHERE state='issued'", [&now])?;
     tx.execute("UPDATE trip_runtime_admissions SET state='failed',failure_reason='database restore invalidated prior runtime authority',updated_at=?1 WHERE state IN ('pending_approval','authorized','running','awaiting_publication')", [&now])?;
     tx.execute("UPDATE trip_runtime_probes SET state='failed',failure_reason='database restore invalidated prior runtime authority',updated_at=?1 WHERE state IN ('pending_approval','authorized','running','awaiting_resume','evidence_recorded')", [&now])?;
@@ -1246,12 +1375,15 @@ fn establish_restore_hold(paths: &InstancePaths, journal: &RestoreJournal) -> Re
             [&now],
         )?;
     }
+    if require_maintenance_schema(&tx)? >= 47 {
+        crate::knowledge::invalidate_restored_observations_in(&tx, &journal.operation_id)?;
+    }
     if require_maintenance_schema(&tx)? >= 43 {
         // Restoring cannot restore knowledge of external delivery or candidate
         // bytes. Preserve every spent reservation and repair receipt.
-        tx.execute("UPDATE single_agent_review_deliveries SET state='abandoned',reason='Database restore invalidated the delivery and its external materialization; allowance remains spent',updated_at=?1 WHERE state!='abandoned' AND result_binding_id IN (SELECT id FROM workflow_result_bindings WHERE state!='accepted')",[&now])?;
+        tx.execute("UPDATE single_agent_review_deliveries SET state='abandoned',reason='Database restore invalidated the delivery and its external materialization; allowance remains spent',updated_at=?1 WHERE state!='abandoned' AND result_binding_id IN (SELECT id FROM workflow_result_bindings WHERE state!='accepted') AND id NOT IN (SELECT value FROM json_each(?2))",rusqlite::params![now,serde_json::to_string(&scheduled_repair_deliveries)?])?;
         tx.execute("UPDATE workflow_result_bindings SET state='review_blocked',state_reason='Database restore requires review recovery; no new review allowance was granted',updated_at=?1 WHERE state IN ('awaiting_review','review_running','review_changes_requested') OR (state='awaiting_human' AND id IN (SELECT result_binding_id FROM single_agent_review_deliveries WHERE state='abandoned'))",[&now])?;
-        tx.execute("UPDATE attempts SET phase='review_blocked',status='needs_input',updated_at=?1 WHERE id IN (SELECT attempt_id FROM workflow_result_bindings WHERE state='review_blocked') AND status!='done'",[&now])?;
+        tx.execute("UPDATE attempts SET phase='review_blocked',status='needs_input',updated_at=?1 WHERE id IN (SELECT attempt_id FROM workflow_result_bindings WHERE state='review_blocked') AND status!='done' AND NOT EXISTS(SELECT 1 FROM recovery_records r WHERE r.attempt_id=attempts.id AND r.state='attention_required')",[&now])?;
     }
     tx.commit()?;
     Ok(())

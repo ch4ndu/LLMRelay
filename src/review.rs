@@ -1,25 +1,10 @@
 use crate::snapshot::SnapshotManifest;
 use crate::store::Store;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct SingleAgentReviewDelivery {
-    pub id: String,
-    pub attempt_id: String,
-    pub result_binding_id: String,
-    pub snapshot_id: String,
-    pub candidate_hash: String,
-    pub selected_check_revision: i64,
-    pub check_receipts: Vec<String>,
-    pub materialization_path: PathBuf,
-    pub materialization_identity: Option<String>,
-    pub state: String,
-}
 
 #[derive(Debug)]
 pub(crate) struct SingleAgentReviewDeferred(pub(crate) String);
@@ -31,201 +16,6 @@ impl std::fmt::Display for SingleAgentReviewDeferred {
 }
 
 impl std::error::Error for SingleAgentReviewDeferred {}
-
-// Launch authority is stricter than historical report/acceptance authority.
-pub(crate) fn require_single_agent_review_launch(
-    connection: &Connection,
-    attempt_id: &str,
-    expected_phase: &str,
-) -> Result<()> {
-    let ready: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.id=a.task_id
-         WHERE a.id=?1 AND a.status='running' AND a.phase=?2
-           AND t.lifecycle IN ('in_progress','awaiting_review') AND t.attention='none'
-           AND t.archived_at IS NULL
-           AND a.id=(SELECT id FROM attempts WHERE task_id=t.id ORDER BY created_at DESC,rowid DESC LIMIT 1)
-           AND EXISTS(SELECT 1 FROM workflow_result_bindings WHERE attempt_id=a.id AND state=?2)
-           AND EXISTS(SELECT 1 FROM workspaces WHERE attempt_id=a.id AND state='ready')
-           AND NOT EXISTS(SELECT 1 FROM controls WHERE attempt_id=a.id
-             AND kind IN ('pause_now','pause_after_role','cancel') AND state IN ('requested','draining'))
-           AND NOT EXISTS(SELECT 1 FROM recovery_records
-             WHERE (attempt_id=a.id OR id='database-restore-hold') AND state='attention_required')
-           AND NOT EXISTS(SELECT 1 FROM restart_candidates WHERE attempt_id=a.id
-             AND state NOT IN ('resumed','released_fresh_dispatch','cancelled'))
-           AND NOT EXISTS(SELECT 1 FROM freeze_intents WHERE attempt_id=a.id
-             AND state IN ('reserved','capturing','recovery_required'))
-           AND NOT EXISTS(SELECT 1 FROM check_runs WHERE attempt_id=a.id
-             AND status IN ('launch_reserved','running','recovery_required','launch_ambiguous')))",
-        params![attempt_id, expected_phase],
-        |row| row.get(0),
-    )?;
-    let provider_held: bool = connection.query_row(
-        &format!(
-            "SELECT {}",
-            crate::store::provider_failure_hold_restricts(
-                "?1",
-                "'single_agent_reviewer'",
-                "'default'"
-            )
-        ),
-        [attempt_id],
-        |row| row.get(0),
-    )?;
-    if !ready
-        || provider_held
-        || crate::store::failure_stop_fence(connection, attempt_id)?.is_some()
-    {
-        return Err(SingleAgentReviewDeferred(
-            "The independent review is waiting for task controls or launch holds to be released"
-                .into(),
-        )
-        .into());
-    }
-    Ok(())
-}
-
-pub(crate) fn single_agent_review_preparation_deferred(
-    connection: &Connection,
-    attempt_id: &str,
-) -> Result<bool> {
-    let unlaunched: bool = connection.query_row(
-        "SELECT NOT EXISTS(SELECT 1 FROM single_agent_review_deliveries WHERE attempt_id=?1
-           AND state NOT IN ('reserved','materializing','ready'))",
-        [attempt_id],
-        |row| row.get(0),
-    )?;
-    if unlaunched {
-        if let Err(error) =
-            require_single_agent_review_launch(connection, attempt_id, "awaiting_review")
-        {
-            if error.is::<SingleAgentReviewDeferred>() {
-                return Ok(true);
-            }
-            return Err(error);
-        }
-    }
-    Ok(false)
-}
-
-pub(crate) fn single_agent_delivery(
-    connection: &Connection,
-    id: &str,
-) -> Result<SingleAgentReviewDelivery> {
-    let raw: String = connection.query_row("SELECT json_object('id',id,'attempt_id',attempt_id,'result_binding_id',result_binding_id,'snapshot_id',snapshot_id,'candidate_hash',candidate_hash,'selected_check_revision',selected_check_revision,'check_receipts',json(check_receipts_json),'materialization_path',materialization_path,'materialization_identity',materialization_identity,'state',state) FROM single_agent_review_deliveries WHERE id=?1",[id],|row|row.get(0))?;
-    Ok(serde_json::from_str(&raw)?)
-}
-
-fn materialization_identity(path: &Path, candidate: &str) -> Result<String> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.is_dir() || path.canonicalize()? != path {
-        bail!("The reviewer candidate path changed")
-    }
-    Ok(hex::encode(Sha256::digest(serde_json::to_vec(
-        &serde_json::json!({
-            "path":path,"device":metadata.dev(),"inode":metadata.ino(),"candidate_hash":candidate,
-        }),
-    )?)))
-}
-
-pub(crate) fn require_current_single_agent_delivery(
-    connection: &Connection,
-    id: &str,
-    materialized: bool,
-) -> Result<SingleAgentReviewDelivery> {
-    let delivery = single_agent_delivery(connection, id)?;
-    let current: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM single_agent_review_deliveries d
-        JOIN workflow_result_bindings r ON r.id=d.result_binding_id AND r.attempt_id=d.attempt_id
-          AND r.snapshot_id=d.snapshot_id AND r.candidate_hash=d.candidate_hash AND r.profile_binding_hash=d.profile_binding_hash AND r.selected_check_revision=d.selected_check_revision
-        JOIN workflow_run_bindings b ON b.attempt_id=d.attempt_id AND b.definition_hash=d.definition_hash AND b.definition_state='available'
-        JOIN attempts a ON a.id=d.attempt_id AND a.candidate_hash=d.candidate_hash
-        JOIN tasks t ON t.id=a.task_id AND t.id=d.task_id AND t.archived_at IS NULL
-        JOIN task_workflow_selections selection ON selection.task_id=t.id AND selection.selection_hash=b.selection_hash
-        JOIN workflow_run_profiles rp ON rp.attempt_id=a.id AND rp.slot_key='single_agent_reviewer' AND rp.profile_revision_id=d.reviewer_profile_revision_id AND rp.profile_hash=d.reviewer_profile_hash AND rp.session_contract='fresh'
-        JOIN agent_profile_revisions profile ON profile.id=rp.profile_revision_id AND profile.profile_hash=rp.profile_hash AND profile.policy_hash=rp.policy_hash AND profile.purpose='repository_reviewer'
-        JOIN profile_admissions pa ON pa.id=rp.admission_id AND pa.state='activated' AND pa.policy_hash=rp.policy_hash AND pa.profile_revision_id=rp.profile_revision_id AND pa.execution_config_revision_id=b.execution_config_revision_id
-        WHERE d.id=?1 AND d.state!='abandoned' AND a.status IN ('running','held','needs_input')
-          AND a.id=(SELECT id FROM attempts WHERE task_id=t.id ORDER BY created_at DESC,rowid DESC LIMIT 1)
-          AND r.state IN ('awaiting_review','review_running','review_changes_requested','awaiting_human')
-          AND t.lifecycle IN ('in_progress','awaiting_review'))",[id],|row|row.get(0))?;
-    if !current {
-        bail!(
-            "The review no longer matches the current result, configuration, profile or admission"
-        )
-    }
-    crate::workflow::require_single_agent_review_pins(
-        connection,
-        &delivery.attempt_id,
-        &delivery.result_binding_id,
-    )?;
-    if delivery.state == "finished" {
-        let exact: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM single_agent_review_deliveries d
-            JOIN single_agent_review_results v ON v.delivery_id=d.id
-            JOIN role_results rr ON rr.id=v.role_result_id AND rr.role_generation_id=d.role_generation_id AND rr.session_id=d.session_id AND rr.operation_id=v.operation_id AND rr.outcome='review_complete' AND rr.consumed_at IS NOT NULL AND rr.summary=v.summary
-            JOIN operation_receipts receipt ON receipt.operation_id=v.operation_id AND receipt.actor_key=d.role_generation_id AND receipt.operation_kind='role_report' AND receipt.request_hash=v.request_hash
-            JOIN sessions s ON s.id=d.session_id AND s.transcript_epoch=d.transcript_epoch AND s.status='exited' AND s.resume_count=0 AND json_extract(s.exit_json,'$.process_group_quiescent')=1
-            JOIN role_generations g ON g.id=d.role_generation_id AND g.role='single_agent_reviewer' AND g.status='exited'
-            JOIN execution_bindings eb ON eb.role_generation_id=g.id AND eb.slot_key=g.role AND eb.actor=g.role AND eb.session_contract='fresh'
-            JOIN role_credentials rc ON rc.id=d.credential_id AND rc.role_generation_id=g.id AND rc.revoked_at IS NOT NULL
-            WHERE d.id=?1 AND json_extract(rr.metadata_json,'$.delivery_id')=d.id AND json_extract(rr.metadata_json,'$.result_binding_id')=d.result_binding_id AND json_extract(rr.metadata_json,'$.candidate_hash')=d.candidate_hash AND json_extract(rr.metadata_json,'$.selected_check_revision')=d.selected_check_revision AND json_extract(rr.metadata_json,'$.verdict')=v.verdict AND json_extract(rr.metadata_json,'$.findings')=v.findings_json
-              AND NOT EXISTS(SELECT 1 FROM sessions other WHERE other.id!=s.id AND other.provider=s.provider AND other.native_session_id=s.native_session_id))",[id],|row|row.get(0))?;
-        if !exact {
-            bail!("The settled review has no exact authenticated verdict and quiescence receipt")
-        }
-    }
-    let definition = crate::workflow_resources::single_agent_definition(
-        crate::workflow::run_preset(connection, &delivery.attempt_id)?,
-    );
-    let definition_hash: String = connection.query_row(
-        "SELECT definition_hash FROM single_agent_review_deliveries WHERE id=?1",
-        [id],
-        |row| row.get(0),
-    )?;
-    if definition.hash() != definition_hash
-        || crate::workflow::run_preset(connection, &delivery.attempt_id)?
-            != crate::domain::SingleAgentPreset::BuildAndReview
-    {
-        bail!("The review definition changed")
-    }
-    if crate::store::single_agent_profile_binding_hash(connection, &delivery.attempt_id)?
-        != connection.query_row::<String, _, _>(
-            "SELECT profile_binding_hash FROM single_agent_review_deliveries WHERE id=?1",
-            [id],
-            |row| row.get(0),
-        )?
-    {
-        bail!("The primary profile binding changed after review reservation")
-    }
-    let receipts = crate::workflow::selected_check_receipts(
-        connection,
-        &delivery.attempt_id,
-        &delivery.candidate_hash,
-        delivery.selected_check_revision,
-    )?;
-    if receipts != delivery.check_receipts {
-        bail!("The selected-check evidence changed after review reservation")
-    }
-    let manifest_json: String = connection.query_row("SELECT manifest_json FROM snapshots WHERE id=?1 AND attempt_id=?2 AND complete=1 AND manifest_hash=?3",params![delivery.snapshot_id,delivery.attempt_id,delivery.candidate_hash],|row|row.get(0))?;
-    let manifest: SnapshotManifest = serde_json::from_str(&manifest_json)?;
-    if hex::encode(Sha256::digest(serde_json::to_vec(&manifest)?)) != delivery.candidate_hash {
-        bail!("The review snapshot manifest changed")
-    }
-    if materialized {
-        if !matches!(delivery.state.as_str(), "ready" | "launched" | "finished")
-            || delivery.materialization_identity.as_deref()
-                != Some(
-                    materialization_identity(
-                        &delivery.materialization_path,
-                        &delivery.candidate_hash,
-                    )?
-                    .as_str(),
-                )
-            || !crate::snapshot::verify_materialized(&manifest, &delivery.materialization_path)?
-        {
-            bail!("The independent review candidate is incomplete or its bytes changed")
-        }
-    }
-    Ok(delivery)
-}
 
 pub(crate) fn ordinary_code_review_cap_reached(
     connection: &Connection,
@@ -516,7 +306,10 @@ impl ReviewService {
     /// service snapshot, not any path or hash the agent claimed, becomes the
     /// result's immutable candidate.
     pub fn freeze_single_agent_result(&self, attempt_id: &str) -> Result<serde_json::Value> {
-        crate::workflow::prepare_read_probe(&self.store, attempt_id)?;
+        {
+            let connection = self.store.lock()?;
+            crate::workflow::require_supported_attempt_execution(&connection, attempt_id)?;
+        }
         let (freeze_id, binding_id) = {
             let mut connection = self.store.lock()?;
             let transaction =
@@ -654,32 +447,8 @@ impl ReviewService {
             params![attempt_id, check_revision],
             |row| row.get(0),
         )?;
-        let preset = crate::workflow::run_preset(&transaction, attempt_id)?;
-        if preset == crate::domain::SingleAgentPreset::RepositoryResearch {
-            let baseline: String = transaction.query_row("SELECT s.manifest_json FROM workflow_run_bindings b JOIN snapshots s ON s.id=b.research_snapshot_id AND s.complete=1 WHERE b.attempt_id=?1",[attempt_id],|row|row.get(0))?;
-            let mut baseline: SnapshotManifest = serde_json::from_str(&baseline)?;
-            let probe: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM single_agent_admission_challenges c JOIN attempts a ON a.task_id=c.task_id WHERE a.id=?1 AND c.state='complete')",[attempt_id],|row|row.get(0))?;
-            if probe {
-                baseline
-                    .entries
-                    .retain(|entry| entry.path != crate::workflow::SINGLE_AGENT_READ_CHALLENGE);
-            }
-            if checks_selected
-                || baseline.entries != manifest.entries
-                || baseline.candidate_head != manifest.candidate_head
-                || baseline.repository_identity != manifest.repository_identity
-            {
-                bail!("Repository research changed its repository or selected write-capable checks; the result cannot be accepted")
-            }
-        }
         let (state, phase, reason) = if checks_selected {
             ("awaiting_checks", "awaiting_checks", "The selected checks must pass against this exact candidate before you can accept it")
-        } else if preset == crate::domain::SingleAgentPreset::BuildAndReview {
-            (
-                "awaiting_review",
-                "awaiting_review",
-                "Waiting for an independent review of this exact candidate",
-            )
         } else {
             (
                 "awaiting_human",
@@ -1042,156 +811,6 @@ impl ReviewService {
         )
     }
 
-    pub fn prepare_research_baseline(&self, attempt_id: &str) -> Result<()> {
-        let (preset, existing, workspace, repository_path, base): (
-            crate::domain::SingleAgentPreset,
-            Option<String>,
-            String,
-            String,
-            String,
-        ) = {
-            let connection = self.store.lock()?;
-            let preset = crate::workflow::run_preset(&connection, attempt_id)?;
-            if preset != crate::domain::SingleAgentPreset::RepositoryResearch {
-                return Ok(());
-            }
-            let row: (Option<String>,String,String,String) = connection.query_row("SELECT b.research_snapshot_id,w.path,p.repository_path,a.base_revision FROM workflow_run_bindings b JOIN attempts a ON a.id=b.attempt_id JOIN workspaces w ON w.attempt_id=a.id AND w.state='ready' JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id WHERE a.id=?1",[attempt_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
-            (preset, row.0, row.1, row.2, row.3)
-        };
-        if let Some(id) = existing {
-            let raw: String = self.store.lock()?.query_row(
-                "SELECT manifest_json FROM snapshots WHERE id=?1 AND complete=1",
-                [id],
-                |row| row.get(0),
-            )?;
-            let mut manifest: SnapshotManifest = serde_json::from_str(&raw)?;
-            let removed: bool = self.store.lock()?.query_row("SELECT EXISTS(SELECT 1 FROM single_agent_admission_challenges c JOIN attempts a ON a.task_id=c.task_id WHERE a.id=?1 AND c.state IN ('challenge_removed','complete'))",[attempt_id],|row|row.get(0))?;
-            if removed {
-                manifest
-                    .entries
-                    .retain(|entry| entry.path != crate::workflow::SINGLE_AGENT_READ_CHALLENGE);
-            }
-            if !crate::snapshot::verify_materialized(&manifest, Path::new(&workspace))? {
-                bail!("The repository changed since research started; this conversation cannot resume")
-            }
-            return Ok(());
-        }
-        let mut repository = crate::workspace::inspect(Path::new(&repository_path))?;
-        repository.head = base;
-        let id = uuid::Uuid::new_v4().to_string();
-        let (manifest, hash) = crate::snapshot::capture(
-            &repository,
-            Path::new(&workspace),
-            &self.snapshots_root.join(&id),
-        )?;
-        let mut connection = self.store.lock()?;
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let started: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM role_generations WHERE attempt_id=?1)",
-            [attempt_id],
-            |row| row.get(0),
-        )?;
-        if started || crate::workflow::run_preset(&tx, attempt_id)? != preset {
-            bail!("Research started before its read-only baseline could be recorded")
-        }
-        tx.execute("INSERT INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,created_at,original_base,candidate_head) VALUES(?1,?2,'research_baseline',?3,?4,?5,1,?6,?7,?8)",params![id,attempt_id,manifest.snapshot_base,hash,serde_json::to_string(&manifest)?,Utc::now().to_rfc3339(),manifest.original_base,manifest.candidate_head])?;
-        if tx.execute("UPDATE workflow_run_bindings SET research_snapshot_id=?1 WHERE attempt_id=?2 AND research_snapshot_id IS NULL",params![id,attempt_id])? != 1 { bail!("Research baseline ownership changed") }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn prepare_single_agent_review(&self, attempt_id: &str) -> Result<String> {
-        let now = Utc::now().to_rfc3339();
-        let id = {
-            let mut connection = self.store.lock()?;
-            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            require_single_agent_review_launch(&tx, attempt_id, "awaiting_review")?;
-            crate::workflow::single_agent_quiescence(&tx, attempt_id)?;
-            let existing: Option<String> = tx
-                .query_row(
-                    "SELECT id FROM single_agent_review_deliveries WHERE attempt_id=?1",
-                    [attempt_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(id) = existing {
-                require_current_single_agent_delivery(&tx, &id, false)?;
-                id
-            } else {
-                let (task,root,result,snapshot,candidate,definition,profile,reviewer,reviewer_hash,revision): (String,String,String,String,String,String,String,String,String,i64) = tx.query_row(
-                    "SELECT a.task_id,budget.root_attempt_id,r.id,r.snapshot_id,r.candidate_hash,b.definition_hash,r.profile_binding_hash,rp.profile_revision_id,rp.profile_hash,r.selected_check_revision
-                     FROM attempts a JOIN workflow_run_bindings b ON b.attempt_id=a.id
-                     JOIN single_agent_review_budgets budget ON budget.task_id=a.task_id
-                     JOIN workflow_result_bindings r ON r.attempt_id=a.id AND r.state='awaiting_review'
-                     JOIN workflow_run_profiles rp ON rp.attempt_id=a.id AND rp.slot_key='single_agent_reviewer'
-                     WHERE a.id=?1 AND a.phase='awaiting_review' AND a.status='running'",[attempt_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?)))?;
-                let ordinal: i64 = tx.query_row("SELECT COALESCE(MAX(ordinal),0)+1 FROM single_agent_review_deliveries WHERE root_attempt_id=?1",[&root],|row|row.get(0))?;
-                if ordinal > 2 {
-                    bail!("The two independent review deliveries are spent; this task remains incomplete")
-                }
-                let checks = crate::workflow::selected_check_receipts(
-                    &tx, attempt_id, &candidate, revision,
-                )?;
-                let id = uuid::Uuid::new_v4().to_string();
-                let path = self
-                    .snapshots_root
-                    .parent()
-                    .context("Snapshots have no artifact parent")?
-                    .join("worktrees")
-                    .join(&id);
-                tx.execute("INSERT INTO single_agent_review_deliveries(id,task_id,root_attempt_id,attempt_id,ordinal,result_binding_id,snapshot_id,candidate_hash,definition_hash,profile_binding_hash,reviewer_profile_revision_id,reviewer_profile_hash,selected_check_revision,check_receipts_json,materialization_path,state,created_at,updated_at)
-                    VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,'reserved',?16,?16)",params![id,task,root,attempt_id,ordinal,result,snapshot,candidate,definition,profile,reviewer,reviewer_hash,revision,serde_json::to_string(&checks)?,path.to_string_lossy(),now])?;
-                tx.commit()?;
-                id
-            }
-        };
-        let delivery = {
-            let connection = self.store.lock()?;
-            require_single_agent_review_launch(&connection, attempt_id, "awaiting_review")?;
-            require_current_single_agent_delivery(&connection, &id, false)?
-        };
-        if delivery.state == "ready" {
-            let connection = self.store.lock()?;
-            require_current_single_agent_delivery(&connection, &id, true)?;
-            return Ok(id);
-        }
-        if !matches!(delivery.state.as_str(), "reserved" | "materializing") {
-            bail!("This review delivery cannot launch again")
-        }
-        let path = &delivery.materialization_path;
-        let prepared = (|| -> Result<()> {
-            self.store.lock()?.execute("UPDATE single_agent_review_deliveries SET state='materializing',updated_at=?1 WHERE id=?2 AND state='reserved'",params![now,id])?;
-            if !path.try_exists()? {
-                self.materialize_rework(&delivery.snapshot_id, path)?;
-            }
-            let manifest: String = self.store.lock()?.query_row(
-                "SELECT manifest_json FROM snapshots WHERE id=?1",
-                [&delivery.snapshot_id],
-                |row| row.get(0),
-            )?;
-            if !crate::snapshot::verify_materialized(&serde_json::from_str(&manifest)?, path)? {
-                bail!("The interrupted review materialization does not match the frozen snapshot")
-            }
-            let identity = materialization_identity(path, &delivery.candidate_hash)?;
-            let mut connection = self.store.lock()?;
-            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            require_single_agent_review_launch(&tx, attempt_id, "awaiting_review")?;
-            crate::workflow::single_agent_quiescence(&tx, attempt_id)?;
-            require_current_single_agent_delivery(&tx, &id, false)?;
-            if tx.execute("UPDATE single_agent_review_deliveries SET state='ready',materialization_identity=?1,updated_at=?2 WHERE id=?3 AND state='materializing'",params![identity,now,id])? != 1 { bail!("Review materialization ownership changed") }
-            tx.commit()?;
-            Ok(())
-        })();
-        if let Err(error) = prepared {
-            if error.is::<SingleAgentReviewDeferred>() {
-                return Err(error);
-            }
-            self.store.lock()?.execute("UPDATE single_agent_review_deliveries SET state='abandoned',reason=?1,updated_at=?2 WHERE id=?3 AND state IN ('reserved','materializing')",params![format!("{error:#}"),now,id])?;
-            return Err(error);
-        }
-        Ok(id)
-    }
-
     pub fn verify_materialized(&self, snapshot_id: &str, destination: &Path) -> Result<bool> {
         let manifest_json: String = {
             let connection = self.store.lock()?;
@@ -1267,23 +886,7 @@ impl ReviewService {
                 )
                 .optional()?
         };
-        let reviewer_manifest: Option<String> = {
-            let connection = self.store.lock()?;
-            let row: Option<(String,String)> = connection.query_row("SELECT s.manifest_json,ri.parent_attempt_id FROM rework_intents ri
-                JOIN single_agent_repair_receipts receipt ON receipt.rework_intent_id=ri.id AND receipt.child_attempt_id=ri.new_attempt_id AND receipt.snapshot_id=ri.snapshot_id
-                JOIN single_agent_review_budgets budget ON budget.root_attempt_id=receipt.root_attempt_id AND budget.repair_attempt_id=ri.new_attempt_id
-                JOIN single_agent_review_deliveries d ON d.id=receipt.delivery_id AND d.state='finished' AND d.snapshot_id=receipt.snapshot_id AND d.candidate_hash=receipt.candidate_hash AND d.result_binding_id=receipt.result_binding_id
-                JOIN single_agent_review_results verdict ON verdict.delivery_id=d.id AND verdict.verdict='changes_requested'
-                JOIN workflow_result_bindings result ON result.id=receipt.result_binding_id AND result.attempt_id=ri.parent_attempt_id AND result.state='changes_requested'
-                JOIN snapshots s ON s.id=ri.snapshot_id AND s.attempt_id=ri.parent_attempt_id AND s.complete=1 AND s.kind='candidate' AND s.manifest_hash=receipt.candidate_hash
-                WHERE ri.id=?1 AND ri.carry_plan_approval=0",[intent_id],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
-            row.map(|(manifest, parent)| -> Result<String> {
-                crate::workflow::single_agent_quiescence(&connection, &parent)?;
-                Ok(manifest)
-            })
-            .transpose()?
-        };
-        let manifest_json = single_agent_manifest.or(reviewer_manifest).or(terminal_manifest).ok_or_else(|| {
+        let manifest_json = single_agent_manifest.or(terminal_manifest).ok_or_else(|| {
             anyhow!("the rework source is not the exact rejected candidate of a recorded terminal replan")
         })?;
         let manifest: SnapshotManifest = serde_json::from_str(&manifest_json)?;

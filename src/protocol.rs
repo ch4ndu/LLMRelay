@@ -16,6 +16,8 @@ pub const SINGLE_AGENT_PRESETS_FEATURE: &str = "single_agent_presets_v1";
 pub const NATIVE_COMPANION_FEATURE: &str = "native_companion_v1";
 pub const DESKTOP_TARGET_FEATURE: &str = "desktop_target_v1";
 pub const CONVERSATION_FEATURE: &str = "conversation_v1";
+pub const SCHEDULE_OCCURRENCE_STOP_INTENT_FEATURE: &str = "schedule_occurrence_stop_intent_v1";
+pub const SCHEDULE_EXECUTION_AUTHORIZATION_FEATURE: &str = "schedule_execution_authorization_v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,6 +41,9 @@ impl ClientKind {
                 WORKFLOW_COMPARISONS_FEATURE,
                 DESKTOP_TARGET_FEATURE,
                 CONVERSATION_FEATURE,
+                SCHEDULE_EXECUTION_AUTHORIZATION_FEATURE,
+                SCHEDULE_OCCURRENCE_STOP_INTENT_FEATURE,
+                crate::knowledge::TASK_KNOWLEDGE_FEATURE,
             ],
             Self::HumanCli => &[
                 "control_requests_v1",

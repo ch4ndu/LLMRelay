@@ -1,6 +1,8 @@
 import { ErrorNotice } from "./ErrorNotice";
 import { type FormEvent, useEffect, useRef, useState } from "react";
-import { ApiError, command, operationId, submitWorkflowCommand } from "../api";
+import { KnowledgeSelector, TaskKnowledgePanel } from "./KnowledgeSelector";
+import type { KnowledgeSelection } from "../types";
+import { ApiError, getState, command, operationId, submitWorkflowCommand } from "../api";
 import { ModelSelector } from "./ModelSelector";
 import { useDialogFocus } from "../useDialogFocus";
 import { UncertainRequestNotice, useWorkflowCommands } from "./WorkflowControls";
@@ -28,6 +30,7 @@ import {
 const efforts = ["low", "medium", "high", "xhigh", "max", "ultra"];
 
 export interface TaskDraft {
+  knowledgeSelection?: KnowledgeSelection[];
   promotion?: ConversationPromotion;
   project_id: string;
   title: string;
@@ -324,6 +327,7 @@ const normalizeDraft = (value: unknown): TaskDraft | undefined => {
     : 0;
   return {
     ...(validPromotion(value.promotion) ? { promotion: value.promotion } : {}),
+    ...(Array.isArray(value.knowledgeSelection) && value.knowledgeSelection.length <= 16 && value.knowledgeSelection.every((item) => isRecord(item) && typeof item.entry_id === "string" && typeof item.revision_id === "string" && typeof item.expected_entry_version === "number" && typeof item.observation_fingerprint === "string" && typeof item.acknowledged_warning === "boolean") ? { knowledgeSelection: value.knowledgeSelection as KnowledgeSelection[] } : {}),
     project_id: stringField(value, "project_id"),
     title: stringField(value, "title"),
     description: stringField(value, "description"),
@@ -392,6 +396,9 @@ export function TaskForm(
     workflowExecution?: ProjectExecution[];
   },
 ) {
+  const [knowledgeTask, setKnowledgeTask] = useState<Task>();
+  const [knowledgeCompletion, setKnowledgeCompletion] = useState<CompletedTaskSave>();
+  const [knowledgeTaskId, setKnowledgeTaskId] = useState<string>();
   const key = editing
     ? `agenticjira.edit.${editing.id}`
     : "agenticjira.new-task";
@@ -970,8 +977,7 @@ export function TaskForm(
       return "Choose an execution configuration and an agent profile for the Single agent.";
     }
     if (singleAgent) {
-      if (singleAgentSelection.preset && singleAgentSelection.preset !== "single_agent" && mainCheckout) return "Research and independent review require an isolated worktree.";
-      if (singleAgentSelection.preset === "build_and_review" && !singleAgentSelection.reviewer_profile_revision_id) return "Choose an independent reviewer profile.";
+      if (singleAgentSelection.preset && singleAgentSelection.preset !== "single_agent") return "This preset has been retired. Choose a writer for a new task.";
       const configuration = execution?.configurations.find((item) => item.id === singleAgentSelection.execution_config_revision_id);
       if (!configuration) return "The saved execution configuration is no longer available. Choose a current configuration.";
       if (!execution?.profiles.some((item) => item.current_revision?.id === singleAgentSelection.profile_revision_id)) {
@@ -1013,6 +1019,7 @@ export function TaskForm(
       : { family: "trip", workspace_mode: draft.workspace_mode },
   });
   const createRequest = (ready: boolean): TaskCreateRequest | WorkflowCreateRequest => {
+    if (draft.knowledgeSelection?.length) ready = false;
     const criteria = draft.criteria.split("\n").map((value) => value.trim()).filter(Boolean);
     return draft.promotion || singleAgent || mainCheckout ? workflowCreate(criteria) : {
       kind: "create_task",
@@ -1089,7 +1096,9 @@ export function TaskForm(
         if (result.entity_kind !== "task") throw new ApiError("The service returned a different entity for this task create. Keep the exact request and reconcile its outcome.", 0, operation.id, true);
         taskId = result.entity_id;
       } else {
-        await command({ ...body, operation_id: operation.id });
+        const response = await command({ ...body, operation_id: operation.id });
+        if (typeof response.result.entity_id === "string") taskId = response.result.entity_id;
+        if (!editing && submittedDraft.knowledgeSelection?.length && !taskId) throw new ApiError("The draft response did not identify the created task. Refresh and check the exact create outcome before continuing.", 0, operation.id, true);
       }
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
@@ -1107,6 +1116,17 @@ export function TaskForm(
           // The refused record stays ignored until a later locked check removes it.
         });
       }
+      return;
+    }
+    if (!editing && submittedDraft.knowledgeSelection?.length && taskId) {
+      const completed: CompletedTaskSave = { taskId, projectId: submittedDraft.project_id, operation, draft: submittedDraft, storedDraft: published.storedDraft, preserveDraft: false };
+      if (!form.aborted) { setKnowledgeTaskId(taskId); setKnowledgeCompletion(completed); }
+      try {
+        const state = await getState();
+        const savedTask = state.tasks.find((item) => item.id === taskId && item.project_id === submittedDraft.project_id);
+        if (!form.aborted && savedTask) setKnowledgeTask(savedTask);
+        else if (!form.aborted) setError("The draft was created. Refresh and open its exact returned task ID from the board to prepare knowledge before Make Ready.");
+      } catch (cause) { if (!form.aborted) setError(`The draft was created and remains reachable from the board. Refresh before preparing knowledge. ${String(cause)}`); }
       return;
     }
     await finishSavingLocally({
@@ -1262,6 +1282,13 @@ export function TaskForm(
     }
   };
 
+  if (knowledgeCompletion) return <div className="modal-backdrop"><form ref={dialog} className="modal" role="dialog" aria-modal="true" aria-label="Prepare created draft knowledge" tabIndex={-1} onKeyDown={onDialogKeyDown} onSubmit={(event) => event.preventDefault()}>
+    <h2>Draft created — confirm knowledge before Make Ready</h2><p>Task {knowledgeTaskId}. This draft is reachable on the board. Confirm the exact selection below, then open the task and explicitly choose Make Ready.</p>
+    {knowledgeTask && <TaskKnowledgePanel key={knowledgeTask.id} task={knowledgeTask} initialSelection={draft.knowledgeSelection} onChanged={async () => { const state = await getState(); if (!lifecycle.current.signal.aborted) setKnowledgeTask(state.tasks.find((item) => item.id === knowledgeTask.id)); }} onConfirmed={() => { void finishSavingLocally(knowledgeCompletion, lifecycle.current.signal); }} />}
+    {error && <ErrorNotice error={error} />}
+    <button type="button" onClick={() => void finishSavingLocally(knowledgeCompletion, lifecycle.current.signal)}>Open saved draft without attaching this selection</button>
+  </form></div>;
+
   return (
     <div className="modal-backdrop">
       <form
@@ -1300,7 +1327,7 @@ export function TaskForm(
           <button type="button" disabled={saving || !!unresolvedCreate || !!draftRecovery || !!completedSave} onClick={() => chooseSavedDraft(() => {
             if (!checkDraftOwnership() || currentUnresolved.current) return;
             setDraft((current) => ({ ...current, project_id: promotion.project_id, promotion, roles: {}, roleOverrides: {},
-              ...(current.project_id === promotion.project_id ? {} : { workflowChoice: undefined, singleAgentChoice: undefined }) }));
+              ...(current.project_id === promotion.project_id ? {} : { workflowChoice: undefined, singleAgentChoice: undefined, knowledgeSelection: [] }) }));
           })}>Use this conversation selection and project defaults</button>
         </section>}
         {draft.promotion && <section className="panel" aria-label="Conversation source selection">
@@ -1317,7 +1344,7 @@ export function TaskForm(
             <select
               value={draft.project_id}
               disabled={!!editing || saving || !!draft.promotion || !!unresolvedCreate}
-              onChange={(event) => update("project_id", event.target.value)}
+              onChange={(event) => { update("project_id", event.target.value); update("knowledgeSelection", []); }}
             >
               <option value="">Choose a project</option>
               {missingProject && (
@@ -1646,6 +1673,9 @@ export function TaskForm(
               "Single agent tasks are saved as drafts. Make one Ready from the task once its agent profile is admitted."
             : readyReason || "Ready uses the activated project defaults or task-only profiles activated with current functional qualification. All six roles may use the same provider; each exact profile is checked separately."}
         </p>
+        {editing && <p>Save task field changes first, then review the saved canonical input and select knowledge in Overview before Make Ready.</p>}
+        {editing && draft.title === editing.title && draft.description === editing.description && draft.criteria === editing.acceptance_criteria.join("\n") && <TaskKnowledgePanel task={editing} onChanged={() => onSaved(editing.id, editing.project_id)} />}
+        {!editing && draft.project_id && <KnowledgeSelector key={draft.project_id} projectId={draft.project_id} initialSelection={draft.knowledgeSelection} disabled={saving || !!unresolvedCreate} onSelectionChange={(selection) => update("knowledgeSelection", selection)} onConfirm={() => {}} />}
         <footer>
           <button type="button" disabled={saving || workspaceCommands.busy} onClick={close}>
             Cancel
@@ -1683,7 +1713,7 @@ export function TaskForm(
                 ? "Saving…"
                 : editing
                 ? "Save changes"
-                : "Create Ready task"}
+                : draft.knowledgeSelection?.length ? "Save draft and confirm knowledge" : "Create Ready task"}
             </button>
           )}
         </footer>

@@ -942,7 +942,7 @@ preview; daily means 24 hours and weekly means 7 days, not a DST-aware local cal
 Edits reanchor to a future occurrence without changing already-created tasks.
 
 Scheduling runs only while the foreground service runs and execution is enabled,
-with drain and restore holds respected. It creates backlog drafts only, including
+with drain and restore holds respected. In **Create draft** mode it creates backlog drafts, including
 when a project queue is paused. It never requests run-next, starts an attempt, grants
 approval or accepts work. Due events before this service start are recorded as missed,
 not backfilled. After a delay, at most the newest eligible occurrence creates a draft;
@@ -954,6 +954,26 @@ not retried; re-save the recipe and explicitly edit the schedule to its new revi
 Archiving a recipe pauses its schedules; archiving schedules preserves fire history.
 A profile set cannot be archived while active recipe/schedule references depend on it.
 Created tasks retain their provenance and ordinary authority checks.
+
+Automatic recipe execution is retired. Existing automatic schedules keep their
+original mode and grant reference as history, are paused with no next-fire time,
+and have their grants revoked. The retained reference is not execution authority.
+They cannot be enabled, resumed or implicitly converted into active draft schedules.
+To schedule new drafts, create a schedule for a supported recipe.
+
+Old task, occurrence and grant records remain readable. Completed outcomes are
+not rewritten. Queued execution, retries, resumes, restart recovery and restored
+grants cannot start retired work. Restore retains the historical representation
+and invalidates authority while preserving its recovery hold and process-safety
+checks. An original mode already lost through an older restore is not reconstructed.
+
+Before deploying this change over active affected work, use the current build's
+safe stop/recovery controls and verify that owned processes and checks have
+settled. A paused schedule or revoked grant does not prove that a native process
+has stopped. Historical nonlaunch cleanup must retain exact process-identity and
+permission-invalidation checks; an uncertain process remains recovery-required.
+If a request outcome is uncertain, check its recorded outcome before submitting
+another request. No old grant can authorize a new launch or signal after restore.
 
 ### Sessions waiting at startup
 
@@ -1442,3 +1462,11 @@ invalid evidence is unavailable. Eligible legacy observations have a labeled
 basis; other history stays unknown. Whole-database backup/restore preserves the
 facts without manufacturing missing endpoints. Comparison evidence never grants
 process ownership, resume authority or approval.
+
+## Knowledge history and recovery
+
+An uncertain knowledge mutation retains its operation ID and original body in browser storage. Refresh and inspect its outcome before choosing an explicit exact retry; do not clear the saved request merely because a response was lost. Project and task changes cannot redirect a pending completion into the new view.
+
+Private database backups retain knowledge revisions, approval events, receipts and frozen manifests. Restore preserves those historical bytes, but environmental source observations require a new explicit revalidation before future attachments. An old revalidation receipt cannot clear the restore hold. Direct assertions remain assertions. Revalidating knowledge does not release execution recovery holds or restore conversation admission.
+
+Archive and supersession affect future selection, not an already-frozen attempt or conversation operation. If a task is held on knowledge, inspect its exact revision and source, revalidate or select a valid revision, and use the next-run preparation controls. Historical task attachments report availability separately from delivery. Sanitized diagnostic exports omit knowledge freeform statements, source excerpts and assembled input; private backups retain them.

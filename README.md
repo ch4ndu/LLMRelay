@@ -15,7 +15,7 @@ A **workflow** is the sequence of steps a task follows.
 
 Both workflows are implemented. Single-agent execution has native verification records for Codex and Claude. Complete TRIP tasks have also reached acceptance using only Codex and only Claude. Your own project profiles still need their setup checks before they can run.
 
-Recipes and draft-only schedules support TRIP and Single agent selections. **Repository research** and **Build and review** execution require separately qualified native policies, which remain unavailable pending qualification. Custom workflow editing is not available.
+Recipes and draft schedules support TRIP and the ordinary Single agent writer. The unqualified Repository research and Build and review presets, and automatic recipe execution, are retired. Historical records remain readable. Codex and Claude provider support remains available under their qualified contracts. Custom workflow editing is not available.
 
 A separate read-only conversation runtime has experimental split-evidence qualification on macOS for exact Codex CLI 0.167.0 with `gpt-6.1-sol` at medium effort. Real-model lifecycle checks and same-server standalone enforcement probes support this scope; denied execution through the model-tool path was not directly observed. Each project still needs its own probe and activation. The Conversations dashboard provides explicit admission setup, retained conversations and promotion into source-linked draft tasks. See the [security contract](docs/SECURITY.md#experimental-structured-conversations) for the evidence boundary. Existing task workflows retain their own compatibility requirements.
 
@@ -129,7 +129,7 @@ In **History**, use **Search** to find saved text across archived tasks and earl
 
 Closing an output view does not stop the agent. Releasing keyboard control does not restart or resume a task.
 
-Single agent recipes can pin the ordinary writer, **Repository research** or **Build and review** preset. The new presets require separate qualified reader/reviewer policies; setup explains any unavailable policy. See [preset behavior and review limits](docs/WORKFLOWS.md#research-and-independent-review-presets).
+Single agent recipes pin the ordinary writer. Historical Research and Build and review records retain their original identity, but cannot start or resume execution. See [retired presets](docs/WORKFLOWS.md#research-and-independent-review-presets).
 
 For Single agent, use **Resume agent** when offered to send an answer and continue its conversation. **Request changes** starts a linked new run with your feedback and preserves the previous result.
 
@@ -181,3 +181,9 @@ The **Providers** page checks local installation and sign-in information. It doe
 | [Native verification record](docs/provider-qualification-20261011.md) | Inspect detailed provider test evidence and its limits. |
 | [Milestones](docs/MILESTONES.md) | Explore longer-term plans, including distribution work. |
 | [Third-party notices](THIRD_PARTY_NOTICES.md) | Review bundled software notices. |
+
+## Project knowledge
+
+Use **Knowledge** to save project notes with exact source references, review drafts and explicitly approve revisions. Reports, findings and confirmed conversation messages can become drafts. Approval and source freshness are shown separately; an edited draft does not replace an approved revision until you approve the replacement.
+
+Select knowledge explicitly for a task or each conversation input, preview the included revisions and omissions, then confirm. Attachments retain their original revision and provenance. Knowledge is reference material, not permission to execute work. See [knowledge workflows](docs/WORKFLOWS.md#project-knowledge-with-explicit-provenance) and [recovery behavior](docs/OPERATIONS.md#knowledge-history-and-recovery).

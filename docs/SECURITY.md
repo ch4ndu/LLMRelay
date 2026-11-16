@@ -342,23 +342,26 @@ Internal setup projects cannot receive
 recipe intake. Scheduled fire records, task insertion, provenance and next-fire
 advancement are transactional, with a unique schedule/time identity.
 
+Scheduling is draft-only. Former automatic schedules are paused and their grants
+revoked using existing first-revocation and permission-invalidation rules. Their
+mode, grant reference, immutable scope and occurrence history remain readable,
+but confer no launch authority. New intent, queued work, final dispatch, restart,
+retry, resume and restore all enforce the retirement boundary. Restore retains
+its existing hold, epoch and process/permission invalidation protections.
+Historical cleanup cannot infer quiescence or signal an uncertain process.
+
 ## Single agent preset authority
 
-Repository readers and independent reviewers use distinct read-only native
-policies and credential identities. They cannot gain writer authority through
-permission approval, use Main checkout or execute selected service checks.
-Release qualification of that exact provider policy is separate from project
-admission; missing evidence blocks launch. Writer evidence cannot satisfy it.
+The unqualified Repository research and Build and review presets are retired.
+Historical profile purposes, definition identifiers and review receipts remain
+compatibility data, not executable authority. The qualified ordinary writer and
+TRIP's separate Explorer/reviewer roles remain protected for both providers.
 
-A reviewer credential names one delivery, result, candidate, check revision and
-fresh native conversation. Its repository is materialized and verified from the
-captured snapshot before launch. Partial materialization, changed evidence or a
-stale credential cannot supply approval. Authenticated reporting, native process
-quiescence and final human acceptance are separate gates. Reviewer-requested
-repair uses its own durable receipt, never a fabricated human decision.
-Task-level delivery and repair limits survive child runs and restart; unresolved
-delivery is not a free retry. Restore preserves spent accounting and holds
-unresolved review delivery for recovery rather than granting fresh authority.
+Observation-policy metadata is retained where provider-pack validation requires
+it, including Claude writer admission. App-wide model checks remain refused;
+historical receipt replay and shared conversation-probe settlement remain intact.
+Neither deleting a control nor preserving a metadata record qualifies a new
+provider version or grants authority to execute.
 
 ## Observed native resolution and notification identity
 
@@ -377,3 +380,11 @@ Profiles, installed executable/protocol identity, policy and execution configura
 The conversation permission-profile name `conversation_read_only_v1` is reserved. Preflight rejects any definition of that profile in inspected system, user, or repository-ancestor configuration, including empty definitions and inheritance through `extends`. Codex recursively merges configuration tables; rejecting collisions prevents inherited child-path grants from broadening the host's read-only or protected-read policy. This check runs before account inspection and applies to fresh and resumed preparation. The conversation configuration identity is `conversation-local-config-v3-0.167.0`; existing task configuration validation is unchanged.
 
 Conversation promotion grants no execution or tool authority. The server resolves selected source identities and hashes from its recorded events, enforces project ownership and size limits, and freezes the result with task creation. Both task workflow contexts label these excerpts as untrusted reference material. Browser preview text is not authoritative. Turn interruption and idle disconnect bind exact session generations; neither accepts an arbitrary process identifier or releases capacity without the existing ownership checks.
+
+## Knowledge reference boundaries
+
+The additive `project_knowledge_v1` browser capability exposes authenticated, project-scoped knowledge reads, lifecycle commands and preview. The host derives the human-control actor; clients cannot supply approval actors. Typed source selectors and server-computed complete-source hashes bind provenance. Committed repository reads reject path escape, symlinks, submodules and nonregular entries, and refuse over-limit sources rather than treating truncated previews as complete evidence. Filesystem freshness is a scoped observation, not a database-atomic claim about external files.
+
+Knowledge content is untrusted reference data. It cannot grant tool permissions, change AGENTS guidance, approve workflow plans or authorize execution. Selection is explicit per task or conversation input; there is no automatic injection, cross-project retrieval or provider-memory integration. Reservation recomputes preview facts and freezes original bytes transactionally. Later lifecycle changes cannot rewrite those bytes or authorize replay of uncertain delivery.
+
+Knowledge preview requests are capped at 32 KiB, preview responses at 64 KiB and exact revision/source detail at 128 KiB. Selectors and fingerprints are bounded. Existing consumer limits still apply to serialized attachments and their envelopes. Restore invalidates environmental freshness for future selection while retaining historical records and existing execution holds. Sanitized exports omit knowledge freeform content.

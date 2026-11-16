@@ -185,11 +185,9 @@ Under **Single agent profiles and configuration**:
   documentation policy and optional checks. Guidance files are read from the
   project's registered commit when you save; uncommitted edits are not
   included. Each save creates a new immutable revision.
-- **Agent profiles** name a provider, exact model, effort, instructions and purpose:
-  workspace writer, retained repository reader or fresh repository reviewer.
-  Research requires a reader; Build and review requires a writer and a separate
-  reviewer profile. The same provider/model may be used, but their authority and
-  conversations remain separate.
+- **Agent profiles** name a provider, exact model, effort and instructions for
+  the workspace writer. Historical repository-reader/reviewer profiles remain
+  identifiable, but cannot acquire a new admission or start retired presets.
   Saved instructions are not shown again; changing the provider, model, effort,
   instructions or purpose creates a new revision that needs its own admission, while a
   rename does not.
@@ -209,13 +207,12 @@ admission probe; it does not activate a profile or replace its current capabilit
 proof.
 
 
-Reader/reviewer contracts are separate from those writer qualifications and
-currently remain unqualified. Saving their profiles or recipes is not evidence
-that a native call can start. A release must first carry reviewed evidence for
-the exact policy and provider version; each project then prepares, probes and
-activates its own admission. Research probes establish authenticated read and
-retained recall; reviewer probes require fresh identity. Neither reuses a writer
-proof or promotes a native policy from an agent's assertion alone.
+The unqualified repository-reader/reviewer execution paths are retired. Their
+stored metadata does not activate a profile. Codex and Claude writer support,
+local installation/authentication diagnostics and historical check receipts remain.
+App-wide model-check starts are refused; preserved observation metadata is part
+of compatibility validation, not permission for a model call. Conversation
+admission and its own cleanup remain separate.
 
 ## Existing workflow files
 

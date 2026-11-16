@@ -100,6 +100,13 @@ fn sanitize_state(value: serde_json::Value) -> serde_json::Value {
                             "config",
                             "invalidation",
                             "limits",
+                            "scope_json",
+                            "authorization_scope",
+                            "stop_process_identity_json",
+                            "process",
+                            "process_identity",
+                            "process_identity_json",
+                            "recovery_anchor_json",
                             "profile",
                             "proof",
                             "receipt",
@@ -108,6 +115,22 @@ fn sanitize_state(value: serde_json::Value) -> serde_json::Value {
                             "arguments",
                             "actual_outcomes",
                             "body",
+                            "statement",
+                            "text",
+                            "excerpt",
+                            "excerpts",
+                            "source_excerpt",
+                            "source_excerpts",
+                            "block",
+                            "assembled_input",
+                            "user_text",
+                            "preview_user_text",
+                            "category",
+                            "tags",
+                            "author",
+                            "admission_hold",
+                            "hold_reason",
+                            "warning",
                             "capability_identity",
                             "command",
                             "command_display",
@@ -195,6 +218,18 @@ fn sanitize_state(value: serde_json::Value) -> serde_json::Value {
                         .contains(&key.as_str());
                         let value = if omitted {
                             serde_json::Value::String("[OMITTED FROM SANITIZED EXPORT]".to_owned())
+                        } else if key == "schedule_stop_target" {
+                            let mut target = value;
+                            if let Some(fields) = target.as_object_mut() {
+                                for key in ["anchor", "targets"] {
+                                    if let Some(payload) = fields.get_mut(key) {
+                                        *payload = serde_json::Value::String(
+                                            "[OMITTED FROM SANITIZED EXPORT]".to_owned(),
+                                        );
+                                    }
+                                }
+                            }
+                            omit(target)
                         } else if key == "acceptance_rows" {
                             // Check rows allow arbitrary JSON; only result statuses
                             // have a fixed public vocabulary.
@@ -254,6 +289,48 @@ fn sanitize_state(value: serde_json::Value) -> serde_json::Value {
         }
     }
     let mut value = value;
+    if let Some(schedules) = value
+        .get_mut("recipe_schedules")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for schedule in schedules {
+            if let Some(fields) = schedule.as_object_mut() {
+                if let Some(id) = fields.remove("active_authorization_id") {
+                    fields.insert("active_grant_id".into(), id);
+                }
+                if let Some(grant) = fields
+                    .remove("authorization")
+                    .filter(|grant| grant.is_object())
+                {
+                    fields.insert("execution_grant".into(), serde_json::json!({
+                        "id":grant["id"],
+                        "state":if !grant["restore_invalidated_at"].is_null() { "restore_invalidated" }
+                            else if !grant["revoked_at"].is_null() { "revoked" } else { "recorded" },
+                    }));
+                }
+            }
+            if let Some(fires) = schedule
+                .get_mut("occurrences")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for fire in fires {
+                    if let Some(fields) = fire.as_object_mut() {
+                        if let Some(id) = fields.remove("authorization_id") {
+                            fields.insert("grant_id".into(), id);
+                        }
+                    }
+                }
+            }
+            if let Some(fields) = schedule
+                .get_mut("last_fire")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                if let Some(id) = fields.remove("authorization_id") {
+                    fields.insert("grant_id".into(), id);
+                }
+            }
+        }
+    }
     if let Some(projects) = value
         .get_mut("projects")
         .and_then(serde_json::Value::as_array_mut)
@@ -392,6 +469,96 @@ mod tests {
     use super::*;
     use rusqlite::params;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn schedule_authorization_export_keeps_identity_without_executable_scope() {
+        for schema in [1, 2] {
+            let occurrence = serde_json::json!({
+                "id":"occurrence-safe","authorization_id":"grant-safe","outcome":"recovery_required",
+                "attempt_id":"root-safe","invocations_spent":3,"allowance_reserved":1,
+                "stop_binding":{"occurrence_id":"occurrence-safe","authorization_id":"grant-safe",
+                    "attempt_id":"child-safe","session_id":"session-safe",
+                    "process":{"native_start_marker":"PRIVATE-PROCESS"}},
+                "stop_process_identity_json":{"arbitrary":"PRIVATE-PROCESS"},
+                "stop_targets":[{"attempt_id":"child-safe","status":"quiescent",
+                    "process_identity_json":"PRIVATE-TARGET"}]
+            });
+            let authorization = serde_json::json!({"id":"grant-safe","scope":{
+                "schema":schema,"preset":"build_and_review",
+                "repository_identity":"PRIVATE-REPOSITORY","knowledge":{"arbitrary":"PRIVATE-KNOWLEDGE"},
+                "writer_admission":{"capability_key":"PRIVATE-WRITER"},
+                "reviewer_admission":{"capability_key":"PRIVATE-REVIEWER"}},
+                "scope_json":"PRIVATE-SERIALIZED-SCOPE"});
+            let check = serde_json::json!({"id":"check-safe","attempt_id":"child-safe","status":"interrupted",
+                "evidence":{"schedule_stop_target":{"anchor":"PRIVATE-ANCHOR","targets":["PRIVATE-TARGET"]}},
+                "schedule_stop_target":{"occurrence_id":"occurrence-safe","authorization_id":"grant-safe",
+                    "attempt_id":"child-safe","check_run_id":"check-safe",
+                    "anchor":{"native_start_marker":"PRIVATE-ANCHOR"},"targets":[{"pid":"PRIVATE-PID"}]}});
+            let state = sanitize_state(serde_json::json!({
+                "recipe_schedules":[{"id":"schedule-safe","active_authorization_id":"grant-safe",
+                    "authorization":authorization,"occurrences":[occurrence],"last_fire":occurrence}],
+                "tasks":[{"id":"task-safe","attempts":[{"id":"child-safe","parent_attempt_id":"root-safe",
+                    "check_runs":[check],"schedule_occurrence":occurrence,"authorization":authorization}]}],
+                "operation_receipts":[{"operation_id":"operation-safe","result":{"occurrence":occurrence,"check":check,"authorization":authorization}}],
+                "projections":[{"nested":{"occurrence":occurrence,"check":check,"authorization":authorization}}]
+            }));
+            let serialized = state.to_string();
+            assert!(!serialized.contains("PRIVATE-"), "{serialized}");
+            for retained in [
+                "schedule-safe",
+                "grant-safe",
+                "occurrence-safe",
+                "root-safe",
+                "child-safe",
+                "check-safe",
+                "recovery_required",
+                "quiescent",
+            ] {
+                assert!(serialized.contains(retained), "omitted {retained}");
+            }
+            assert_eq!(
+                state["recipe_schedules"][0]["occurrences"][0]["invocations_spent"],
+                3
+            );
+            assert_eq!(
+                state["tasks"][0]["attempts"][0]["parent_attempt_id"],
+                "root-safe"
+            );
+            assert_eq!(sanitize_state(state.clone()), state);
+        }
+    }
+
+    #[test]
+    fn knowledge_freeform_is_omitted_at_every_nested_export_position() {
+        let private = serde_json::json!({
+            "entry_id":"retained-entry", "revision_id":"retained-revision", "state":"needs_revalidation",
+            "content_hash":"retained-hash", "statement":"PRIVATE-KNOWLEDGE-STATEMENT",
+            "sources":[{"identity_hash":"retained-source-hash", "text":"PRIVATE-SOURCE-TEXT", "excerpt":"PRIVATE-SOURCE-EXCERPT"}],
+            "preview":{"block":"PRIVATE-FROZEN-BLOCK", "warning":"PRIVATE-WARNING"},
+            "assembled_input":"PRIVATE-ASSEMBLED-INPUT", "user_text":"PRIVATE-USER-TEXT",
+            "preview_user_text":"PRIVATE-PREVIEW-TEXT", "category":"PRIVATE-CATEGORY",
+            "tags":["PRIVATE-TAG"], "author":"PRIVATE-AUTHOR"
+        });
+        let state = sanitize_state(serde_json::json!({
+            "knowledge":private,
+            "tasks":[{"id":"retained-task", "knowledge":{"selection":private,"preparation":private,"manifests":[private]}}],
+            "operation_receipts":[{"operation_id":"retained-operation", "result":private}],
+            "projections":[{"nested":private}]
+        }));
+        let serialized = serde_json::to_string(&state).unwrap();
+        assert!(!serialized.contains("PRIVATE-"), "{serialized}");
+        for retained in [
+            "retained-entry",
+            "retained-revision",
+            "needs_revalidation",
+            "retained-hash",
+            "retained-source-hash",
+            "retained-task",
+            "retained-operation",
+        ] {
+            assert!(serialized.contains(retained), "omitted {retained}");
+        }
+    }
 
     #[test]
     fn capability_proof_retains_only_a_valid_runtime_scope_hash() {
@@ -817,6 +984,7 @@ mod tests {
             ).unwrap();
             let saved = crate::recipes::apply_command(
                 &transaction,
+                &store.compatibility_bundles,
                 &crate::domain::HumanCommand::UpsertProfileSet {
                     operation_id: "export-opaque-profile-operation".into(),
                     project_id: "export-project".into(),

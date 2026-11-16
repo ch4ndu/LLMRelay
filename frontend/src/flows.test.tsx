@@ -91,6 +91,7 @@ const {
   command,
   operation,
   getState,
+  recipeScheduleExecutionPreview,
   getTaskContent,
   waitForState,
   transportTimeouts,
@@ -111,8 +112,8 @@ const { AppErrorBoundary } = await import("./components/AppErrorBoundary");
 const nativeFetch = globalThis.fetch;
 const fixtureSource = Symbol("protocol fixture source");
 type FixtureFetch = typeof fetch & { [fixtureSource]?: typeof fetch };
-// The fixture service advertises every feature this dashboard can request,
-// so feature-gated operations reach the stubbed transport.
+// Shared fixtures advertise only the capabilities their transports implement.
+// Conversation flows opt in explicitly to their additional read/mutation contract.
 const allFeatures = [
   "http_operational_v1",
   "history_view_v1",
@@ -121,14 +122,16 @@ const allFeatures = [
   "task_interactions_v1",
   "history_insights_v1",
   "workflow_comparisons_v1",
+  "project_knowledge_v1",
+  "schedule_execution_authorization_v1",
 ];
-const protocolFixture = () =>
+const protocolFixture = (features = allFeatures, instanceId = "test-instance") =>
   new Response(
     JSON.stringify({
       generation: 1,
       server_version: "fixture",
-      instance_id: "test-instance",
-      supported_features: allFeatures,
+      instance_id: instanceId,
+      supported_features: features,
     }),
     { headers: { "content-type": "application/json" } },
   );
@@ -19118,6 +19121,56 @@ Deno.test("Project Single agent settings show the service's probe blocker and se
     />
   );
   try {
+    for (const preset of ["repository_research", "build_and_review"] as const) {
+      const historicalDefault = { ...singleAgentExecution, default_preset: preset };
+      mount(settings(historicalDefault));
+      let taskType = document.querySelector<HTMLSelectElement>(".workflow-default select")!;
+      check(
+        taskType.value === preset && taskType.selectedOptions[0].disabled &&
+          taskType.selectedOptions[0].textContent?.includes("historical, retired") &&
+          [...taskType.options].filter((option) => !option.disabled).map((option) => option.value).join() === "single_agent" &&
+          document.body.textContent?.includes("This saved default is retired and kept as history"),
+        "a saved retired default was converted, hidden, or offered as a selectable choice",
+      );
+      act(() => choiceFor("TRIP", document.querySelector(".workflow-default")!).click());
+      act(() => choiceFor("Single agent", document.querySelector(".workflow-default")!).click());
+      taskType = document.querySelector<HTMLSelectElement>(".workflow-default select")!;
+      const save = findButton("Save default workflow");
+      check(save.disabled && taskType.value === preset, "switching families silently replaced retired history");
+      const beforeRefusedSave = workflowCommands(bodies).length;
+      act(() => save.click());
+      await settle();
+      check(workflowCommands(bodies).length === beforeRefusedSave, "stale retired default reached the service through Save");
+      change(taskType, "single_agent");
+      click("Save default workflow");
+      await settle();
+      const writerDefault = workflowCommands(bodies).at(-1);
+      check(
+        workflowCommands(bodies).length === beforeRefusedSave + 1 &&
+          writerDefault?.kind === "set_project_workflow_default" &&
+          writerDefault.family === "single_agent" && writerDefault.preset === undefined &&
+          writerDefault.expected_version === 3 && historicalDefault.default_preset === preset,
+        "explicit writer replacement lost its version or changed stored history",
+      );
+      mount(settings(historicalDefault));
+      act(() => choiceFor("TRIP", document.querySelector(".workflow-default")!).click());
+      click("Save default workflow");
+      await settle();
+      const tripDefault = workflowCommands(bodies).at(-1);
+      check(
+        workflowCommands(bodies).length === beforeRefusedSave + 2 &&
+          tripDefault?.kind === "set_project_workflow_default" &&
+          tripDefault.family === "trip" && tripDefault.preset === undefined &&
+          tripDefault.expected_version === 3,
+        "explicit TRIP replacement submitted a stale retired preset",
+      );
+    }
+    bodies.length = 0;
+    for (const purpose of ["repository_reader", "repository_reviewer"] as const) {
+      mount(settings({ ...singleAgentExecution, profiles: singleAgentExecution.profiles.map((profile) => ({ ...profile, current_revision: profile.current_revision ? { ...profile.current_revision, purpose } : null })) }));
+      check(document.body.textContent?.includes(purpose.replaceAll("_", " ")) && document.body.textContent.includes("Historical profile"), "retired profile label was lost");
+      check(![...document.querySelectorAll("button")].some((button) => /^(Edit|Prepare admission|Probe this profile|Activate admission)/.test(button.textContent?.trim() ?? "")), "retired profile offered editing or admission");
+    }
     mount(settings(singleAgentExecution));
     check(
       findButton("Probe this profile").disabled &&
@@ -19238,6 +19291,9 @@ Deno.test("Project Single agent settings show the service's probe blocker and se
         command.kind === "save_agent_profile" && command.profile_id === null
       );
     click("Add an agent profile");
+    check(![...editor().querySelectorAll("label")].some((label) => label.textContent?.startsWith("Purpose")), "retired profile creation purposes remained selectable");
+    const providerSelect = [...editor().querySelectorAll("label")].find((label) => label.textContent?.trim().startsWith("Provider"))?.querySelector("select");
+    check(!!providerSelect && [...providerSelect.options].map((option) => option.value).join() === "codex,claude", "profile editor lost a provider");
     change(editorField("Name"), "Reviewer");
     change(editorField("Profile exact model"), "gpt-6.1-sol");
     change(editorField("Instructions for the agent"), "Review carefully.");
@@ -22914,6 +22970,62 @@ Deno.test("Workflow comparisons keep applied filters and older-run facts through
   }
 });
 
+Deno.test("Task comparison detail shows held schedule origin without invented execution or usage", async () => {
+  const duration = { sum_millis: null, mean_millis: null, complete_samples: 0, unavailable_samples: 1, ongoing_samples: 0 };
+  const page: WorkflowComparisonPage = {
+    selection: { cohort: "task", group_by: "project" }, cohort: "task", total_selected_units: 1, displayed_group_units: 1,
+    snapshot: "held-snapshot", next_cursor: null, date_basis: "Task creation UTC", outcome_scope: "Task outcomes",
+    usage_scope: "Recorded usage only", timing_scope: "Observed intervals", wait_scope: "Recorded waits",
+    groups: [{ key: "held-group", attribution: { state: "known", values: [project.id] },
+      counts: { units: 1, accepted: 0, cancelled: 0, failed: 0, incomplete: 1, human_changes: 0, provider_verdicts: 0,
+        provider_negative_verdicts: 0, repairs_authorized: 0, repairs_started: 0, repair_classification_unavailable: 0,
+        human_classification_unavailable: 0, provider_classification_unavailable: 0, infrastructure_recoveries: 0,
+        complete_execution_epochs: 0, missing_execution_epochs: 0, ongoing_execution_epochs: 0, never_executed_epochs: 0,
+        selected_checks: 0, unknown_check_matrices: 0, checks_passed: 0, checks_failed: 0, checks_running: 0,
+        checks_not_run: 0, checks_stale: 0, checks_unavailable: 0, matching_sessions: 0, sessions_with_usage: 0, sessions_without_usage: 0 },
+      elapsed_to_acceptance: duration, observed_execution_intervals: duration, known_partial_execution_intervals: duration,
+      recorded_recovery_waits: duration, check_execution: duration,
+      usage: { status: "unavailable", partial: true, counters: null, observed_responses: 0, source: "Recorded observations", last_observed_at: null, reason: "No execution observations" },
+    }],
+  };
+  const evidence: ComparisonEvidencePage = { snapshot: page.snapshot, next_cursor: null, total_rows: 1, rows: [{
+    key: "held-origin", unit_id: task.id, task_id: task.id, attempt_id: null, source: null, truncated: false,
+    recipe_attribution: { recipe_revision_id: "historical-recipe-r1", recipe_title: "Historical research title",
+      schedule_id: "historical-schedule", scheduled_for_utc: "2026-11-10T09:00:00Z", occurrence_id: "held-occurrence",
+      authorization_id: "original-grant", root_attempt_id: null, occurrence_outcome: "held", occurrence_reason: "Start window ended before execution" },
+    fact: { kind: "task_timing", state: "never_executed", elapsed_millis: null, first_start_coverage_complete: false, reason: "no_human_acceptance" },
+  }] };
+  let malformed = false;
+  globalThis.fetch = (input) => {
+    const url = new URL(String(input), "http://127.0.0.1");
+    if (url.pathname === "/api/history/comparisons") return Promise.resolve(new Response(JSON.stringify(page)));
+    if (url.pathname === "/api/history/comparisons/evidence") return Promise.resolve(new Response(JSON.stringify(malformed ? {
+      ...evidence, rows: [{ ...evidence.rows[0], recipe_attribution: { ...evidence.rows[0].recipe_attribution, authorization_id: 42 } }],
+    } : evidence)));
+    throw new Error(`Unexpected schedule comparison request: ${url}`);
+  };
+  try {
+    mount(<History tasks={[task]} projects={[project]} incarnation="held-comparison" onOpen={noop} onChanged={noop} />);
+    click("Observed usage");
+    change(findSelect("Counting unit"), "task");
+    click("Apply");
+    await settle();
+    click("Inspect all evidence");
+    await settle();
+    const detail = document.querySelector(".comparison-fact");
+    check(detail?.textContent?.includes("Historical research title") && detail.textContent.includes("historical-schedule") &&
+      detail.textContent.includes("original-grant") && detail.textContent.includes("held-occurrence"), "historical schedule attribution was omitted");
+    check(detail?.textContent?.includes("Start window ended before execution") && detail.textContent.includes("never executed"), "nonexecution reason was lost");
+    check(!detail?.textContent?.includes("tokens") && !detail?.textContent?.includes("0 ms") &&
+      !detail?.textContent?.includes("Execution identity") && document.body.textContent?.includes("0 human accepted"), "held origin invented runtime, usage or success");
+    click("Close evidence");
+    malformed = true;
+    click("Inspect all evidence");
+    await settle();
+    check(document.body.textContent?.includes("Saved schedule attribution could not be read") && !document.querySelector(".comparison-fact"), "malformed attribution was displayed");
+  } finally { unmount(); globalThis.fetch = nativeFetch; }
+});
+
 Deno.test("History session usage keeps its endpoint, UTC filters, observed zero and unavailable coverage", async () => {
   const requests: URL[] = [];
   const zero: ObservedUsage = {
@@ -22941,4 +23053,476 @@ Deno.test("History session usage keeps its endpoint, UTC filters, observed zero 
     check(requests.length === 1 && requests[0].searchParams.get("role") === "implementer" && requests[0].searchParams.get("start_date") === "2026-11-01" && requests[0].searchParams.get("project_id") === "p1" && requests[0].searchParams.get("workflow") === "trip", "session filters or endpoint changed");
     check(document.body.textContent?.includes("Provider-reported observed total: 0 tokens") && document.body.textContent.includes("1 without") && document.body.textContent.includes("lifetime observations"), "session observed zero, missing coverage or lifetime scope was lost");
   } finally { unmount(); globalThis.fetch = nativeFetch; }
+});
+
+const { Knowledge, SaveKnowledgeSource } = await import("./components/Knowledge");
+const { KnowledgeSelector, TaskKnowledgePanel } = await import("./components/KnowledgeSelector");
+const { ConversationWorkspace } = await import("./components/ConversationWorkspace");
+type KnowledgeFixtureEntry = import("./types").KnowledgeEntry;
+type KnowledgeFixtureRevision = import("./types").KnowledgeRevision;
+const knowledgeEntry = (): KnowledgeFixtureEntry => ({ id: "knowledge-entry", project_id: "p1", version: 3, approved_revision_id: "revision-approved", latest_draft_id: null, archived_at: null });
+const knowledgeRevision = (id = "revision-approved"): KnowledgeFixtureRevision => ({ id, entry_id: "knowledge-entry", parent_revision_id: null, title: "Exact knowledge", statement: "Complete approved statement", category: "note", tags: [], author: "human_control", content_hash: "content-hash", created_at: "2026-11-09", sources: [{ selector: { kind: "historical", source: { task_id: "AJ-1", attempt_id: "old-attempt", kind: "report", id: "old-report" } }, content_hash: "original-source-hash", identity_hash: "identity-hash", repository_scope: null }] });
+const knowledgeObservation = (id = "revision-approved"): import("./types").KnowledgeObservation => ({ revision_id: id, check_started_at: "2026-11-09", checked_at: "2026-11-09", state: "verified", fingerprint: "observation-current", sources: [] });
+const knowledgeSelectionFixture = (): import("./types").KnowledgeSelection => ({ entry_id: "knowledge-entry", revision_id: "revision-approved", expected_entry_version: 3, observation_fingerprint: "observation-current", acknowledged_warning: false });
+function knowledgePreviewFixture(request: import("./types").KnowledgePreviewRequest, omitSecond = false): import("./types").KnowledgePreview {
+  return { block: request.selection.length ? "EXACT FROZEN KNOWLEDGE BLOCK" : "", block_hash: "block-hash", block_serialized_bytes: 30, block_limit: 8192, selected_count: request.selection.length, included_count: request.selection.length - (omitSecond ? 1 : 0), omitted_count: omitSecond ? 1 : 0, effective_digest: "digest", fingerprint: "preview-fingerprint", requires_consumer_validation: request.consumer.kind === "task", items: request.selection.map((selection, index) => ({ selection, content_hash: "hash", source_identity_hash: "source-hash", freshness: "verified", checked_at: "2026-11-09", warning: null, disposition: omitSecond && index === 1 ? "omitted_byte_limit" : "included", text_hash: "text-hash" })) };
+}
+function knowledgeJson(value: unknown, status = 200): Response {
+  return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
+}
+function toggleKnowledge(label: string): void {
+  const owner = [...document.querySelectorAll("label")].find((item) => item.textContent?.includes(label));
+  const input = owner?.querySelector<HTMLInputElement>('input[type="checkbox"]');
+  if (!input) throw new Error(`Knowledge checkbox missing: ${label}`);
+  act(() => input.click());
+}
+async function settleKnowledge(): Promise<void> { for (let index = 0; index < 5; index++) await settle(); }
+
+Deno.test("knowledge source draft preserves exact selector, explicit replacement and archive history", async () => {
+  localStorage.clear();
+  let entry = { ...knowledgeEntry(), version: 1, approved_revision_id: null as string | null, latest_draft_id: "revision-draft" as string | null };
+  const revisions = new Map<string, KnowledgeFixtureRevision>();
+  const mutations: import("./types").KnowledgeCommand[] = [];
+  const reads: import("./types").KnowledgeRead[] = [];
+  let deferRefresh = false;
+  let finishSearch: (() => void) | undefined;
+  let finishEntry: (() => void) | undefined;
+  const source: import("./types").KnowledgeSourceSelector = { kind: "historical", source: { task_id: "AJ-1", attempt_id: "old-attempt", kind: "report", id: "old-report" } };
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body));
+    if (String(url) === "/api/knowledge/command") {
+      const request = body as import("./types").KnowledgeCommand; mutations.push(request);
+      if (request.kind !== "mutate") throw new Error("unexpected revalidation");
+      const mutation = request.request.mutation;
+      if (mutation.kind === "draft") {
+        const id = mutation.entry_id ? "revision-replacement" : "revision-draft";
+        revisions.set(id, { ...knowledgeRevision(id), ...mutation.body, sources: mutation.body.sources.map((selector) => ({ selector, content_hash: "source-hash", identity_hash: "source-id", repository_scope: null })) });
+        entry = { ...entry, latest_draft_id: id, version: mutation.expected_version === null ? 1 : mutation.expected_version + 1 };
+      } else if (mutation.kind === "approve") entry = { ...entry, version: entry.version + 1, approved_revision_id: mutation.revision_id, latest_draft_id: null };
+      else entry = { ...entry, version: entry.version + 1, archived_at: "2026-11-09" };
+      return knowledgeJson(entry);
+    }
+    const read = body.read as import("./types").KnowledgeRead; reads.push(read);
+    if (read.kind === "search") {
+      const revisionId = read.search.include_drafts ? entry.latest_draft_id || entry.approved_revision_id : entry.approved_revision_id;
+      const revision = revisionId ? revisions.get(revisionId) : undefined;
+      const result = revision && (!entry.archived_at || read.search.include_archived) && revision.title.toLowerCase().includes(read.search.query.toLowerCase())
+        ? [{ entry, revision_id: revision.id, title: revision.title }] : [];
+      if (deferRefresh) return await new Promise<Response>((resolve) => { finishSearch = () => resolve(knowledgeJson(result)); });
+      return knowledgeJson(result);
+    }
+    if (read.kind === "entry") {
+      if (deferRefresh) return await new Promise<Response>((resolve) => { finishEntry = () => resolve(knowledgeJson(entry)); });
+      return knowledgeJson(entry);
+    }
+    if (read.kind === "revision") return knowledgeJson(revisions.get(read.revision_id));
+    if (read.kind === "freshness") return knowledgeJson(knowledgeObservation(read.revision_id));
+    if (read.kind === "history") return knowledgeJson([{ kind: "draft", entry_version: 1, revision_id: "revision-draft", replaced_revision_id: null, actor: "human_control", created_at: "2026-11-09" }]);
+    if (read.kind === "source") return knowledgeJson({ source: knowledgeRevision().sources[0], text: "Exact old report body", checked_at: "2026-11-09" });
+    throw new Error("unexpected knowledge route");
+  }) as typeof fetch;
+  try {
+    mount(<SaveKnowledgeSource projectId="p1" source={source} title="Source finding" />);
+    click("Save as knowledge"); field("Knowledge statement", "User-authored statement from the source"); click("Save knowledge draft"); await settleKnowledge();
+    check(mutations.length === 1 && mutations[0].kind === "mutate" && mutations[0].request.mutation.kind === "draft", "source save granted approval");
+    const draft = mutations[0];
+    check(draft.kind === "mutate" && draft.request.mutation.kind === "draft" && JSON.stringify(draft.request.mutation.body.sources) === JSON.stringify([source]), "source selector changed or used a snippet");
+    check(!("actor" in draft), "browser supplied actor authority");
+    mount(<Knowledge projectId="p1" />); await settleKnowledge();
+    toggleKnowledge("Include drafts"); await settleKnowledge(); click("Source finding"); await settleKnowledge();
+    check(document.body.textContent?.includes("Draft — no approval"), "draft shown as approved");
+    toggleKnowledge("Approve revision revision-draft"); click("Approve named revision"); await settleKnowledge();
+    click("Open exact source 1"); await settleKnowledge();
+    check(document.body.textContent?.includes("Exact old report body"), "exact historical source was not opened");
+    const sourceRead = reads.find((read) => read.kind === "source");
+    check(sourceRead?.kind === "source" && sourceRead.entry_id === entry.id && sourceRead.revision_id === "revision-draft" && sourceRead.index === 0, "source read substituted current identity");
+    click("Edit as draft"); field("Knowledge statement", "Replacement statement"); click("Save knowledge draft"); await settleKnowledge();
+    check(entry.approved_revision_id === "revision-draft", "editing removed the old approval");
+    toggleKnowledge("Approve revision revision-replacement and replace approved revision revision-draft"); click("Approve named revision"); await settleKnowledge();
+    const approval = mutations.filter((item) => item.kind === "mutate" && item.request.mutation.kind === "approve").at(-1);
+    check(approval?.kind === "mutate" && approval.request.mutation.kind === "approve" && approval.request.mutation.revision_id === "revision-replacement" && approval.request.mutation.replaces_revision_id === "revision-draft", "replacement omitted named old approval");
+    toggleKnowledge("Include drafts"); await settleKnowledge();
+    click("Source finding"); await settleKnowledge();
+    const resultList = () => document.querySelector(".knowledge-view > ul");
+    check(resultList()?.textContent?.includes("revision-replacement"), "default approved search did not open the replacement");
+    deferRefresh = true;
+    toggleKnowledge("Archive this entry"); click("Archive knowledge entry"); await settleKnowledge();
+    check(!!entry.archived_at && revisions.has("revision-draft") && revisions.has("revision-replacement"), "archive lost historical revisions");
+    check(finishSearch && finishEntry && findButton("Source finding").disabled, "archive did not retain the old hit behind the pending refresh");
+    const readsBeforeNavigation = reads.length;
+    click("Source finding");
+    await act(async () => finishEntry?.()); await settleKnowledge();
+    check(document.querySelector('[aria-label="Knowledge revision"]')?.textContent?.includes("Entry archived") && findButton("Refresh Knowledge").disabled && findButton("Search knowledge").disabled, "detail completion ended busy before the archive search settled");
+    click("Source finding");
+    check(findButton("Open exact source 1").disabled, "exact source navigation remained enabled during refresh");
+    click("Open exact source 1");
+    toggleKnowledge("Show revision and lifecycle history");
+    check(findButton("Open exact revision revision-draft").disabled, "history navigation remained enabled during refresh");
+    click("Open exact revision revision-draft");
+    toggleKnowledge("Include drafts"); toggleKnowledge("Include archived");
+    await settleKnowledge();
+    check(reads.length === readsBeforeNavigation && resultList()?.textContent?.includes("Source finding"), "navigation superseded the pending archive refresh");
+    await act(async () => finishSearch?.()); await settleKnowledge();
+    check(!findButton("Refresh Knowledge").disabled && !findButton("Search knowledge").disabled && !findButton("Open exact source 1").disabled && !findButton("Open exact revision revision-draft").disabled, "archive refresh did not release busy after both reads settled");
+    deferRefresh = false;
+    check(!resultList()?.textContent?.includes("Source finding") && document.querySelector('[aria-label="Knowledge revision"]')?.textContent?.includes("Entry archived"), "archive did not refresh default hits and exact archived detail together");
+    click("Open exact revision revision-draft"); await settleKnowledge();
+    check(document.querySelector('[aria-label="Knowledge revision"]')?.textContent?.includes("Exact revision revision-draft"), "archive removed exact historical revision access");
+    toggleKnowledge("Include archived"); await settleKnowledge();
+    check(resultList()?.textContent?.includes("Archived"), "archived search hit retained its old lifecycle label");
+    click("Source finding"); await settleKnowledge(); click("Open exact revision revision-draft"); await settleKnowledge();
+    field("Search project knowledge", "Source finding");
+    const externalRevision = { ...knowledgeRevision("revision-external"), title: "Updated Source finding" };
+    revisions.set(externalRevision.id, externalRevision);
+    entry = { ...entry, approved_revision_id: externalRevision.id, version: entry.version + 1 };
+    deferRefresh = true;
+    click("Refresh Knowledge"); await settleKnowledge();
+    check(finishSearch && finishEntry, "Refresh Knowledge did not request both hits and detail");
+    const refreshSearch = reads.filter((read) => read.kind === "search").at(-1);
+    check(refreshSearch?.kind === "search" && refreshSearch.search.query === "Source finding" && refreshSearch.search.include_archived && !refreshSearch.search.include_drafts && refreshSearch.search.after_entry_id === null, "refresh changed search query, filters or first-page semantics");
+    await act(async () => finishSearch?.());
+    await settleKnowledge();
+    check(resultList()?.textContent?.includes("Updated Source finding") && resultList()?.textContent?.includes(externalRevision.id) && resultList()?.textContent?.includes("Archived") && findButton("Refresh Knowledge").disabled, "list response was discarded or ended refresh before exact detail returned");
+    await act(async () => finishEntry?.()); await settleKnowledge();
+    const refreshedDetail = document.querySelector('[aria-label="Knowledge revision"]')?.textContent;
+    check(refreshedDetail?.includes("Exact revision revision-draft") && refreshedDetail.includes(`version ${entry.version}`) && refreshedDetail.includes("Entry archived") && !findButton("Refresh Knowledge").disabled, "late detail response was discarded or replaced the selected historical revision");
+    deferRefresh = false;
+    const nonmatchingRevision = { ...knowledgeRevision("revision-nonmatching"), title: "Unrelated note" };
+    revisions.set(nonmatchingRevision.id, nonmatchingRevision);
+    entry = { ...entry, approved_revision_id: nonmatchingRevision.id, version: entry.version + 1 };
+    click("Refresh Knowledge"); await settleKnowledge();
+    check(!resultList()?.textContent?.trim() && document.querySelector('[aria-label="Knowledge revision"]')?.textContent?.includes("Exact revision revision-draft"), "refresh kept a nonmatching changed revision or dropped exact historical detail");
+  } finally { unmount(); globalThis.fetch = nativeFetch; localStorage.clear(); }
+});
+
+Deno.test("knowledge uncertain mutation retains exact body and ID across close and explicit outcome check", async () => {
+  localStorage.clear(); const bodies: string[] = [];
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    if (String(url) === "/api/knowledge/command") { bodies.push(String(init?.body)); if (bodies.length === 1) throw new TypeError("response lost after commit"); return knowledgeJson({ ...knowledgeEntry(), latest_draft_id: "revision-draft" }); }
+    return knowledgeJson([]);
+  }) as typeof fetch;
+  try {
+    mount(<SaveKnowledgeSource projectId="p1" source={{ kind: "user_assertion" }} title="Uncertain note" />); click("Save as knowledge"); field("Knowledge statement", "Retained text"); click("Save knowledge draft"); await settleKnowledge();
+    check(bodies.length === 1 && document.body.textContent?.includes("original operation identity is retained"), "uncertain draft was automatically retried");
+    unmount(); mount(<SaveKnowledgeSource projectId="p1" source={{ kind: "user_assertion" }} />); click("Save as knowledge"); await settleKnowledge();
+    check(bodies.length === 1, "remount resent the mutation"); toggleKnowledge("I refreshed and checked"); click("Check / retry exact saved operation"); await settleKnowledge();
+    check(bodies.length === 2 && bodies[0] === bodies[1], "retry changed the operation ID or body");
+  } finally { unmount(); globalThis.fetch = nativeFetch; localStorage.clear(); }
+});
+
+Deno.test("knowledge task selection confirms whole-entry omission and refuses stale task preview", async () => {
+  localStorage.clear(); const commands: Record<string, unknown>[] = [];
+  const second = { ...knowledgeSelectionFixture(), entry_id: "entry-two", revision_id: "revision-two" };
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body));
+    if (String(url) === "/api/knowledge/preview") return knowledgeJson(knowledgePreviewFixture(body, true));
+    if (String(url) === "/api/command") { commands.push(body); return knowledgeJson({ result: { version: 8, entity_id: task.id, state: "knowledge_saved" } }); }
+    throw new Error("Unexpected task knowledge request");
+  }) as typeof fetch;
+  let current: Task = { ...task, active_attempt: undefined, lifecycle: "backlog", knowledge: { selection: null, preparation: null, admission_hold: null, manifests: [], preview_user_text: "HOST-CANONICAL-TASK-INPUT" } };
+  const view = () => <TaskKnowledgePanel task={current} initialSelection={[knowledgeSelectionFixture(), second]} onChanged={noop} />;
+  try {
+    mount(view()); click("Preview knowledge attachment"); await settleKnowledge();
+    check(document.body.textContent?.includes("revision-two: Omitted in full: byte limit"), "whole entry omission missing");
+    toggleKnowledge("I confirm these exact included revisions");
+    current = { ...current, version: 8 }; rerender(view()); await settleKnowledge();
+    click("Save confirmed task knowledge"); await settleKnowledge(); check(commands.length === 0, "stale preview dispatched");
+    click("Preview knowledge attachment"); await settleKnowledge(); toggleKnowledge("I confirm these exact included revisions"); click("Save confirmed task knowledge"); await settleKnowledge();
+    check(commands.length === 1, "confirmed selection did not dispatch once");
+    const request = commands[0].request as import("./types").KnowledgePreviewRequest;
+    check(request.expected_consumer_version === 8 && request.user_text === "HOST-CANONICAL-TASK-INPUT" && request.selection.length === 2 && !("block" in commands[0]), "task command used rendered authority or stale input");
+  } finally { unmount(); globalThis.fetch = nativeFetch; localStorage.clear(); }
+});
+
+Deno.test("knowledge-held rework has reachable save-only and exact explicit continuation", async () => {
+  localStorage.clear(); const commands: Record<string, unknown>[] = [];
+  let held: Task = { ...task, knowledge: { selection: null, admission_hold: null, preview_user_text: "canonical-task", manifests: [], preparation: { version: 4, parent_attempt_id: "a1", continuation_kind: "single_agent_repair", parent_result_binding_id: "settled-result", parent_review_binding_id: "settled-review", expected_task_version: 7, confirmation: null, hold_reason: "Prepare next-run knowledge: archived inherited revision" } } };
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body));
+    if (String(url) === "/api/knowledge/preview") return knowledgeJson(knowledgePreviewFixture(body));
+    commands.push(body); return knowledgeJson({ result: { version: 7, entity_id: task.id, state: "knowledge_prepared", detail: { child_attempt_id: null } } });
+  }) as typeof fetch;
+  try {
+    mount(<TaskKnowledgePanel task={held} onChanged={noop} />);
+    check(document.body.textContent?.includes("archived inherited revision"), "existing hold reason was hidden");
+    click("Preview knowledge attachment"); await settleKnowledge(); toggleKnowledge("I confirm these exact included revisions"); click("Save next-run knowledge only"); await settleKnowledge();
+    const save = commands[0].request as import("./types").PrepareNextRunKnowledge;
+    check(save.action === "save_only" && save.parent_attempt_id === "a1" && save.parent_result_binding_id === "settled-result" && save.parent_review_binding_id === "settled-review" && save.expected_preparation_version === 4, "save-only lost settled parent bindings");
+    click("Preview knowledge attachment"); await settleKnowledge(); toggleKnowledge("I confirm these exact included revisions"); click("Save and continue rework"); await settleKnowledge();
+    const continuation = commands[1].request as import("./types").PrepareNextRunKnowledge;
+    check(continuation.action === "save_and_continue_rework" && continuation.continuation_kind === "single_agent_repair" && continuation.expected_task_version === 7 && !commands.some((item) => item.kind === "update_task"), "continuation used an unreachable backlog-only command");
+    held = { ...held, version: 8, lifecycle: "in_progress", workflow: undefined,
+      active_attempt: { ...task.active_attempt!, id: "child-b", phase: "implementing" },
+      knowledge: { ...held.knowledge!, preparation: null } };
+    rerender(<TaskKnowledgePanel task={held} onChanged={noop} />); await settleKnowledge();
+    check(!Array.from(document.querySelectorAll("button")).some((button) => button.textContent?.includes("Save and continue rework")), "consumed parent A controls remained actionable while B ran");
+    held = { ...held, lifecycle: "awaiting_review", active_attempt: { ...held.active_attempt!, accepted_snapshot_id: "b-result" } };
+    rerender(<TaskKnowledgePanel task={held} onChanged={noop} />); await settleKnowledge();
+    click("Preview knowledge attachment"); await settleKnowledge(); toggleKnowledge("I confirm these exact included revisions"); click("Save next-run knowledge only"); await settleKnowledge();
+    const next = commands[2].request as import("./types").PrepareNextRunKnowledge;
+    check(next.parent_attempt_id === "child-b" && next.parent_result_binding_id === "b-result" && next.expected_preparation_version === null, "B review preparation reused consumed A identity");
+  } finally { unmount(); globalThis.fetch = nativeFetch; localStorage.clear(); }
+});
+
+Deno.test("knowledge exact source unavailable retains original revision identity without current-source fallback", async () => {
+  localStorage.clear(); const sourceReads: import("./types").KnowledgeRead[] = [];
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    check(String(url) === "/api/knowledge/read", "missing source triggered a fallback service");
+    const { read } = JSON.parse(String(init?.body)) as { read: import("./types").KnowledgeRead };
+    if (read.kind === "search") return knowledgeJson([{ entry: knowledgeEntry(), revision_id: "revision-approved", title: "Exact knowledge" }]);
+    if (read.kind === "entry") return knowledgeJson(knowledgeEntry());
+    if (read.kind === "revision") return knowledgeJson(knowledgeRevision());
+    if (read.kind === "freshness") return knowledgeJson(knowledgeObservation());
+    if (read.kind === "history") return knowledgeJson([]);
+    sourceReads.push(read); return knowledgeJson({ error: "exact original report was removed" }, 409);
+  }) as typeof fetch;
+  try {
+    mount(<Knowledge projectId="p1" />); await settleKnowledge(); click("Exact knowledge"); await settleKnowledge(); click("Open exact source 1"); await settleKnowledge();
+    check(sourceReads.length === 1 && sourceReads[0].kind === "source" && sourceReads[0].revision_id === "revision-approved", "exact source identity changed");
+    check(document.body.textContent?.includes("no current source was substituted") && document.body.textContent.includes("Complete approved statement"), "missing source hid approved text or claimed current replacement");
+  } finally { unmount(); globalThis.fetch = nativeFetch; localStorage.clear(); }
+});
+
+Deno.test("conversation knowledge start submit and steer bind original operation and keep uncertain identity", async () => {
+  const previousProtocolResponder = protocolFixtureResponder;
+  const previousFetch = globalThis.fetch;
+  protocolFixtureResponder = () => Promise.resolve(protocolFixture([...allFeatures, "conversation_v1"], "knowledge-conversation-fixture"));
+  try {
+  globalThis.fetch = (async () => knowledgeJson(snapshotAt("knowledge-conversation-fixture", "1"))) as typeof fetch;
+  await getState();
+  const profile: import("./types").ConversationProfile = { id: "profile", project_id: "p1", execution_config_revision_id: "config", model: "gpt-6.1-sol", effort: "medium", instructions: "", instructions_hash: "instructions", profile_hash: "profile-hash" };
+  const admission: import("./types").ConversationAdmission = { id: "admission", profile_revision_id: profile.id, recorded_state: "active", evidence_hash: "evidence", probe_invocation_id: "probe", live_eligibility_checked: false };
+  for (const action of ["start", "submit", "steer"] as const) {
+    localStorage.clear();
+    let version = 9; const previews: import("./types").KnowledgePreviewRequest[] = [];
+    const sent: import("./types").ConversationMutation[] = [];
+    const conversation: import("./types").ConversationSummary = { id: "conversation", project_id: "p1", admission_id: admission.id, state: action === "steer" ? "running" : "idle", generation: "generation", session_id: "session", reservation_state: "running", active_turn_id: action === "steer" ? "turn-exact" : null, binding_valid: true, is_probe: false, created_at: "2026-11-09", updated_at: "2026-11-09" };
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      if (String(url) === "/api/knowledge/read") {
+        const read = body.read as import("./types").KnowledgeRead;
+        if (read.kind === "search") return knowledgeJson([{ entry: knowledgeEntry(), title: "Exact knowledge", revision_id: "revision-approved" }]);
+        if (read.kind === "revision") return knowledgeJson(knowledgeRevision());
+        if (read.kind === "freshness") return knowledgeJson(knowledgeObservation());
+        if (read.kind === "conversation_consumer") return knowledgeJson({ conversation_id: conversation.id, expected_consumer_version: version, state: conversation.state, generation: conversation.generation, active_turn_id: conversation.active_turn_id, binding_valid: true });
+        if (read.kind === "manifest") return knowledgeJson({ id: read.manifest_id, project_id: "p1",
+          binding: { kind: "conversation_operation", operation_id: read.manifest_id === "confirmed-manifest" ? "old-operation" : "unresolved-operation", assembled_input_hash: "assembled", complete_operation_hash: "complete" },
+          preview: { block: "Frozen exact knowledge evidence", items: [] }, sources: [], created_at: "2026-11-09" });
+      }
+      if (String(url) === "/api/knowledge/preview") { previews.push(body); return knowledgeJson(knowledgePreviewFixture(body)); }
+      const operation = body.operation as import("./types").ConversationRead | import("./types").ConversationMutation;
+      if (operation.action === "workspace_identity") return knowledgeJson({ result: { project_id: "p1", storage_scope: "c".repeat(64) } });
+      if (operation.action === "list") return knowledgeJson({ result: { items: action === "start" ? [] : [conversation], next_cursor: null } });
+      if (operation.action === "profiles") return knowledgeJson({ result: { items: [profile], next_cursor: null } });
+      if (operation.action === "admissions") return knowledgeJson({ result: { items: [admission], next_cursor: null } });
+      if (operation.action === "messages") return knowledgeJson({ result: { messages: [{ id: "confirmed-message", source: { kind: "user", conversation_id: conversation.id, operation_id: "old-operation" }, first_sequence: 1, last_sequence: 1, text: "Original visible user message", content_hash: "message-hash", selectable: true, coverage: "confirmed" }], through_sequence: 1, history_coverage: "partial" } });
+      if (operation.action === "detail") {
+        const pending = sent.find((item) => item.action === "with_knowledge");
+        return knowledgeJson({ result: { conversation, profile, admission, unresolved_operation: !!pending, unresolved_operation_id: pending?.operation_id ?? null, requests: [], events: [
+        { sequence: 1, kind: "user_message", operation_id: "old-operation", turn_id: "old-turn", observed_at: "2026-11-09", payload: { input: "Original visible user message", knowledge_manifest_id: "confirmed-manifest" } },
+        ...(pending ? [{ sequence: 2, kind: "user_message", operation_id: pending.operation_id, turn_id: null, observed_at: "2026-11-09", payload: { input: "Original send input", knowledge_manifest_id: "unresolved-manifest" } }] : []),
+      ], next_after: 2, has_more: false, history_coverage: "partial" } });
+      }
+      if (operation.action === "receipt") return knowledgeJson({ result: { operation_id: operation.operation_id, request_hash: operation.request_hash, found: false, kind: null, delivery_state: null, conversation_id: null, generation: null, profile_revision_id: null, admission_id: null, state: null, quiescence: null } });
+      sent.push(operation as import("./types").ConversationMutation);
+      throw new TypeError("response lost after reservation");
+    }) as typeof fetch;
+    const view = () => <ConversationWorkspace projectId="p1" revision="revision" sourceConversationId={action === "start" ? undefined : conversation.id} onOpenSetup={noop} onOpenProviders={noop} onPromote={noop} />;
+    try {
+      mount(view()); await settleKnowledge();
+      if (action === "start") change(findSelect("Admitted conversation profile"), "admission");
+      change(document.querySelector<HTMLTextAreaElement>("#conversation-input")!, "Original send input");
+      click("Find approved knowledge"); await settleKnowledge(); click("Exact knowledge"); await settleKnowledge();
+      click(action === "steer" ? "Prepare steer with knowledge" : action === "start" ? "Prepare start with knowledge" : "Prepare follow-up with knowledge"); await settleKnowledge();
+      click("Preview knowledge attachment"); await settleKnowledge(); toggleKnowledge("I confirm these exact included revisions");
+      if (action !== "start") {
+        version++;
+        click(action === "steer" ? "Steer active turn" : "Send follow-up"); await settleKnowledge();
+        check(sent.length === 0 && document.body.textContent?.includes("Prepare, preview and confirm again"), "stale consumer dispatched");
+        click(action === "steer" ? "Prepare steer with knowledge" : "Prepare follow-up with knowledge"); await settleKnowledge(); click("Preview knowledge attachment"); await settleKnowledge(); toggleKnowledge("I confirm these exact included revisions");
+      }
+      click(action === "start" ? "Ask / start conversation" : action === "submit" ? "Send follow-up" : "Steer active turn"); await settleKnowledge();
+      check(sent.length === 1 && sent[0].action === "with_knowledge", "selected operation bypassed wrapper");
+      const wrapper = sent[0] as Extract<import("./types").ConversationMutation, { action: "with_knowledge" }>;
+      const preview = previews.at(-1)!;
+      check(preview.consumer.kind === "conversation" && JSON.stringify(preview.consumer.operation) === JSON.stringify(wrapper.operation) && wrapper.operation_id === wrapper.operation.operation_id && wrapper.operation.input === "Original send input", "preview and confirmation operation differ");
+      check(wrapper.expected_consumer_version === (action === "start" ? 0 : version) && wrapper.preview_fingerprint === "preview-fingerprint" && wrapper.selection[0].revision_id === "revision-approved" && !("block" in wrapper), "conversation used rendered attachment authority");
+      const journalKey = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index)).find((key) => key?.startsWith("llmrelay.conversation.request."));
+      check(!!journalKey, "unknown operation was not retained");
+      const retained = localStorage.getItem(journalKey!);
+      check(!!retained?.includes(wrapper.operation_id), "retained operation identity changed");
+      unmount(); mount(view()); await settleKnowledge();
+      check(sent.length === 1 && localStorage.getItem(journalKey!)?.includes(wrapper.operation_id), "reload resubmitted or regenerated an unknown operation");
+      if (action !== "start") {
+        check(document.body.textContent?.includes("Original visible user message"), "user text replaced by assembled knowledge");
+        check(document.body.textContent?.includes("Operation delivery confirmed; provider reading and understanding unverified"), "confirmed operation projection lost its delivery label");
+        check(document.body.textContent?.includes("Reserved input recorded; delivery unverified"), "sending event was mislabeled as confirmed delivery");
+        check(document.body.textContent?.includes("Frozen exact knowledge evidence"), "unverified delivery hid frozen manifest evidence");
+        check(!document.body.textContent?.includes("Confirmed user-message event recorded"), "raw send intent claimed confirmation");
+        const originalJournal = JSON.parse(retained!);
+        const currentJournal = JSON.parse(localStorage.getItem(journalKey!)!);
+        check(sent.length === 1 && currentJournal.body === originalJournal.body && currentJournal.hash === originalJournal.hash, "delivery inspection changed uncertain identity or resent input");
+      }
+    } finally { unmount(); globalThis.fetch = nativeFetch; localStorage.clear(); }
+  }
+  } finally {
+    protocolFixtureResponder = previousProtocolResponder;
+    // A state observation fences the cached opt-in descriptor through the real API.
+    globalThis.fetch = (async () => knowledgeJson(snapshotAt("test-instance", "1"))) as typeof fetch;
+    try { await getState(); } finally { globalThis.fetch = previousFetch; }
+  }
+});
+
+Deno.test("task creation with knowledge creates reachable draft before canonical preview and confirmation", async () => {
+  localStorage.clear(); const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const created: Task = { ...task, id: "created-knowledge-draft", active_attempt: undefined, lifecycle: "backlog", version: 1, knowledge: { selection: null, preparation: null, admission_hold: null, manifests: [], preview_user_text: "HOST-CANONICAL-CREATED-TASK" } };
+  let savedId: string | undefined;
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    const path = String(url); const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {};
+    calls.push({ path, body });
+    if (path === "/api/state") return knowledgeJson({ ...liveBase, tasks: [created], projects: [project] });
+    if (path === "/api/knowledge/read") {
+      const read = body.read as import("./types").KnowledgeRead;
+      if (read.kind === "search") return knowledgeJson([{ entry: knowledgeEntry(), title: "Exact knowledge", revision_id: "revision-approved" }]);
+      if (read.kind === "revision") return knowledgeJson(knowledgeRevision());
+      if (read.kind === "freshness") return knowledgeJson(knowledgeObservation());
+    }
+    if (path === "/api/knowledge/preview") return knowledgeJson(knowledgePreviewFixture(body as unknown as import("./types").KnowledgePreviewRequest));
+    if (path === "/api/command" && body.kind === "create_task") return knowledgeJson({ result: { entity_kind: "task", entity_id: created.id, version: 1, state: "created" } });
+    if (path === "/api/command" && body.kind === "set_task_knowledge") return knowledgeJson({ result: { entity_kind: "task", entity_id: created.id, version: 2, state: "knowledge_saved" } });
+    throw new Error(`Unexpected knowledge create route ${path}`);
+  }) as typeof fetch;
+  try {
+    mount(<TaskForm projects={[project]} selectedProjectId="p1" onClose={noop} onSaved={(id) => { savedId = id; }} />);
+    field("Title", "Task with knowledge"); click("Find approved knowledge"); await settleKnowledge(); click("Exact knowledge"); await settleKnowledge(); click("Save draft"); await settleKnowledge();
+    const create = calls.find((call) => call.body.kind === "create_task");
+    check(create?.body.ready === false && !calls.some((call) => call.body.kind === "make_ready"), "selection dispatched work before confirmation");
+    check(document.body.textContent?.includes(created.id), "failed attachment would leave an unreachable draft");
+    click("Preview knowledge attachment"); await settleKnowledge(); toggleKnowledge("I confirm these exact included revisions"); click("Save confirmed task knowledge"); await settleKnowledge();
+    const saved = calls.find((call) => call.body.kind === "set_task_knowledge");
+    const request = saved?.body.request as import("./types").KnowledgePreviewRequest | undefined;
+    check(request?.user_text === "HOST-CANONICAL-CREATED-TASK" && request.expected_consumer_version === 1 && savedId === created.id, "task creation failed canonical preview-before-confirmation sequence");
+    check(!calls.some((call) => call.body.kind === "make_ready"), "knowledge save implicitly made work ready");
+  } finally { unmount(); globalThis.fetch = nativeFetch; localStorage.clear(); }
+});
+
+Deno.test("knowledge restored observation requires explicit revalidation before preview despite prior acknowledgement", async () => {
+  localStorage.clear(); let previews = 0;
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body));
+    if (String(url) === "/api/knowledge/preview") { previews++; return knowledgeJson(knowledgePreviewFixture(body)); }
+    const read = body.read as import("./types").KnowledgeRead;
+    if (read.kind === "search") return knowledgeJson([{ entry: knowledgeEntry(), title: "Exact knowledge", revision_id: "revision-approved" }]);
+    if (read.kind === "revision") return knowledgeJson(knowledgeRevision());
+    if (read.kind === "freshness") return knowledgeJson({ ...knowledgeObservation(), state: "needs_revalidation", restore_operation_id: "restore-exact", sources: [{ state: "needs_revalidation", reason: "restored environment", identity_hash: "source", original_content_hash: "original", observed_content_hash: null }] });
+    throw new Error("Unexpected restored selection request");
+  }) as typeof fetch;
+  try {
+    mount(<KnowledgeSelector projectId="p1" consumer={{ project_id: "p1", consumer: { kind: "task", task_id: task.id, parent_attempt_id: null, continuation: null, parent_binding_id: null }, expected_consumer_version: 7, user_text: "canonical-task" }} onConfirm={noop} />);
+    click("Find approved knowledge"); await settleKnowledge(); click("Exact knowledge"); await settleKnowledge();
+    check(document.body.textContent?.includes("requires a new explicit Revalidate"), "restore remedy missing");
+    click("Preview knowledge attachment"); await settleKnowledge(); check(previews === 0, "restore marker accepted a warning acknowledgement");
+  } finally { unmount(); globalThis.fetch = nativeFetch; localStorage.clear(); }
+});
+
+Deno.test("report source action keeps the historical attempt and never prefills a report preview as complete evidence", async () => {
+  localStorage.clear(); const { ReportList } = await import("./components/TaskReports");
+  const saved: import("./types").KnowledgeCommand[] = [];
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => { saved.push(JSON.parse(String(init?.body))); return knowledgeJson({ ...knowledgeEntry(), latest_draft_id: "draft-from-report" }); }) as typeof fetch;
+  try {
+    mount(<ReportList projectId="p1" taskId="AJ-1" attemptId="historical-attempt" started error="" content={{ task_id: "AJ-1", attempt_id: "historical-attempt", content_revision: "old-content", truncated: true, records: [{ kind: "report", id: "historical-report", role: "implementer", created_at: "2026-11-09", outcome: "candidate_ready", summary: "Bounded report preview" }] }} />);
+    click("Save as knowledge"); check(findField("Knowledge statement").value === "", "bounded report preview was presented as a complete statement");
+    field("Knowledge statement", "My explicit source-based statement"); click("Save knowledge draft"); await settleKnowledge();
+    const command = saved[0];
+    check(command.kind === "mutate" && command.request.mutation.kind === "draft" && command.request.mutation.body.sources[0].kind === "historical" && command.request.mutation.body.sources[0].source.attempt_id === "historical-attempt" && command.request.mutation.body.sources[0].source.id === "historical-report", "source action redirected to the current attempt");
+  } finally { unmount(); globalThis.fetch = nativeFetch; localStorage.clear(); }
+});
+
+
+Deno.test("knowledge mutation late completions cannot close a new project editor or replace its pending operation", async () => {
+  for (const outcome of ["success", "refusal", "uncertain"] as const) {
+    localStorage.clear();
+    let finish: ((response: Response) => void) | undefined;
+    let fail: ((cause: Error) => void) | undefined;
+    let originalBody = "";
+    let sends = 0;
+    const destination: import("./types").KnowledgeCommand = { kind: "mutate", request: { operation_id: "destination-operation", project_id: "p2", mutation: { kind: "draft", entry_id: null, expected_version: null, body: { title: "Destination note", statement: "Destination text", category: "note", tags: [], sources: [{ kind: "user_assertion" }] } } } };
+    const destinationBody = JSON.stringify(destination);
+    const oldKey = "llmrelay.knowledge.pending.p1";
+    const newKey = "llmrelay.knowledge.pending.p2";
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      check(String(url) === "/api/knowledge/command", "scope-switch flow issued an unexpected read or mutation");
+      sends++; originalBody = String(init?.body);
+      return await new Promise<Response>((resolve, reject) => { finish = resolve; fail = reject; });
+    }) as typeof fetch;
+    const view = (projectId: string) => <SaveKnowledgeSource projectId={projectId} source={{ kind: "user_assertion" }} title="Scoped note" />;
+    try {
+      mount(view("p1")); click("Save as knowledge"); field("Knowledge statement", "Original text"); click("Save knowledge draft"); await settleKnowledge();
+      check(!!finish && localStorage.getItem(oldKey) === originalBody, "original operation was not published before switching");
+      localStorage.setItem(newKey, destinationBody);
+      rerender(view("p2")); await settleKnowledge();
+      check(document.querySelector('[aria-label="Pending knowledge operation"]')?.textContent?.includes("destination-operation"), "destination did not load its own pending operation");
+      await act(async () => {
+        if (outcome === "uncertain") fail?.(new TypeError("old scope response lost"));
+        else finish?.(outcome === "refusal" ? knowledgeJson({ error: "old scope refused" }, 409) : knowledgeJson({ ...knowledgeEntry(), latest_draft_id: "old-draft" }));
+      });
+      await settleKnowledge();
+      check(localStorage.getItem(newKey) === destinationBody && document.querySelector('[aria-label="Pending knowledge operation"]')?.textContent?.includes("destination-operation"), `${outcome} completion discarded the destination operation or closed its editor`);
+      check(!document.body.textContent?.includes("Knowledge draft saved.") && !document.body.textContent?.includes("old scope"), `${outcome} completion wrote status or invoked callbacks in the new scope`);
+      check(sends === 1, "scope switching retried or dispatched another operation");
+      check(localStorage.getItem(oldKey) === (outcome === "uncertain" ? originalBody : null), `${outcome} completion changed old-scope retention semantics`);
+    } finally { fail?.(new TypeError("scope flow cleanup")); unmount(); globalThis.fetch = nativeFetch; localStorage.clear(); }
+  }
+});
+
+Deno.test("task knowledge late completions preserve new task state callbacks and pending storage", async () => {
+  for (const outcome of ["success", "refusal", "uncertain"] as const) {
+    localStorage.clear();
+    let finish: ((response: Response) => void) | undefined;
+    let fail: ((cause: Error) => void) | undefined;
+    let originalBody = "";
+    let sends = 0;
+    const callbacks: string[] = [];
+    const first: Task = { ...task, id: "scope-a", active_attempt: undefined, lifecycle: "backlog", knowledge: { selection: null, preparation: null, admission_hold: null, manifests: [], preview_user_text: "canonical-a" } };
+    // Keep the project fixed so this exercises task identity, independently of project switching.
+    const second: Task = { ...first, id: "scope-b" };
+    const destination: import("./types").Command = { kind: "set_task_knowledge", operation_id: "destination-task-operation", request: { project_id: "p1", user_text: "canonical-b", expected_consumer_version: second.version, consumer: { kind: "task", task_id: second.id, parent_attempt_id: null, continuation: null, parent_binding_id: null }, selection: [] }, preview_fingerprint: "destination-preview" };
+    const destinationBody = JSON.stringify(destination);
+    const oldKey = "llmrelay.task.knowledge.p1.scope-a";
+    const newKey = "llmrelay.task.knowledge.p1.scope-b";
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      if (String(url) === "/api/knowledge/preview") return knowledgeJson(knowledgePreviewFixture(body));
+      check(String(url) === "/api/command", "task scope-switch flow issued an unexpected request");
+      sends++; originalBody = String(init?.body);
+      return await new Promise<Response>((resolve, reject) => { finish = resolve; fail = reject; });
+    }) as typeof fetch;
+    const view = (current: Task) => <TaskKnowledgePanel task={current} onChanged={() => { callbacks.push(`changed:${current.id}`); }} onConfirmed={() => { callbacks.push(`confirmed:${current.id}`); }} />;
+    try {
+      mount(view(first)); click("Preview knowledge attachment"); await settleKnowledge(); toggleKnowledge("I confirm these exact included revisions"); click("Save confirmed task knowledge"); await settleKnowledge();
+      check(!!finish && localStorage.getItem(oldKey) === originalBody, "task operation was not published before switching");
+      localStorage.setItem(newKey, destinationBody);
+      rerender(view(second)); await settleKnowledge();
+      check(document.body.textContent?.includes("destination-task-operation"), "new task did not load its own pending operation");
+      await act(async () => {
+        if (outcome === "uncertain") fail?.(new TypeError("old task response lost"));
+        else finish?.(outcome === "refusal" ? knowledgeJson({ error: "old task refused" }, 409) : knowledgeJson({ result: { version: 99, entity_id: first.id, state: "knowledge_saved" } }));
+      });
+      await settleKnowledge();
+      check(callbacks.length === 0 && !document.body.textContent?.includes("Knowledge saved.") && !document.body.textContent?.includes("old task"), `${outcome} completion updated the new task or invoked callbacks`);
+      check(localStorage.getItem(newKey) === destinationBody && document.body.textContent?.includes("destination-task-operation") && findButton("Save confirmed task knowledge").disabled, `${outcome} completion discarded the new task's pending operation`);
+      check(sends === 1, "scope switching retried or dispatched another operation");
+      check(localStorage.getItem(oldKey) === (outcome === "uncertain" ? originalBody : null), `${outcome} completion changed task retention semantics`);
+    } finally { fail?.(new TypeError("task scope flow cleanup")); unmount(); globalThis.fetch = nativeFetch; localStorage.clear(); }
+  }
+});
+
+const { registerScheduleTests } = await import("./scheduleTests/schedules");
+registerScheduleTests({
+  Recipes, liveBase, initialized, noop, knowledgePreviewFixture, knowledgeJson,
+  mount, unmount, rerender, check, click, findButton, settleKnowledge, toggleKnowledge,
+  nativeFetch, command, getState, recipeScheduleExecutionPreview, protocolFixture,
+  allFeatures, ProtocolError, ApiError, snapshotAt,
+  getProtocolFixtureResponder: () => protocolFixtureResponder,
+  setProtocolFixtureResponder: (responder) => { protocolFixtureResponder = responder; },
 });

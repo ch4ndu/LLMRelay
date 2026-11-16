@@ -58,6 +58,7 @@ import { TaskDetail, type TaskTab } from "./components/TaskDetail";
 import { pendingApprovalCount } from "./components/ApprovalInbox";
 import { Workspace } from "./components/Workspace";
 import { History } from "./components/History";
+import { Knowledge } from "./components/Knowledge";
 import { Recipes } from "./components/Recipes";
 import { ConversationWorkspace } from "./components/ConversationWorkspace";
 import { DiagnosticsPanel } from "./components/DiagnosticsPanel";
@@ -70,6 +71,7 @@ type Page =
   | "recipes"
   | "roles"
   | "providers"
+  | "knowledge"
   | "history"
   | "diagnostics";
 const pages: Array<{ id: Page; label: string; icon: string }> = [
@@ -79,6 +81,7 @@ const pages: Array<{ id: Page; label: string; icon: string }> = [
   { id: "recipes", label: "Recipes", icon: "▤" },
   { id: "roles", label: "Projects", icon: "▣" },
   { id: "providers", label: "Providers", icon: "◇" },
+  { id: "knowledge", label: "Knowledge", icon: "▧" },
   { id: "history", label: "History", icon: "◴" },
   { id: "diagnostics", label: "Diagnostics", icon: "⚙" },
 ];
@@ -1303,6 +1306,7 @@ export function App() {
             />
           </section>
         )}
+        {page === "knowledge" && (project ? <Knowledge key={`${state.incarnation}:${project}`} projectId={project} /> : <section className="panel"><h1>Knowledge</h1><p>Choose a project to search and manage its knowledge.</p></section>)}
         {page === "history" && (
           <History
             tasks={state.tasks}

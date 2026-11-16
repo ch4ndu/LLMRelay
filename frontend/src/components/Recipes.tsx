@@ -1,12 +1,13 @@
 import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useRef, useState } from "react";
-import { ApiError, command, operationId } from "../api";
+import { ApiError, command, operationId, scheduleExecutionCommandIsCurrent } from "../api";
 import { SingleAgentSelectionFields, emptySingleAgentSelection, type SingleAgentSelection } from "./RoleSettings";
 import {
   type AppState,
   type ProfileSet,
   type Project,
   type RecipeSchedule,
+  type ScheduleExecutionCommand,
   type Role,
   type RoleConfig,
   roleLabel,
@@ -82,13 +83,23 @@ const commandFields: Record<string, string[]> = {
   pause_recipe_schedule: ["schedule_id", "expected_version"],
   resume_recipe_schedule: ["schedule_id", "expected_version"],
   archive_recipe_schedule: ["schedule_id", "expected_version"],
+  authorize_recipe_schedule_execution: ["request", "preview_digest"],
+  stop_recipe_schedule_occurrence: ["schedule_id", "expected_version", "binding"],
+  request_recipe_schedule_occurrence_stop: ["intent"],
 };
 const resourceFor = (body: PendingRecipeCommand["body"]): string => {
   const type = body.kind.includes("profile_set") ? "profile" :
     body.kind.includes("schedule") ? "schedule" : "recipe";
-  const id = type === "profile" ? body.profile_set_id :
+  const request = body.kind === "request_recipe_schedule_occurrence_stop" ? body.intent : body.request;
+  const id = ["authorize_recipe_schedule_execution", "request_recipe_schedule_occurrence_stop"].includes(body.kind) && request && typeof request === "object" && "schedule_id" in request ? request.schedule_id : type === "profile" ? body.profile_set_id :
     type === "schedule" ? body.schedule_id : body.recipe_id;
   return `${body.project_id}:${type}:${typeof id === "string" ? id : "new"}`;
+};
+const stoppedOccurrenceKey = (body: PendingRecipeCommand["body"]): string | undefined => {
+  const target = body.kind === "request_recipe_schedule_occurrence_stop" ? body.intent :
+    body.kind === "stop_recipe_schedule_occurrence" ? body.binding : undefined;
+  return target && typeof target === "object" && "occurrence_id" in target && typeof target.occurrence_id === "string"
+    ? `${body.project_id}:${target.occurrence_id}` : undefined;
 };
 const validPending = (value: unknown): value is PendingRecipeCommand => {
   if (!value || typeof value !== "object") return false;
@@ -100,6 +111,7 @@ const validPending = (value: unknown): value is PendingRecipeCommand => {
     typeof body.operation_id !== "string" || !body.operation_id ||
     Object.keys(body).sort().join() !== ["kind", "project_id", "operation_id", ...fields].sort().join() ||
     fields.some((field) => body[field] === undefined)) return false;
+  if (["authorize_recipe_schedule_execution", "stop_recipe_schedule_occurrence", "request_recipe_schedule_occurrence_stop"].includes(String(body.kind)) && !scheduleExecutionCommandIsCurrent(body)) return false;
   const id = body.profile_set_id ?? body.recipe_id ?? body.schedule_id;
   if (id !== undefined && id !== null && typeof id !== "string") return false;
   if (String(body.kind).startsWith("archive_") || body.kind === "pause_recipe_schedule" ||
@@ -157,6 +169,7 @@ const writePending = (entries: PendingRecipeCommand[]) =>
 const samePending = (left: PendingRecipeCommand, right: PendingRecipeCommand) =>
   left.resource === right.resource &&
   JSON.stringify(left.body) === JSON.stringify(right.body);
+const receiptIdentity = (entry: PendingRecipeCommand): string => JSON.stringify(entry);
 // Removes only this exact request from the current journal, so entries added
 // meanwhile by another form instance survive. On storage failure it is kept.
 const settlePending = (settled: PendingRecipeCommand): boolean => {
@@ -187,6 +200,8 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [pending, setPending] = useState(false);
+  const [checkedReceipts, setCheckedReceipts] = useState<string[]>([]);
+  const [requestedStops, setRequestedStops] = useState<string[]>([]);
   const identities = useRef(new Map<string, string>());
   const projectId = project?.id;
   const execution = state.workflow_execution?.find((item) => item.project_id === projectId);
@@ -213,6 +228,8 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
     setError("");
     setNotice("");
     setPending(false);
+    setCheckedReceipts([]);
+    setRequestedStops([]);
     identities.current.clear();
   }
   const profiles = state.profile_sets.filter((item) =>
@@ -265,6 +282,8 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
       const response = await command(entry.body);
       const cleared = settlePending(entry);
       if (signal.aborted) return undefined;
+      const stopped = stoppedOccurrenceKey(entry.body);
+      if (stopped) setRequestedStops((items) => items.includes(stopped) ? items : [...items, stopped]);
       identities.current.delete(key);
       setError(cleared ? "" : unsettledMessage);
       setNotice("Saved. The latest state is loading.");
@@ -277,7 +296,7 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
       const message = cause instanceof Error ? cause.message : String(cause);
       if (ambiguous) {
         onChanged();
-        setError(`${message} Current state is refreshing. The exact request is retained for explicit retry; your edited draft was kept.`);
+        setError(`${message} The outcome is uncertain. Refresh and check the current schedule before recovering the exact saved request; your edited draft was kept.`);
       } else {
         identities.current.delete(key);
         setError(`${message} Your edited draft was kept.${cleared ? "" : ` ${unsettledMessage}`}`);
@@ -288,7 +307,8 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
     }
   };
   const retryPending = async (entry: PendingRecipeCommand) => {
-    if (pending || entry.body.project_id !== projectId) return;
+    if (pending || entry.body.project_id !== projectId || entry.body.kind === "authorize_recipe_schedule_execution") return;
+    if (["authorize_recipe_schedule_execution", "stop_recipe_schedule_occurrence", "request_recipe_schedule_occurrence_stop"].includes(entry.body.kind) && !checkedReceipts.includes(receiptIdentity(entry))) return;
     const signal = lifecycle.current.signal;
     let stillPending: boolean;
     try {
@@ -303,11 +323,14 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
       onChanged();
       return;
     }
+    setCheckedReceipts((items) => items.filter((id) => id !== receiptIdentity(entry)));
     setPending(true);
     try {
       const response = await command(entry.body);
       const cleared = settlePending(entry);
       if (signal.aborted) return;
+      const stopped = stoppedOccurrenceKey(entry.body);
+      if (stopped) setRequestedStops((items) => items.includes(stopped) ? items : [...items, stopped]);
       const result = response.result;
       if (typeof result?.entity_id === "string" && typeof result.version === "number") {
         const { entity_id, version } = result;
@@ -359,6 +382,7 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
         if (entry.body.kind === "create_draft_from_recipe") onOpenTask(result.entity_id);
       }
       setError(cleared ? "" : unsettledMessage);
+      setCheckedReceipts((items) => items.filter((id) => id !== receiptIdentity(entry)));
       setNotice(
         "Pending request recovered. The latest state is loading. Select the recovered record before editing it if this form has changed.",
       );
@@ -493,9 +517,8 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
           <span className="eyebrow">{project.display_name}</span>
           <h1>Recipes</h1>
           <p>
-            Saved TRIP configurations copy into ordinary editable TRIP drafts.
-            A draft is queued only when you choose Make Ready. Recipes and
-            schedules do not create Single agent tasks.
+            Recipes and schedules create editable backlog drafts. Review each
+            draft and make it Ready when you want work to begin.
           </p>
         </div>
       </header>
@@ -518,9 +541,17 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
         <div className="warning" key={entry.resource}>
           {entry.body.kind} has an unknown result for {entry.resource}. The current state can be inspected,
           but its snapshot does not prove failure. Your edited form stays separate.
-          <button disabled={pending} onClick={() => void retryPending(entry)}>
+          {["authorize_recipe_schedule_execution", "stop_recipe_schedule_occurrence", "request_recipe_schedule_occurrence_stop"].includes(entry.body.kind) && <>
+            <p>Refresh and check this schedule’s grant and occurrence history before recovering the saved operation. Recovery asks for the original receipt with the same operation identity.</p>
+            <button disabled={pending} onClick={() => onChanged()}>Refresh schedule outcome</button>
+            <label><input type="checkbox" checked={checkedReceipts.includes(receiptIdentity(entry))} onChange={(event) => setCheckedReceipts((items) => event.target.checked ? [...items, receiptIdentity(entry)] : items.filter((id) => id !== receiptIdentity(entry)))} />I checked this schedule’s outcome.</label>
+            <details><summary>Technical details</summary><pre>{JSON.stringify(entry.body, null, 2)}</pre></details>
+          </>}
+          {entry.body.kind === "authorize_recipe_schedule_execution" ? (
+            <p>Automatic execution is retired. This saved request is historical and cannot be retried. Refresh to inspect its recorded outcome.</p>
+          ) : <button disabled={pending || (["stop_recipe_schedule_occurrence", "request_recipe_schedule_occurrence_stop"].includes(entry.body.kind) && !checkedReceipts.includes(receiptIdentity(entry)))} onClick={() => void retryPending(entry)}>
             Retry exact pending request
-          </button>
+          </button>}
         </div>
       ))}
 
@@ -668,13 +699,13 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
               )}
               <div className="button-row">
                 <button
-                  disabled={item.archived || pending}
+                  disabled={item.archived || pending || (item.family === "single_agent" && !!item.preset && item.preset !== "single_agent")}
                   onClick={() => chooseRecipe(item)}
                 >
                   Edit
                 </button>
                 <button
-                  disabled={item.archived || pending || (item.family !== "single_agent" && (!ready || item.config_revision_id !== currentConfig))}
+                  disabled={item.archived || pending || (item.family === "single_agent" && !!item.preset && item.preset !== "single_agent") || (item.family !== "single_agent" && (!ready || item.config_revision_id !== currentConfig))}
                   onClick={async () => {
                     const result = await submit({
                       kind: "create_draft_from_recipe",
@@ -789,7 +820,7 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
           selection here constrains the Manager’s later selection; it creates no
           selected-check rows.
         </p></>}
-        {recipe.family === "single_agent" && <p className="hint">Saving pins the exact definition, configuration, profile revisions and checks. Creating from a recipe or schedule makes a draft; you still choose Make Ready.</p>}
+        {recipe.family === "single_agent" && <p className="hint">Saving pins the exact definition, configuration, profile revisions and checks. Create draft leaves the task for you to make Ready. Schedules create drafts; make each task Ready manually.</p>}
         <div className="button-row">
           <button
             disabled={pending || (recipe.family === "single_agent" ? !recipe.selection?.profile_revision_id || (recipe.selection.preset === "build_and_review" && !recipe.selection.reviewer_profile_revision_id) : !ready || !recipe.profileRevisionId)}
@@ -807,8 +838,9 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
         <h2>Foreground schedules</h2>
         <p className="hint">
           Daily means every 24 hours; weekly means every 7 days from the UTC
-          anchor. Fires only create backlog drafts while this service runs.
-          Missed time is summarized without catch-up drafts.
+          anchor. Local display times can shift with daylight saving time.
+          This service must be running. Missed time is summarized without catch-up runs.
+          Schedules create drafts only. Review each draft before making it Ready.
         </p>
         <div className="recipe-list">
           {schedules.map((item) => (
@@ -840,15 +872,50 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
                     ` · ${item.last_fire.missed_count} missed (${item.last_fire.missed_first_utc} to ${item.last_fire.missed_last_utc})`}
                 </p>
               )}
+              {(item.mode === "run_authorized_research" || item.mode === "run_authorized_recipe") && <p className="warning">Automatic execution is retired. This schedule and its grants are retained as history.</p>}
+              <p>{item.mode === "run_authorized_research" ? "Run authorized research" : item.mode === "run_authorized_recipe" ? item.recipe_preset === "build_and_review" ? "Run authorized Build and review" : "Run authorized Single agent" : "Create draft"}</p>
+              {item.authorization && <section aria-label="Historical schedule grant">
+                <p>Historical grant: {item.authorization.remaining_occurrences} occurrences remaining · {item.authorization.reserved_occurrences} reserved of {item.authorization.max_occurrences}.</p>
+                <p>At most {item.authorization.max_invocations_per_occurrence} invocations per occurrence · runtime {item.authorization.max_runtime_seconds} seconds · start window {item.authorization.start_window_seconds} seconds. Permission and human waits count toward runtime.</p>
+                {(item.authorization.revoked_at || item.authorization.restore_invalidated_at) && <p className="warning">This grant is revoked or invalidated. Automatic execution has been retired.</p>}
+                <details><summary>Grant scope and pins</summary><pre>{JSON.stringify(item.authorization, null, 2)}</pre></details>
+              </section>}
+              {!!item.occurrences?.length && <section aria-label="Schedule occurrence history">
+                <h4>Occurrence history</h4>
+                <ol>{item.occurrences.map((occurrence) => <li key={occurrence.id}>
+                  <p>{utcLabel(occurrence.scheduled_for_utc)} · {occurrence.outcome.replaceAll("_", " ")} · {occurrence.invocations_spent} invocations spent · {occurrence.allowance_reserved ? "Occurrence allowance reserved" : "No occurrence allowance reserved"}</p>
+                  <p>Runtime deadline: {utcLabel(occurrence.runtime_deadline_utc)}</p>
+                  {occurrence.reason && <ErrorNotice error={occurrence.reason} />}
+                  {occurrence.task_id && <button onClick={() => onOpenTask(occurrence.task_id!)}>Open occurrence task</button>}
+                  {occurrence.attempt_id && <p>Recorded attempt: {occurrence.attempt_id}</p>}
+                  {["waiting", "reserved", "running", "stop_requested", "recovery_required"].includes(occurrence.outcome) && <>
+                    <p>{occurrence.stop_requested_at || requestedStops.includes(`${projectId}:${occurrence.id}`) || occurrence.outcome === "stop_requested" ? "Stop requested; waiting for verified preparation and process quiescence." : "Pausing future runs does not stop this current run."}</p>
+                    {occurrence.outcome === "recovery_required" && <p>Recovery required. The process outcome is unknown; inspect the task and recovery controls.</p>}
+                    <button disabled={pending || !!journal.fault || (!(occurrence.stop_intent_available && occurrence.stop_intent) && !(occurrence.stop_intent_available === undefined && occurrence.stop_binding?.process)) || !!occurrence.stop_requested_at || requestedStops.includes(`${projectId}:${occurrence.id}`) || occurrence.outcome === "stop_requested" || journal.entries.some((entry) => entry.resource === `${projectId}:schedule:${item.id}`)} onClick={() => {
+                      if (occurrence.stop_intent_available && occurrence.stop_intent) {
+                        const body: Omit<Extract<ScheduleExecutionCommand, { kind: "request_recipe_schedule_occurrence_stop" }>, "operation_id"> = { kind: "request_recipe_schedule_occurrence_stop", intent: occurrence.stop_intent };
+                        void submit(body);
+                        return;
+                      }
+                      if (occurrence.stop_intent_available !== undefined || !occurrence.stop_binding?.process) return;
+                      const body: Omit<Extract<ScheduleExecutionCommand, { kind: "stop_recipe_schedule_occurrence" }>, "operation_id"> = { kind: "stop_recipe_schedule_occurrence", project_id: item.project_id, schedule_id: item.id, expected_version: item.version, binding: occurrence.stop_binding };
+                      void submit(body);
+                    }}>Stop current run</button>
+                    {!occurrence.stop_intent_available && !occurrence.stop_binding?.process && <p>{occurrence.stop_intent_reason || "No exact current process target is available. Refresh, then inspect the task’s recovery controls."}</p>}
+                    {item.authorization && item.authorization.id === occurrence.authorization_id && <p>{Math.max(0, item.authorization.max_invocations_per_occurrence - occurrence.invocations_spent)} native invocations were unused in the original allowance. Retired execution cannot spend them; Stop does not change the recorded history.</p>}
+                  </>}
+                </li>)}</ol>
+              </section>}
               <div className="button-row">
                 <button
-                  disabled={item.archived || pending}
+                  disabled={item.archived || pending || (item.mode === "run_authorized_research" || item.mode === "run_authorized_recipe")}
                   onClick={() => chooseSchedule(item)}
                 >
                   Edit
                 </button>
                 <button
                   disabled={item.archived || pending ||
+                    (item.paused && (item.mode === "run_authorized_research" || item.mode === "run_authorized_recipe")) ||
                     (item.paused &&
                       (item.recipe_archived || (item.recipe_family !== "single_agent" &&
                         (!ready || item.recipe_config_revision_id !== currentConfig))))}
@@ -861,7 +928,7 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
                       expected_version: item.version,
                     })}
                 >
-                  {item.paused ? item.last_fire ? "Resume" : "Enable" : "Pause"}
+                  {item.paused ? (item.mode === "run_authorized_research" || item.mode === "run_authorized_recipe") ? "Retired" : item.last_fire ? "Resume" : "Enable" : (item.mode === "run_authorized_research" || item.mode === "run_authorized_recipe") ? "Pause future runs" : "Pause"}
                 </button>
                 <button
                   disabled={item.archived || pending}
@@ -899,7 +966,7 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
           >
             <option value="">Select a recipe revision</option>
             {recipes.filter((item) =>
-              !item.archived && (item.family === "single_agent" || item.config_revision_id === currentConfig)
+              !item.archived && (!item.preset || item.preset === "single_agent") && (item.family === "single_agent" || item.config_revision_id === currentConfig)
             ).map((item) => (
               <option key={item.revision_id} value={item.revision_id}>
                 {item.name} · revision {item.revision}
@@ -954,6 +1021,7 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
           New schedules start paused. Enable or Resume anchors the first fire
           strictly after that command.
         </p>
+
       </section>
     </section>
   );

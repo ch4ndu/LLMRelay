@@ -11,6 +11,7 @@ pub mod diagnostics;
 pub mod domain;
 pub mod export;
 pub mod import;
+pub mod knowledge;
 pub mod model_catalog;
 pub mod operations;
 pub mod permissions;

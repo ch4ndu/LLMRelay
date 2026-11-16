@@ -1,6 +1,10 @@
 # Engineering workflow and authority
 
 These requirements apply to every engineering task in this repository.
+Follow the installed [engineering baseline](../.agents/skills/trip-explorer-workflow/references/engineering-baseline.md)
+for planning, feasibility, complexity, proportional verification, and completion.
+Apply it proportionately; this does not activate the full TRIP workflow or add
+routine approval gates. Existing project constraints and authorization apply.
 Use [Coding standards](CODING_STANDARDS.md) for implementation and review guidance.
 When TRIP Explorer is invoked, also follow the installed
 [TRIP Explorer skill](../.agents/skills/trip-explorer-workflow/SKILL.md) and its configured roles.

@@ -501,7 +501,91 @@ export interface TaskRecipe {
   workflow_version: string;
   workflow_hash: string;
 }
+export interface RecipeScheduleExecutionLimits {
+  max_occurrences: number;
+  max_invocations_per_occurrence: number;
+  max_runtime_seconds: number;
+  start_window_seconds: number;
+}
+export interface RecipeSchedulePreviewRequest {
+  project_id: string;
+  schedule_id: string;
+  expected_version: number;
+  limits: RecipeScheduleExecutionLimits;
+  knowledge_selection: KnowledgeSelection[];
+}
+export interface RecipeScheduleScopeBase {
+  project_id: string;
+  schedule_id: string;
+  recipe_revision_id: string;
+  recipe: { id: string; revision: number; title: string; description: string; acceptance_criteria: string[]; priority: number; definition_id: string; workflow_version: string; workflow_hash: string };
+  admission: RecipeScheduleAdmission;
+  knowledge: KnowledgePreview;
+  cadence: "daily" | "weekly";
+  anchor_utc: string;
+  limits: RecipeScheduleExecutionLimits;
+  deadline_stop_policy: "interrupt_then_identity_verified_force_stop_within_runtime";
+}
+export interface RecipeScheduleAdmission {
+  project_id: string; repository_identity: string; repository_path: string; base_revision: string;
+  execution_config_revision_id: string; execution_config_hash: string; profile_revision_id: string; profile_hash: string;
+  provider: Provider; policy_hash: string; adapter_hash: string; admission_id: string; prepared_scope_hash: string;
+  capability_key: string; capability_id: string; capability_proof_hash: string; native_identity_hash: string;
+  effective_policy_hash: string | null; guidance: Array<{ path: string; sha256: string; bytes: number }>;
+}
+export type RecipeScheduleScope =
+  | (RecipeScheduleScopeBase & { schema: 1 })
+  | (RecipeScheduleScopeBase & {
+      schema: 2;
+      workspace_mode: "isolated_worktree";
+      admission: RecipeScheduleAdmission & { session_contract: "retained" };
+      check_ids: string[];
+      check_execution_policy: "per_candidate_human_authorization";
+      writer_resume_policy: "explicit_retained_only_within_allowance";
+      human_request_changes_policy: "separate_draft_and_new_grant_required";
+    } & (
+      | { preset: "single_agent"; reviewer_admission: null; max_repair_attempts: 0 }
+      | { preset: "build_and_review"; reviewer_admission: RecipeScheduleAdmission & { session_contract: "fresh" }; max_repair_attempts: 1 }
+    ));
+export interface ScheduleOccurrenceStopIntent {
+  project_id: string; schedule_id: string; expected_version: number;
+  occurrence_id: string; authorization_id: string;
+}
+export interface RecipeScheduleExecutionPreview { scope: RecipeScheduleScope; digest: string; expected_version: number }
+export interface ScheduleStopBinding {
+  occurrence_id: string; authorization_id: string; attempt_id: string; session_id: string;
+  resume_invocation_id: string | null; role_generation_id: string; transcript_epoch: string;
+  process: { pid: number; process_group_id: number; native_start_marker: string; observed_started_at: string } | null;
+}
+export type ScheduleExecutionCommand =
+  | { kind: "request_recipe_schedule_occurrence_stop"; operation_id: string; intent: ScheduleOccurrenceStopIntent }
+  | { kind: "authorize_recipe_schedule_execution"; operation_id: string; request: RecipeSchedulePreviewRequest; preview_digest: string }
+  | { kind: "stop_recipe_schedule_occurrence"; operation_id: string; project_id: string; schedule_id: string; expected_version: number; binding: ScheduleStopBinding };
+export type RecipeScheduleOutcome = "task_created" | "skipped_ineligible" | "missed" | "waiting" | "held" | "reserved" | "running" | "stop_requested" | "review_ready" | "finished" | "recovery_required";
+export interface RecipeScheduleOccurrence {
+  id: string; authorization_id: string | null; scheduled_for_utc: string;
+  task_id: string | null; attempt_id: string | null; outcome: RecipeScheduleOutcome; reason: string | null;
+  allowance_reserved: boolean | 0 | 1; invocations_spent: number; runtime_deadline_utc: string | null;
+  stop_binding?: ScheduleStopBinding | null;
+  stop_intent?: ScheduleOccurrenceStopIntent | null;
+  stop_intent_available?: boolean;
+  stop_intent_reason?: string | null;
+  stop_requested_at?: string | null;
+  stop_reason?: string | null;
+}
 export interface RecipeSchedule {
+  mode?: "create_draft" | "run_authorized_research" | "run_authorized_recipe";
+  active_authorization_id?: string | null;
+  execution_intake_enabled?: boolean;
+  execution_authorization_supported?: boolean;
+  execution_authorization_reason?: string;
+  execution_qualification_state?: "preview_required" | "unsupported";
+  authorization?: (RecipeScheduleExecutionLimits & {
+    id: string; scope_hash: string; scope: RecipeScheduleScope; created_at: string;
+    revoked_at: string | null; restore_invalidated_at: string | null;
+    reserved_occurrences: number; remaining_occurrences: number;
+  }) | null;
+  occurrences?: RecipeScheduleOccurrence[];
   recipe_family?: WorkflowFamily;
   recipe_preset?: SingleAgentPreset;
   id: string;
@@ -519,7 +603,7 @@ export interface RecipeSchedule {
   next_fire_utc: string | null;
   last_fire: null | {
     scheduled_for_utc: string;
-    outcome: "task_created" | "skipped_ineligible" | "missed";
+    outcome: RecipeScheduleOutcome;
     task_id: string | null;
     reason: string | null;
     missed_first_utc: string | null;
@@ -586,6 +670,7 @@ export interface ReviewBudget {
   version: number;
 }
 export interface Task {
+  knowledge?: TaskKnowledge;
   observed_usage?: ObservedUsage | null;
   /** Absent for tasks without a workflow selection, which are TRIP. */
   workflow?: TaskWorkflow;
@@ -2271,6 +2356,7 @@ export interface ConversationMessages {
   history_coverage: string;
 }
 export type ConversationMutation =
+  | { action: "with_knowledge"; operation_id: string; operation: KnowledgeConversationOperation; project_id: string; expected_consumer_version: number; selection: KnowledgeSelection[]; preview_fingerprint: string }
   | { action: "create_profile"; input: { operation_id: string; project_id: string; execution_config_revision_id: string; model: string; effort: string; instructions: string } }
   | { action: "prepare"; operation_id: string; profile_revision_id: string }
   | { action: "probe"; operation_id: string; admission_id: string }
@@ -2293,6 +2379,7 @@ export type ConversationRead =
   | { action: "messages"; project_id: string; conversation_id: string }
   | { action: "receipt"; project_id: string; operation_id: string; original_request: ConversationMutation; request_hash: string };
 export interface ConversationMutationResult {
+  knowledge_manifest_id?: string;
   state?: string;
   conversation_id?: string;
   admission_id?: string;
@@ -2659,11 +2746,24 @@ export type ComparisonEvidenceFact =
     reason: string | null;
   };
 
+export interface ComparisonRecipeAttribution {
+  recipe_revision_id: string;
+  recipe_title: string;
+  schedule_id: string | null;
+  scheduled_for_utc: string | null;
+  occurrence_id: string | null;
+  authorization_id: string | null;
+  root_attempt_id: string | null;
+  occurrence_outcome: string | null;
+  occurrence_reason: string | null;
+}
+
 export interface ComparisonEvidenceRow {
   key: string;
   unit_id: string;
   task_id: string;
   attempt_id: string | null;
+  recipe_attribution?: ComparisonRecipeAttribution | null;
   source: HistoricalSourceKey | null;
   fact: ComparisonEvidenceFact;
   truncated: boolean;
@@ -2715,4 +2815,79 @@ export interface ComparisonTaskTiming {
   elapsed_to_acceptance_millis: number | null;
   unavailable_reason: string | null;
   runs: ComparisonRunTiming[];
+}
+
+export type KnowledgeSourceSelector =
+  | { kind: "historical"; source: HistoricalSourceKey }
+  | { kind: "conversation"; source: ConversationSourceInput }
+  | { kind: "finding"; parent: { kind: "explorer"; decision_id: string; attempt_id: string } | { kind: "single_agent_review"; delivery_id: string; role_result_id: string; attempt_id: string }; field: "summary" | "evidence" | "findings"; index: number | null; content_hash: string }
+  | { kind: "repository"; commit: string; path: string }
+  | { kind: "user_assertion" };
+export interface KnowledgeSource {
+  selector: KnowledgeSourceSelector;
+  content_hash: string;
+  identity_hash: string;
+  repository_scope: { repository_path: string; repository_identity: string; registered_revision: string } | null;
+}
+export interface KnowledgeDraftBody { title: string; statement: string; category: string; tags: string[]; sources: KnowledgeSourceSelector[] }
+export interface KnowledgeEntry { id: string; project_id: string; version: number; latest_draft_id: string | null; approved_revision_id: string | null; archived_at: string | null }
+export interface KnowledgeRevision extends Omit<KnowledgeDraftBody, "sources"> { id: string; entry_id: string; parent_revision_id: string | null; sources: KnowledgeSource[]; author: string; content_hash: string; created_at: string }
+export type KnowledgeFreshness = "verified" | "needs_revalidation" | "source_unavailable" | "user_assertion";
+export interface KnowledgeObservation {
+  revision_id: string; check_started_at: string; checked_at: string; state: KnowledgeFreshness; fingerprint: string; restore_operation_id?: string;
+  sources: Array<{ identity_hash: string; original_content_hash: string; observed_content_hash: string | null; state: KnowledgeFreshness; reason: string }>;
+}
+export interface KnowledgeSelection { entry_id: string; revision_id: string; expected_entry_version: number; observation_fingerprint: string; acknowledged_warning: boolean }
+export type KnowledgeConsumer =
+  | { kind: "schedule"; schedule_id: string }
+  | { kind: "task"; task_id: string; parent_attempt_id: string | null; continuation: string | null; parent_binding_id: string | null }
+  | { kind: "conversation"; conversation_id: string | null; operation_kind: "start" | "submit" | "steer"; operation: KnowledgeConversationOperation };
+export type KnowledgeConversationOperation =
+  | { action: "start"; operation_id: string; admission_id: string; input: string }
+  | { action: "submit"; operation_id: string; conversation_id: string; input: string }
+  | { action: "steer"; operation_id: string; conversation_id: string; expected_turn_id: string; input: string };
+export interface KnowledgePreviewRequest { project_id: string; consumer: KnowledgeConsumer; expected_consumer_version: number; user_text: string; selection: KnowledgeSelection[] }
+export interface KnowledgePreview {
+  block: string; block_hash: string; block_serialized_bytes: number; block_limit: number; selected_count: number; included_count: number; omitted_count: number;
+  items: Array<{ selection: KnowledgeSelection; content_hash: string; source_identity_hash: string; freshness: KnowledgeFreshness; checked_at: string; warning: string | null; disposition: "included" | "omitted_byte_limit"; text_hash: string }>;
+  effective_digest: string; fingerprint: string; requires_consumer_validation: boolean;
+}
+export interface KnowledgeConfirmation { request: KnowledgePreviewRequest; preview_fingerprint: string }
+export interface KnowledgeManifest { id: string; project_id: string; binding: { kind: "task_attempt"; attempt_id: string } | { kind: "conversation_operation"; operation_id: string; assembled_input_hash: string; complete_operation_hash: string }; request: KnowledgePreviewRequest; preview: KnowledgePreview; sources: KnowledgeSource[][]; created_at: string }
+export interface KnowledgeSearch { query: string; include_drafts: boolean; include_archived: boolean; after_entry_id: string | null; limit: number }
+export interface KnowledgeSearchHit { entry: KnowledgeEntry; revision_id: string; title: string }
+export interface KnowledgeLifecycleEvent { revision_id: string | null; replaced_revision_id: string | null; kind: string; actor: string; entry_version: number; created_at: string }
+export type KnowledgeMutation =
+  | { kind: "draft"; entry_id: string | null; expected_version: number | null; body: KnowledgeDraftBody }
+  | { kind: "approve"; entry_id: string; expected_version: number; revision_id: string; replaces_revision_id: string | null }
+  | { kind: "archive"; entry_id: string; expected_version: number };
+export type KnowledgeCommand =
+  | { kind: "mutate"; request: { operation_id: string; project_id: string; mutation: KnowledgeMutation } }
+  | { kind: "revalidate"; project_id: string; operation_id: string; entry_id: string; revision_id: string; expected_version: number; expected_observation: string };
+export interface KnowledgeReadResults {
+  search: KnowledgeSearchHit[]; entry: KnowledgeEntry; revision: KnowledgeRevision;
+  source: { source: KnowledgeSource; text: string; checked_at: string };
+  history: KnowledgeLifecycleEvent[]; freshness: KnowledgeObservation; manifest: KnowledgeManifest;
+  conversation_consumer: { conversation_id: string; expected_consumer_version: number; state: string; generation: string; active_turn_id: string | null; binding_valid: boolean };
+}
+export type KnowledgeRead =
+  | { kind: "search"; search: KnowledgeSearch }
+  | { kind: "entry"; entry_id: string }
+  | { kind: "revision" | "freshness"; entry_id: string; revision_id: string }
+  | { kind: "source"; entry_id: string; revision_id: string; index: number }
+  | { kind: "history"; entry_id: string; after_version: number }
+  | { kind: "manifest"; manifest_id: string }
+  | { kind: "conversation_consumer"; conversation_id: string };
+export interface NextRunKnowledge {
+  version: number; parent_attempt_id: string; continuation_kind: string; parent_result_binding_id: string; parent_review_binding_id: string | null;
+  expected_task_version: number; confirmation: KnowledgeConfirmation | null; hold_reason: string | null;
+}
+export interface TaskKnowledge {
+  selection: KnowledgeConfirmation | null; preparation: NextRunKnowledge | null; admission_hold: string | null; preview_user_text: string;
+  manifests: Array<{ id: string; binding: KnowledgeManifest["binding"]; created_at: string; selected_count: number; included_count: number; omitted_count: number; availability: string; delivery: string }>;
+}
+export interface PrepareNextRunKnowledge {
+  operation_id: string; project_id: string; task_id: string; parent_attempt_id: string; continuation_kind: string; expected_task_version: number;
+  expected_preparation_version: number | null; parent_result_binding_id: string; parent_review_binding_id: string | null;
+  selection: KnowledgeSelection[]; preview_fingerprint: string; action: "save_only" | "save_and_continue_rework";
 }

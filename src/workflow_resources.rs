@@ -70,46 +70,27 @@ impl SingleAgentDefinition {
     }
 }
 
-pub fn single_agent_definition(preset: crate::domain::SingleAgentPreset) -> SingleAgentDefinition {
-    use crate::domain::SingleAgentPreset;
-    match preset {
-        SingleAgentPreset::SingleAgent => SingleAgentDefinition {
-            id: SINGLE_AGENT_DEFINITION_ID,
-            version: SINGLE_AGENT_DEFINITION_VERSION,
-            text: SINGLE_AGENT_DEFINITION,
-            prompt: SINGLE_AGENT_PROMPT,
-        },
-        SingleAgentPreset::RepositoryResearch => SingleAgentDefinition {
-            id: "llmrelay-repository-research-v1",
-            version: "repository-research-v1",
-            text: include_str!("../resources/workflows/repository-research-v1.json"),
-            prompt: include_str!("../resources/prompts/repository-research.md"),
-        },
-        SingleAgentPreset::BuildAndReview => SingleAgentDefinition {
-            id: "llmrelay-build-and-review-v1",
-            version: "build-and-review-v1",
-            text: include_str!("../resources/workflows/build-and-review-v1.json"),
-            prompt: include_str!("../resources/prompts/build-and-review.md"),
-        },
-    }
+pub fn single_agent_definition(
+    preset: crate::domain::SingleAgentPreset,
+) -> Result<SingleAgentDefinition> {
+    preset.require_supported()?;
+    Ok(SingleAgentDefinition {
+        id: SINGLE_AGENT_DEFINITION_ID,
+        version: SINGLE_AGENT_DEFINITION_VERSION,
+        text: SINGLE_AGENT_DEFINITION,
+        prompt: SINGLE_AGENT_PROMPT,
+    })
 }
 
 pub fn preset_for_definition(id: &str) -> Result<crate::domain::SingleAgentPreset> {
     use crate::domain::SingleAgentPreset;
-    for preset in [
-        SingleAgentPreset::SingleAgent,
-        SingleAgentPreset::RepositoryResearch,
-        SingleAgentPreset::BuildAndReview,
-    ] {
-        if single_agent_definition(preset).id == id {
-            return Ok(preset);
-        }
+    match id {
+        SINGLE_AGENT_DEFINITION_ID => Ok(SingleAgentPreset::SingleAgent),
+        "llmrelay-repository-research-v1" => Ok(SingleAgentPreset::RepositoryResearch),
+        "llmrelay-build-and-review-v1" => Ok(SingleAgentPreset::BuildAndReview),
+        _ => anyhow::bail!("This workflow definition is unavailable in the installed release"),
     }
-    anyhow::bail!("This workflow definition is unavailable in the installed release")
 }
-
-pub const SINGLE_AGENT_REVIEWER_PROMPT: &str =
-    include_str!("../resources/prompts/single-agent-reviewer.md");
 
 pub fn render(role: RoleKind, context: &serde_json::Value) -> Result<String> {
     Ok(format!(

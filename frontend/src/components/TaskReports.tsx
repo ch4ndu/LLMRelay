@@ -1,3 +1,5 @@
+import { useEffect, useState } from "react";
+import { SaveKnowledgeSource } from "./Knowledge";
 import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
 import { MarkdownContent } from "./MarkdownContent";
 import {
@@ -33,7 +35,8 @@ export const outcomeLabel = (outcome?: string) => {
 };
 
 export function ReportList(
-  { content, error, started }: {
+  { content, error, started, projectId, taskId, attemptId }: {
+    projectId?: string; taskId?: string; attemptId?: string;
     content?: TaskContent;
     error: string;
     /** Whether the task has an attempt; without one nothing is fetched. */
@@ -85,6 +88,7 @@ export function ReportList(
             </small>
           )}
           <MarkdownContent text={record.summary} />
+          {projectId && taskId && attemptId && content.task_id === taskId && content.attempt_id === attemptId && record.kind === "report" && <SaveKnowledgeSource projectId={projectId} source={{ kind: "historical", source: { task_id: taskId, attempt_id: attemptId, kind: "report", id: record.id } }} title={record.summary.slice(0, 100)} />}
           {record.plan && record.plan !== record.summary && (
             <details>
               <summary>Plan</summary>
@@ -223,4 +227,37 @@ export function CurrentInputReport(
       </TechnicalDetails>
     </>
   );
+}
+
+export function FindingKnowledgeSource({ projectId, parent, field, index, text, title }: {
+  projectId: string;
+  parent: Extract<import("../types").KnowledgeSourceSelector, { kind: "finding" }>["parent"];
+  field: "summary" | "evidence" | "findings";
+  index: number | null;
+  text: string;
+  title: string;
+}) {
+  const [hash, setHash] = useState(""); const [error, setError] = useState("");
+  useEffect(() => {
+    let abandoned = false; setHash(""); setError("");
+    if (new TextEncoder().encode(text).length > 65536) { setError("This complete finding exceeds 64 KiB. Select a smaller source; its preview will not be hashed as complete evidence."); return; }
+    void crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)).then((digest) => { if (!abandoned) setHash(Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")); }).catch((cause: unknown) => { if (!abandoned) setError(String(cause)); });
+    return () => { abandoned = true; };
+  }, [text]);
+  return <>{hash && <SaveKnowledgeSource key={`${JSON.stringify(parent)}:${field}:${index}:${hash}`} projectId={projectId} source={{ kind: "finding", parent, field, index, content_hash: hash }} title={title} statement={new TextEncoder().encode(text).length <= 8192 ? text : ""} />}{error && <ErrorNotice error={error} />}</>;
+}
+
+
+export function knowledgeFindingText(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  function encode(item: unknown): string | undefined {
+    if (item === null || typeof item === "boolean" || typeof item === "string" || (typeof item === "number" && Number.isFinite(item))) return JSON.stringify(item);
+    if (Array.isArray(item)) { const values = item.map(encode); return values.every((value) => value !== undefined) ? `[${values.join(",")}]` : undefined; }
+    if (typeof item === "object" && item !== null) {
+      const values = Object.entries(item).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0).map(([key, value]) => { const encoded = encode(value); return encoded === undefined ? undefined : `${JSON.stringify(key)}:${encoded}`; });
+      return values.every((value) => value !== undefined) ? `{${values.join(",")}}` : undefined;
+    }
+    return undefined;
+  }
+  return value === null ? undefined : encode(value);
 }

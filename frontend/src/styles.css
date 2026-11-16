@@ -3362,3 +3362,28 @@ details.panel > summary,
 .comparison-facts dt { font-weight: 600; }
 .comparison-facts dd { margin: .2rem 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .comparison-evidence > label { display: inline-grid; gap: .35rem; margin-right: 1rem; }
+
+.knowledge-view, .knowledge-selector, .knowledge-editor {
+  display: grid;
+  gap: 0.8rem;
+  min-width: 0;
+}
+.knowledge-view label, .knowledge-selector label, .knowledge-editor label {
+  display: grid;
+  gap: 0.35rem;
+}
+.knowledge-view pre, .knowledge-selector pre, .knowledge-editor pre,
+.knowledge-manifest pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 28rem;
+  overflow: auto;
+}
+.knowledge-selector {
+  border: 1px solid var(--border);
+  border-radius: 0.6rem;
+  padding: 1rem;
+}
+.knowledge-source-save { margin-block: 0.75rem; }
+.knowledge-source-save .knowledge-editor { margin-top: 0.75rem; }
+.knowledge-selector li { margin-block: 0.7rem; }

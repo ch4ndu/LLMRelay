@@ -1639,6 +1639,25 @@ impl Supervisor {
         transcript_epoch: &str,
         launch: &ProviderProcess<'_>,
     ) -> std::result::Result<ProcessIdentity, SpawnFailure> {
+        self.spawn_process_with_schedule_deadline(
+            session_id,
+            requested_owner,
+            transcript_epoch,
+            launch,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn spawn_process_with_schedule_deadline(
+        &self,
+        session_id: &str,
+        requested_owner: &SessionOwner,
+        transcript_epoch: &str,
+        launch: &ProviderProcess<'_>,
+        monotonic_deadline: Option<std::time::Instant>,
+        dispatch_enabled: Option<&std::sync::atomic::AtomicBool>,
+    ) -> std::result::Result<ProcessIdentity, SpawnFailure> {
         if self.store.compatibility_bundles.is_synthetic() {
             return Err(SpawnFailure::proven(
                 "synthetic compatibility context cannot spawn a native provider",
@@ -1684,7 +1703,13 @@ impl Supervisor {
             Err(error) => return Err(SpawnFailure::proven(error)),
         }
         self.store
-            .mark_session_spawning(session_id, transcript_epoch, &boot_identity)
+            .mark_session_spawning_with_schedule_deadline(
+                session_id,
+                transcript_epoch,
+                &boot_identity,
+                monotonic_deadline,
+                dispatch_enabled,
+            )
             .context("persist native spawn intent")
             .map_err(SpawnFailure::proven)?;
         let spawn_baseline = self
@@ -3407,6 +3432,116 @@ impl Supervisor {
         self.signal_recorded_exact_process(session_id, libc::SIGINT)
     }
 
+    pub(crate) fn signal_schedule_stop(
+        &self,
+        binding: &crate::domain::ScheduleStopBinding,
+        force: bool,
+    ) -> Result<()> {
+        if binding.process.is_none() {
+            let mut connection = self.store.lock()?;
+            let tx =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if !crate::recipes::schedule_stop_is_current_in(&tx, binding)? {
+                bail!("Scheduled stop target changed before cancellation")
+            }
+            let cancelled = tx.execute(
+                "UPDATE sessions SET status='launch_failed',launch_state='failed',launch_error='Scheduled stop before spawning',updated_at=?1
+                 WHERE id=?2 AND transcript_epoch=?3 AND launch_state='reserved' AND status='launch_reserved'",
+                rusqlite::params![Utc::now().to_rfc3339(),binding.session_id,binding.transcript_epoch],
+            )?;
+            if cancelled != 1 {
+                bail!("Scheduled startup identity is unknown; retain recovery fence")
+            }
+            tx.execute("UPDATE resume_invocations SET state='proven_nondelivery',updated_at=?1 WHERE session_id=?2 AND transcript_epoch=?3 AND state='reserved'",
+                rusqlite::params![Utc::now().to_rfc3339(),binding.session_id,binding.transcript_epoch])?;
+            tx.execute(
+                "UPDATE role_generations SET status='launch_failed' WHERE id=?1",
+                [&binding.role_generation_id],
+            )?;
+            tx.commit()?;
+            return Ok(());
+        }
+        // Keep registry replacement and turn I/O outside the identity-check/signal interval.
+        let sessions = self
+            .sessions
+            .read()
+            .map_err(|_| anyhow!("session registry poisoned"))?;
+        let Some(handle) = sessions.get(&binding.session_id) else {
+            let process = binding
+                .process
+                .as_ref()
+                .ok_or_else(|| anyhow!("Scheduled process identity is unknown"))?;
+            {
+                let mut connection = self.store.lock()?;
+                let tx = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                if !crate::recipes::schedule_stop_is_current_in(&tx, binding)? {
+                    bail!("Recorded scheduled stop target changed")
+                }
+                if !force {
+                    let changed = tx.execute(
+                        "UPDATE sessions SET interrupt_requested_at=?1
+                        WHERE id=?2 AND transcript_epoch=?3 AND interrupt_requested_at IS NULL",
+                        rusqlite::params![
+                            Utc::now().to_rfc3339(),
+                            binding.session_id,
+                            binding.transcript_epoch
+                        ],
+                    )?;
+                    if changed == 0 {
+                        return Ok(());
+                    }
+                }
+                tx.commit()?;
+            }
+            let connection = self.store.lock()?;
+            if !crate::recipes::schedule_stop_is_current_in(&connection, binding)? {
+                bail!("Recorded scheduled target changed immediately before signal")
+            }
+            if !same_process_start(
+                &native_start_marker(process.pid)?,
+                &process.native_start_marker,
+            ) || unsafe { libc::getpgid(process.pid as libc::pid_t) } != process.process_group_id
+            {
+                bail!("Recorded scheduled process start identity or group changed")
+            }
+            let signal = if force { libc::SIGKILL } else { libc::SIGINT };
+            if unsafe { libc::kill(-process.process_group_id, signal) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("signal recorded exact scheduled invocation");
+            }
+            return Ok(());
+        };
+        let _boundary = handle
+            .io_boundary
+            .lock()
+            .map_err(|_| anyhow!("session I/O boundary poisoned"))?;
+        let mut first_stop = handle
+            .first_stop_requested_at
+            .lock()
+            .map_err(|_| anyhow!("session stop state poisoned"))?;
+        let connection = self.store.lock()?;
+        let current = crate::recipes::schedule_stop_is_current_in(&connection, binding)?;
+        if !binding.matches_process(&handle.owner, &handle.transcript_epoch, &handle.process)
+            || !current
+        {
+            bail!("Scheduled stop binding no longer matches the exact attached invocation")
+        }
+        if !force && first_stop.is_some() {
+            return Ok(());
+        }
+        self.verify_process(handle)?;
+        if !force {
+            *first_stop = Some(std::time::Instant::now());
+        }
+        let signal = if force { libc::SIGKILL } else { libc::SIGINT };
+        if unsafe { libc::kill(-handle.process.process_group_id, signal) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("signal exact scheduled invocation");
+        }
+        Ok(())
+    }
+
     pub(crate) fn force_stop_exact_managed_process(&self, session_id: &str) -> Result<()> {
         if let Ok(handle) = self.handle(session_id) {
             self.verify_process(&handle)?;
@@ -4328,6 +4463,40 @@ fn newly_spawned_service_descendants(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schedule_stop_rejects_stale_epoch_and_same_pid_with_changed_native_start() {
+        let process = ProcessIdentity {
+            pid: 42,
+            process_group_id: 42,
+            native_start_marker: "original start".into(),
+            observed_started_at: "2030-01-01T09:00:00Z".into(),
+        };
+        let binding = crate::domain::ScheduleStopBinding {
+            occurrence_id: "occurrence".into(),
+            authorization_id: "grant".into(),
+            attempt_id: "attempt".into(),
+            session_id: "retained-session".into(),
+            resume_invocation_id: Some("resume-1".into()),
+            role_generation_id: "generation".into(),
+            transcript_epoch: "resume-epoch-1".into(),
+            process: Some(process.clone()),
+        };
+        let owner = SessionOwner::RoleGeneration("generation".into());
+        assert!(binding.matches_process(&owner, "resume-epoch-1", &process));
+        assert!(!binding.matches_process(&owner, "resume-epoch-2", &process));
+        let mut reused = process.clone();
+        reused.native_start_marker = "replacement start".into();
+        assert!(!binding.matches_process(&owner, "resume-epoch-1", &reused));
+        let mut observed = process.clone();
+        observed.observed_started_at = "2030-01-01T09:01:00Z".into();
+        assert!(!binding.matches_process(&owner, "resume-epoch-1", &observed));
+        assert!(!binding.matches_process(
+            &SessionOwner::RoleGeneration("new-generation".into()),
+            "resume-epoch-1",
+            &process
+        ));
+    }
 
     #[test]
     fn attention_process_snapshot_inventory_failure_writes_nothing() {

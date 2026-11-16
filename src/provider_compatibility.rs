@@ -384,6 +384,11 @@ pub struct PolicyBinding {
     pub contract_revision: String,
     pub authority: PolicyAuthority,
     pub session_contract: SessionContract,
+    // Older persisted bindings carry only the canonical hash, not these revisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_policy_revision: Option<String>,
     pub effective_hash: String,
     pub bundle_hash: String,
     pub qualification: PolicyQualification,
@@ -527,19 +532,50 @@ impl BundleSet {
     /// ignored native fixture only. This never alters embedded manifests.
     #[cfg(test)]
     pub(crate) fn provisional_native_fixture(version: &str) -> anyhow::Result<Self> {
-        if ![
-            crate::providers::codex::EXACT_CODEX_VERSION,
-            crate::providers::codex::SINGLE_AGENT_QUALIFICATION_VERSION,
-        ]
-        .contains(&version)
+        Self::provisional_native_fixture_for(Provider::Codex, version)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provisional_native_fixture_for(
+        provider: Provider,
+        version: &str,
+    ) -> anyhow::Result<Self> {
+        if exact_policy(provider, version, PolicyMode::SingleAgentWriter).is_err()
+            || (provider != Provider::Codex && version != "2.1.312 (Claude Code)")
         {
             anyhow::bail!("No provisional predicate for this exact native version")
         }
         let mut bundles = Self::embedded();
+        if provider == Provider::Claude {
+            let mut pack: serde_json::Value = serde_json::from_str(&bundles.claude_policy)?;
+            let mut writer = pack["selectors"][0]["contracts"]
+                .as_array()
+                .and_then(|contracts| {
+                    contracts
+                        .iter()
+                        .find(|c| c["mode"] == "single_agent_writer")
+                })
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Missing historical Claude writer contract"))?;
+            writer["contract_id"] = "claude-single-agent-writer-2-1-312-candidate".into();
+            writer["qualification"] = serde_json::json!({"state":"unqualified","reason":"Test-only acquisition; independent native evidence review required"});
+            pack["selectors"] = serde_json::json!([{
+                "predicate_id":"claude-code-2.1.312-candidate", "exact_version":version,
+                "contracts":[writer]
+            }]);
+            bundles.claude_policy = serde_json::to_string(&pack)?;
+            return Ok(bundles);
+        }
         let mut pack: serde_json::Value = serde_json::from_str(&bundles.codex_policy)?;
         let mut selector = pack["selectors"][0].clone();
         selector["exact_version"] = version.into();
         selector["predicate_id"] = version.replace(' ', "-").into();
+        if version == crate::providers::codex::CURRENT_SINGLE_AGENT_VERSION {
+            selector["contracts"]
+                .as_array_mut()
+                .ok_or_else(|| anyhow::anyhow!("Missing policy contracts"))?
+                .retain(|contract| contract["mode"] != "provider_observation");
+        }
         for contract in selector["contracts"]
             .as_array_mut()
             .ok_or_else(|| anyhow::anyhow!("Missing policy contracts"))?
@@ -666,6 +702,8 @@ impl BundleSet {
             contract_revision: contract.contract_revision.clone(),
             authority: contract.authority,
             session_contract: contract.session_contract,
+            launch_revision: Some(contract.launch_revision.clone()),
+            native_policy_revision: Some(contract.native_policy_revision.clone()),
             qualification: contract.qualification.clone(),
         })
     }
@@ -891,19 +929,17 @@ fn validate_policy_pack(pack: &PolicyPack, provider: Provider) -> Result<(), ()>
     {
         return Err(());
     }
-    let exact_version = match provider {
-        Provider::Codex => crate::providers::codex::EXACT_CODEX_VERSION,
-        Provider::Claude => crate::providers::claude::EXACT_CLAUDE_VERSION,
-    };
     let mut versions = BTreeSet::new();
     let mut predicates = BTreeSet::new();
     let mut ids = BTreeSet::new();
     for selector in &pack.selectors {
         if selector.predicate_id.trim().is_empty()
-            || (selector.exact_version != exact_version
-                && !(provider == Provider::Codex
-                    && selector.exact_version
-                        == crate::providers::codex::SINGLE_AGENT_QUALIFICATION_VERSION))
+            || exact_policy(
+                provider,
+                &selector.exact_version,
+                PolicyMode::SingleAgentWriter,
+            )
+            .is_err()
             || !versions.insert(&selector.exact_version)
             || !predicates.insert(&selector.predicate_id)
         {
@@ -912,7 +948,7 @@ fn validate_policy_pack(pack: &PolicyPack, provider: Provider) -> Result<(), ()>
         let mut modes = BTreeSet::new();
         for contract in &selector.contracts {
             let (authority, session, launch, native, credential, evidence, required) =
-                compiled_policy(provider, contract.mode);
+                exact_policy(provider, &selector.exact_version, contract.mode)?;
             let qualification_stated = match &contract.qualification {
                 PolicyQualification::Unqualified { reason } => !reason.trim().is_empty(),
                 PolicyQualification::Qualified { evidence_reference } => {
@@ -940,7 +976,14 @@ fn validate_policy_pack(pack: &PolicyPack, provider: Provider) -> Result<(), ()>
                 return Err(());
             }
         }
-        if !modes.contains(&PolicyMode::ProviderObservation)
+        let current_codex = provider == Provider::Codex
+            && selector.exact_version == crate::providers::codex::CURRENT_SINGLE_AGENT_VERSION;
+        let candidate_claude = cfg!(test)
+            && provider == Provider::Claude
+            && selector.exact_version == "2.1.312 (Claude Code)";
+        if (!current_codex
+            && !candidate_claude
+            && !modes.contains(&PolicyMode::ProviderObservation))
             || !modes.contains(&PolicyMode::SingleAgentWriter)
         {
             return Err(());
@@ -958,6 +1001,29 @@ type CompiledPolicy = (
     &'static str,
     [&'static str; 4],
 );
+
+fn exact_policy(provider: Provider, version: &str, mode: PolicyMode) -> Result<CompiledPolicy, ()> {
+    let supported = match provider {
+        Provider::Codex => {
+            version == crate::providers::codex::EXACT_CODEX_VERSION
+                || version == crate::providers::codex::SINGLE_AGENT_QUALIFICATION_VERSION
+                || (version == crate::providers::codex::CURRENT_SINGLE_AGENT_VERSION
+                    && mode != PolicyMode::ProviderObservation)
+        }
+        Provider::Claude => {
+            version == crate::providers::claude::EXACT_CLAUDE_VERSION
+                || (cfg!(test)
+                    && version == "2.1.312 (Claude Code)"
+                    && mode == PolicyMode::SingleAgentWriter)
+        }
+    };
+    if !supported {
+        return Err(());
+    }
+    // Current Codex uses the same native restrictions; exact version remains
+    // part of canonical authority without changing profile-policy hashes.
+    Ok(compiled_policy(provider, mode))
+}
 
 fn compiled_policy(provider: Provider, mode: PolicyMode) -> CompiledPolicy {
     match (provider, mode) {
@@ -1168,6 +1234,283 @@ fn validate_compiled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provisional_codex_versions_keep_native_calls_unqualified_and_modes_separate() {
+        use crate::providers::codex::{
+            CURRENT_SINGLE_AGENT_VERSION, EXACT_CODEX_VERSION, SINGLE_AGENT_QUALIFICATION_VERSION,
+        };
+        for version in [
+            EXACT_CODEX_VERSION,
+            SINGLE_AGENT_QUALIFICATION_VERSION,
+            CURRENT_SINGLE_AGENT_VERSION,
+        ] {
+            let bundles = BundleSet::provisional_native_fixture(version).unwrap();
+            assert!(!bundles.is_synthetic());
+            for mode in [
+                PolicyMode::SingleAgentWriter,
+                PolicyMode::SingleAgentReader,
+                PolicyMode::SingleAgentReviewer,
+            ] {
+                let binding = bundles
+                    .resolve_policy(Provider::Codex, version, mode)
+                    .unwrap();
+                assert!(binding.native_calls_disabled_reason().is_some());
+                assert!(matches!(
+                    binding.qualification,
+                    PolicyQualification::Unqualified { .. }
+                ));
+                assert_eq!(binding.exact_version, version);
+                assert!(binding.launch_revision.is_some());
+                assert!(binding.native_policy_revision.is_some());
+            }
+            assert_eq!(
+                bundles
+                    .resolve_policy(Provider::Codex, version, PolicyMode::ProviderObservation)
+                    .is_ok(),
+                version != CURRENT_SINGLE_AGENT_VERSION
+            );
+            if version != EXACT_CODEX_VERSION {
+                assert!(bundles
+                    .resolve(Provider::Codex, version, RoleKind::Implementer)
+                    .is_err());
+            }
+        }
+        for version in [
+            "codex-cli 0.167.1",
+            "codex-cli 0.168.0",
+            "0.167.0",
+            "unknown",
+        ] {
+            assert!(BundleSet::provisional_native_fixture(version).is_err());
+        }
+        assert!(BundleSet::provisional_native_fixture_for(
+            Provider::Claude,
+            crate::providers::claude::EXACT_CLAUDE_VERSION,
+        )
+        .is_err());
+        assert!(BundleSet::embedded()
+            .resolve_policy(
+                Provider::Codex,
+                CURRENT_SINGLE_AGENT_VERSION,
+                PolicyMode::SingleAgentWriter,
+            )
+            .is_err());
+
+        let claude_version = "2.1.312 (Claude Code)";
+        let claude =
+            BundleSet::provisional_native_fixture_for(Provider::Claude, claude_version).unwrap();
+        assert_eq!(claude.codex_policy, CODEX_POLICY_BYTES);
+        assert_eq!(BundleSet::embedded().claude_policy, CLAUDE_POLICY_BYTES);
+        let candidate = claude
+            .resolve_policy(
+                Provider::Claude,
+                claude_version,
+                PolicyMode::SingleAgentWriter,
+            )
+            .unwrap();
+        assert!(!candidate.synthetic_origin);
+        assert!(matches!(
+            candidate.qualification,
+            PolicyQualification::Unqualified { .. }
+        ));
+        // Ordinary dispatch uses this same qualification refusal.
+        assert!(candidate.native_calls_disabled_reason().is_some());
+        assert!(BundleSet::embedded()
+            .resolve_policy(
+                Provider::Claude,
+                claude_version,
+                PolicyMode::SingleAgentWriter
+            )
+            .is_err());
+        assert!(claude
+            .resolve(Provider::Claude, claude_version, RoleKind::Implementer)
+            .is_err());
+        let pack: serde_json::Value = serde_json::from_str(&claude.claude_policy).unwrap();
+        assert_eq!(
+            pack["selectors"][0]["contracts"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            pack["selectors"][0]["contracts"][0]["contract_id"],
+            "claude-single-agent-writer-2-1-312-candidate"
+        );
+        for mode in [
+            PolicyMode::ProviderObservation,
+            PolicyMode::SingleAgentReader,
+            PolicyMode::SingleAgentReviewer,
+        ] {
+            assert!(claude
+                .resolve_policy(Provider::Claude, claude_version, mode)
+                .is_err());
+        }
+        for version in ["2.1.313 (Claude Code)", "2.1.312", "unknown"] {
+            assert!(BundleSet::provisional_native_fixture_for(Provider::Claude, version).is_err());
+        }
+        let mut malformed = pack.clone();
+        malformed["selectors"][0]["contracts"][0]["native_policy_revision"] = "guessed".into();
+        assert!(BundleSet::embedded()
+            .with_policy_packs_for_tests(CODEX_POLICY_BYTES, &malformed.to_string())
+            .resolve_policy(
+                Provider::Claude,
+                claude_version,
+                PolicyMode::SingleAgentWriter
+            )
+            .is_err());
+        let historical: serde_json::Value = serde_json::from_str(CLAUDE_POLICY_BYTES).unwrap();
+        for contract in historical["selectors"][0]["contracts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["mode"] != "single_agent_writer")
+        {
+            let mut invalid = pack.clone();
+            invalid["selectors"][0]["contracts"]
+                .as_array_mut()
+                .unwrap()
+                .push(contract.clone());
+            assert!(BundleSet::embedded()
+                .with_policy_packs_for_tests(CODEX_POLICY_BYTES, &invalid.to_string())
+                .resolve_policy(
+                    Provider::Claude,
+                    claude_version,
+                    PolicyMode::SingleAgentWriter
+                )
+                .is_err());
+        }
+
+        let provisional =
+            BundleSet::provisional_native_fixture(CURRENT_SINGLE_AGENT_VERSION).unwrap();
+        let synthetic = provisional
+            .clone()
+            .with_policy_packs_for_tests(&provisional.codex_policy, &provisional.claude_policy);
+        let binding = synthetic
+            .resolve_policy(
+                Provider::Codex,
+                CURRENT_SINGLE_AGENT_VERSION,
+                PolicyMode::SingleAgentWriter,
+            )
+            .unwrap();
+        assert!(binding.synthetic_origin);
+        assert!(binding.native_calls_disabled_reason().is_some());
+        let mut invalid: serde_json::Value =
+            serde_json::from_str(&provisional.codex_policy).unwrap();
+        invalid["selectors"][0]["contracts"][0]["launch_revision"] =
+            "guessed-current-revision".into();
+        assert!(BundleSet::embedded()
+            .with_policy_packs_for_tests(&invalid.to_string(), CLAUDE_POLICY_BYTES)
+            .resolve_policy(
+                Provider::Codex,
+                CURRENT_SINGLE_AGENT_VERSION,
+                PolicyMode::SingleAgentWriter,
+            )
+            .is_err());
+        let mut wrong_mode: serde_json::Value =
+            serde_json::from_str(&provisional.codex_policy).unwrap();
+        let legacy: serde_json::Value = serde_json::from_str(CODEX_POLICY_BYTES).unwrap();
+        wrong_mode["selectors"][0]["contracts"]
+            .as_array_mut()
+            .unwrap()
+            .push(legacy["selectors"][0]["contracts"][0].clone());
+        assert!(BundleSet::embedded()
+            .with_policy_packs_for_tests(&wrong_mode.to_string(), CLAUDE_POLICY_BYTES)
+            .resolve_policy(
+                Provider::Codex,
+                CURRENT_SINGLE_AGENT_VERSION,
+                PolicyMode::ProviderObservation,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn exact_native_binding_changes_without_changing_profile_policy() {
+        use crate::domain::ProfilePurpose;
+        use crate::providers::codex::{CURRENT_SINGLE_AGENT_VERSION, EXACT_CODEX_VERSION};
+        for purpose in [
+            ProfilePurpose::WorkspaceWriter,
+            ProfilePurpose::RepositoryReader,
+            ProfilePurpose::RepositoryReviewer,
+        ] {
+            let policy = ExecutionPolicy::for_purpose(Provider::Codex, purpose);
+            let profile_hash = policy.content_hash();
+            let adapter_hash = policy.adapter_hash();
+            let resolve = |version| {
+                BundleSet::provisional_native_fixture(version)
+                    .unwrap()
+                    .resolve_policy(Provider::Codex, version, policy.mode)
+                    .unwrap()
+            };
+            let legacy = resolve(EXACT_CODEX_VERSION);
+            let current = resolve(CURRENT_SINGLE_AGENT_VERSION);
+            assert_ne!(legacy.effective_hash, current.effective_hash);
+            assert_eq!(legacy.launch_revision, current.launch_revision);
+            assert_eq!(
+                current.launch_revision.as_deref(),
+                Some(policy.launch_revision.as_str())
+            );
+            assert_eq!(
+                current.native_policy_revision.as_deref(),
+                Some(policy.native_policy_revision.as_str())
+            );
+            let retained: PolicyBinding =
+                serde_json::from_value(serde_json::to_value(&legacy).unwrap()).unwrap();
+            assert_eq!(retained.exact_version, EXACT_CODEX_VERSION);
+            assert_eq!(retained.effective_hash, legacy.effective_hash);
+            assert_ne!(retained.effective_hash, current.effective_hash);
+            let identity = |binding: &PolicyBinding| crate::providers::SingleAgentNativeIdentity {
+                provider: Provider::Codex,
+                executable: crate::domain::ExecutableFingerprint {
+                    canonical_path: "/fixture/codex".into(),
+                    device: 1,
+                    inode: 2,
+                    bytes: 3,
+                    modified_seconds: 4,
+                    modified_nanos: 5,
+                },
+                executable_version: binding.exact_version.clone(),
+                account_identity: None,
+                config_identity: serde_json::json!({"fixture": true}),
+                security_policy: serde_json::json!({"fixture": true}),
+                hook_revision: "same-hook-revision".into(),
+                policy_binding_hash: binding.effective_hash.clone(),
+            };
+            assert_ne!(
+                serde_json::to_value(identity(&legacy)).unwrap(),
+                serde_json::to_value(identity(&current)).unwrap(),
+            );
+            let mut changed_binding = identity(&legacy);
+            changed_binding.policy_binding_hash = current.effective_hash.clone();
+            assert_ne!(
+                serde_json::to_value(identity(&legacy)).unwrap(),
+                serde_json::to_value(changed_binding).unwrap(),
+            );
+            let unchanged = ExecutionPolicy::for_purpose(Provider::Codex, purpose);
+            assert_eq!(profile_hash, unchanged.content_hash());
+            assert_eq!(adapter_hash, unchanged.adapter_hash());
+        }
+    }
+
+    #[test]
+    fn persisted_policy_binding_without_revision_fields_preserves_its_authority() {
+        let binding = BundleSet::embedded()
+            .resolve_policy(
+                Provider::Codex,
+                CODEX_EXACT_VERSION,
+                PolicyMode::SingleAgentWriter,
+            )
+            .unwrap();
+        let mut original = serde_json::to_value(&binding).unwrap();
+        original.as_object_mut().unwrap().remove("launch_revision");
+        original
+            .as_object_mut()
+            .unwrap()
+            .remove("native_policy_revision");
+        let restored: PolicyBinding = serde_json::from_value(original.clone()).unwrap();
+        assert!(restored.launch_revision.is_none());
+        assert!(restored.native_policy_revision.is_none());
+        assert_eq!(restored.effective_hash, binding.effective_hash);
+        assert_eq!(serde_json::to_value(&restored).unwrap(), original);
+    }
 
     #[test]
     fn conversation_split_release_requires_exact_complete_reviewed_summary() {

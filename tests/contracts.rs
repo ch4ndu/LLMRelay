@@ -530,6 +530,312 @@ fn m4a_backup_captures_wal_and_rejects_changed_snapshot_bytes() {
 }
 
 #[test]
+fn m4a_knowledge_roundtrip_retains_manifests_but_requires_revalidation_and_sanitizes_export() {
+    use agenticjira::domain::{
+        KnowledgeManifestBinding, KnowledgeMutationRequest, KnowledgeUserActor,
+    };
+    let source = Fixture::new("m4a-knowledge");
+    seed_attempt(&source, "planning");
+    source.execute_batch(
+        "UPDATE tasks SET lifecycle='backlog' WHERE id='t';
+        UPDATE attempts SET status='completed' WHERE id='a';
+        INSERT INTO task_comments(id,task_id,body,actor_kind,created_at)
+        VALUES('knowledge-source','t','PRIVATE-KNOWLEDGE-SOURCE-SENTINEL','human','now');",
+    );
+    let actor = KnowledgeUserActor {
+        user_id: "fixture-human".into(),
+    };
+    let draft: KnowledgeMutationRequest = serde_json::from_value(serde_json::json!({
+        "operation_id":"roundtrip-draft", "project_id":"p", "mutation":{"kind":"draft",
+        "entry_id":null,"expected_version":null,"body":{"title":"PRIVATE-KNOWLEDGE-TITLE",
+        "statement":"PRIVATE-KNOWLEDGE-STATEMENT-SENTINEL","category":"PRIVATE-KNOWLEDGE-CATEGORY",
+        "tags":["PRIVATE-KNOWLEDGE-TAG"],"sources":[{"kind":"historical","source":{
+            "task_id":"t","attempt_id":null,"kind":"comment","id":"knowledge-source"}},
+            {"kind":"user_assertion"}]}}}))
+    .unwrap();
+    let entry = source.store.knowledge_mutate(&actor, &draft).unwrap();
+    let approve = serde_json::from_value(serde_json::json!({
+        "operation_id":"roundtrip-approve","project_id":"p","mutation":{"kind":"approve",
+        "entry_id":entry.id,"expected_version":entry.version,"revision_id":entry.latest_draft_id,
+        "replaces_revision_id":null}}))
+    .unwrap();
+    let entry = source.store.knowledge_mutate(&actor, &approve).unwrap();
+    let revision = entry.approved_revision_id.as_ref().unwrap();
+    let selection = vec![task_knowledge_selection(&source, &entry)];
+    let request = task_knowledge_request(&source, "p", "t", selection.clone(), None);
+    let preview = source.store.knowledge_preview(&request).unwrap();
+    {
+        let mut connection = source.connection();
+        let tx = connection.transaction().unwrap();
+        let manifest = agenticjira::knowledge::prepare_knowledge_manifest_in(
+            &tx,
+            &request,
+            &preview.fingerprint,
+            KnowledgeManifestBinding::TaskAttempt {
+                attempt_id: "a".into(),
+            },
+        )
+        .unwrap();
+        agenticjira::knowledge::insert_knowledge_manifest_in(&tx, &manifest).unwrap();
+        tx.commit().unwrap();
+    }
+    // Use the existing reservation seam without launching a native process.
+    let identity_json = serde_json::json!({
+        "executable":{"canonical_path":"/synthetic/provider","device":1,"inode":2,"bytes":3,"modified_seconds":0,"modified_nanos":0},
+        "executable_version":"synthetic","schema_hash":"schema","adapter_revision":"adapter","adapter_hash":"adapter-hash",
+        "profile":{"id":"knowledge-profile","project_id":"p","execution_config_revision_id":"knowledge-config","model":"model","effort":"medium",
+            "instructions":"instructions","instructions_hash":"instructions","profile_hash":"profile"},
+        "repository_identity":"/tmp/identity","repository_root":"/tmp/project","guidance_hash":"guidance",
+        "execution_config_hash":"config","policy_hash":"policy","credential_contract":"contract",
+        "configuration_hash":"configuration","release_binding":"release","instance_id":"instance","restore_epoch":"epoch"
+    });
+    source.execute_batch("INSERT INTO execution_config_revisions(id,project_id,revision,config_json,content_hash,approved_at,created_at)
+        VALUES('knowledge-config','p',1,'{}','config','now','now');
+        INSERT INTO conversation_profiles(id,project_id,execution_config_revision_id,profile_json,profile_hash,created_at)
+        VALUES('knowledge-profile','p','knowledge-config','{}','profile','now');");
+    source.execute("INSERT INTO conversation_admissions(id,profile_revision_id,identity_json,identity_hash,state,created_at,updated_at)
+        VALUES('knowledge-admission','knowledge-profile',?1,?2,'active','now','now')",
+        params![identity_json.to_string(), agenticjira::store::json_hash(&identity_json).unwrap()]);
+    source.execute("INSERT INTO conversations(id,project_id,admission_id,identity_json,identity_hash,generation,native_thread_id,state,created_at,updated_at)
+        VALUES('knowledge-conversation','p','knowledge-admission',?1,'identity','knowledge-generation','thread','idle','now','now')",
+        [identity_json.to_string()]);
+    source.execute("INSERT INTO sessions(id,conversation_id,provider,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at,workflow_version)
+        VALUES('knowledge-session','knowledge-conversation','codex','running',?1,'synthetic','knowledge-generation','now','now','conversation_v1')",
+        [identity_json.to_string()]);
+    source.execute_batch("INSERT INTO conversation_reservations(conversation_id,session_id,repository_identity,state,created_at,updated_at)
+        VALUES('knowledge-conversation','knowledge-session','/tmp/identity','running','now','now');");
+    let operation = serde_json::json!({"action":"submit","operation_id":"knowledge-submit",
+        "conversation_id":"knowledge-conversation","input":"PRIVATE-KNOWLEDGE-USER-INPUT"});
+    let conversation_request = serde_json::from_value(serde_json::json!({
+        "project_id":"p","consumer":{"kind":"conversation","conversation_id":"knowledge-conversation",
+        "operation_kind":"submit","operation":operation},"expected_consumer_version":0,
+        "user_text":"PRIVATE-KNOWLEDGE-USER-INPUT","selection":selection})).unwrap();
+    let conversation_preview = source
+        .store
+        .knowledge_preview(&conversation_request)
+        .unwrap();
+    let confirmed = serde_json::json!({"action":"with_knowledge","operation_id":"knowledge-submit",
+        "operation":operation,"project_id":"p","expected_consumer_version":0,
+        "selection":selection,"preview_fingerprint":conversation_preview.fingerprint});
+    let (receipt, fresh) = source
+        .store
+        .conversation_reserve_input(
+            "knowledge-submit",
+            &confirmed,
+            "knowledge-conversation",
+            "PRIVATE-KNOWLEDGE-USER-INPUT",
+            None,
+        )
+        .unwrap();
+    assert!(fresh);
+    let conversation_id = receipt["conversation_id"].as_str().unwrap();
+    let manifests_sql = "SELECT json_group_array(json_object('id',id,'body',manifest_json,'hash',manifest_hash)) FROM (SELECT * FROM knowledge_manifests ORDER BY id)";
+    let manifests = source.scalar::<String>(manifests_sql);
+    let revision_json = source.scalar::<String>("SELECT body_json FROM knowledge_revisions");
+    let receipts_sql = "SELECT json_group_array(result_json) FROM (SELECT result_json FROM knowledge_operation_receipts ORDER BY operation_id)";
+    let receipts = source.scalar::<String>(receipts_sql);
+    let events =
+        serde_json::to_value(source.store.knowledge_history("p", &entry.id, 0).unwrap()).unwrap();
+    let observations = source.scalar::<i64>("SELECT COUNT(*) FROM knowledge_observations");
+    let retained_observations_sql = "SELECT json_group_array(observation_json) FROM (SELECT observation_json FROM knowledge_observations WHERE json_extract(observation_json,'$.restore_operation_id') IS NULL ORDER BY rowid)";
+    let retained_observations = source.scalar::<String>(retained_observations_sql);
+    let mut paths = m4a_paths("knowledge-source");
+    paths.database = source.database.clone();
+    paths.state = source.root.clone();
+    let backup = m4a_backup_path(&database::backup(&paths, None).unwrap());
+    let snapshot = Connection::open_with_flags(
+        backup.join("database.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    assert_eq!(
+        snapshot
+            .query_row(manifests_sql, [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        manifests
+    );
+    assert_eq!(
+        snapshot
+            .query_row("SELECT body_json FROM knowledge_revisions", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        revision_json
+    );
+    assert_eq!(
+        snapshot
+            .query_row(receipts_sql, [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        receipts
+    );
+    assert_eq!(
+        snapshot
+            .query_row(retained_observations_sql, [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        retained_observations
+    );
+    assert_eq!(
+        snapshot
+            .query_row(
+                "SELECT body FROM task_comments WHERE id='knowledge-source'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "PRIVATE-KNOWLEDGE-SOURCE-SENTINEL"
+    );
+    drop(snapshot);
+    let target = m4a_paths("knowledge-target");
+    database::restore(&target, &backup).unwrap();
+    let restored = Fixture {
+        root: target.root.clone(),
+        database: target.database.clone(),
+        store: Store::open(&target.database).unwrap(),
+        synthetic_bundles: None,
+    };
+    assert_eq!(restored.scalar::<String>(manifests_sql), manifests);
+    assert_eq!(
+        restored.scalar::<String>("SELECT body_json FROM knowledge_revisions"),
+        revision_json
+    );
+    assert_eq!(restored.scalar::<String>(receipts_sql), receipts);
+    assert_eq!(
+        restored.scalar::<String>(retained_observations_sql),
+        retained_observations
+    );
+    for retained in serde_json::from_str::<Vec<serde_json::Value>>(&manifests).unwrap() {
+        let historical = restored
+            .store
+            .knowledge_manifest("p", retained["id"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(historical).unwrap(),
+            serde_json::from_str::<serde_json::Value>(retained["body"].as_str().unwrap()).unwrap()
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(restored.store.knowledge_history("p", &entry.id, 0).unwrap()).unwrap(),
+        events
+    );
+    assert_eq!(
+        restored.scalar::<i64>("SELECT COUNT(*) FROM knowledge_observations"),
+        observations + 1
+    );
+    assert_eq!(
+        restored
+            .store
+            .knowledge_entry("p", &entry.id)
+            .unwrap()
+            .approved_revision_id
+            .as_ref(),
+        Some(revision)
+    );
+    let observation = restored
+        .store
+        .knowledge_freshness("p", &entry.id, revision)
+        .unwrap();
+    assert_eq!(
+        observation.state,
+        agenticjira::domain::KnowledgeFreshness::NeedsRevalidation
+    );
+    assert!(observation.restore_operation_id.is_some());
+    assert!(restored
+        .store
+        .knowledge_preview(&request)
+        .unwrap_err()
+        .to_string()
+        .contains("Revalidate"));
+    let mut new_request = request.clone();
+    new_request.selection[0].observation_fingerprint = observation.fingerprint.clone();
+    new_request.selection[0].acknowledged_warning = true;
+    assert!(restored
+        .store
+        .knowledge_preview(&new_request)
+        .unwrap_err()
+        .to_string()
+        .contains("Revalidate"));
+    let refreshed = restored
+        .store
+        .knowledge_revalidate(
+            &actor,
+            "p",
+            "roundtrip-refresh",
+            &entry.id,
+            revision,
+            entry.version,
+            &observation.fingerprint,
+        )
+        .unwrap();
+    assert_eq!(
+        refreshed.state,
+        agenticjira::domain::KnowledgeFreshness::Verified
+    );
+    new_request.selection[0].observation_fingerprint = refreshed.fingerprint;
+    restored.store.knowledge_preview(&new_request).unwrap();
+    assert_eq!(restored.scalar::<String>(manifests_sql), manifests);
+    // Revalidation is a source observation, never an execution or resume grant.
+    assert!(
+        Scheduler::new(restored.store.clone(), target.artifacts.clone())
+            .claim_next()
+            .unwrap_err()
+            .to_string()
+            .contains("database restore hold")
+    );
+    assert!(restored
+        .store
+        .conversation_send_intent(
+            conversation_id,
+            receipt["generation"].as_str().unwrap(),
+            "knowledge-submit"
+        )
+        .is_err());
+    let delete = HumanCommand::DeleteDraftTask {
+        operation_id: "delete-knowledge-history".into(),
+        task_id: "t".into(),
+        expected_version: 1,
+    };
+    assert!(workflow::execute(&source.store, &delete)
+        .unwrap_err()
+        .to_string()
+        .contains("never started"));
+    let state = workflow::state(&source.store).unwrap();
+    assert!(
+        !state
+            .tasks
+            .iter()
+            .find(|task| task.id == "t")
+            .unwrap()
+            .draft_deletion
+            .as_ref()
+            .unwrap()
+            .allowed
+    );
+    let connection = source.connection();
+    connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    for sql in [
+        "DELETE FROM attempts WHERE id='a'",
+        "DELETE FROM projects WHERE id='p'",
+        "DELETE FROM conversation_operations WHERE operation_id='knowledge-submit'",
+        "DELETE FROM knowledge_manifests",
+        "DELETE FROM knowledge_manifest_items",
+    ] {
+        assert!(connection.execute(sql, []).is_err(), "allowed {sql}");
+    }
+    drop(connection);
+    assert_eq!(source.scalar::<String>(manifests_sql), manifests);
+    assert_eq!(restored.scalar::<String>(manifests_sql), manifests);
+    let output = target.root.join("sanitized-knowledge.zip");
+    agenticjira::export::export_sanitized(&target, &output).unwrap();
+    let exported = String::from_utf8_lossy(&std::fs::read(&output).unwrap()).into_owned();
+    assert!(!exported.contains("PRIVATE-KNOWLEDGE-"), "{exported}");
+    assert!(exported.contains(
+        &source.scalar::<String>("SELECT id FROM knowledge_manifests WHERE attempt_id='a'")
+    ));
+    assert!(exported.contains(&preview.block_hash));
+    assert!(exported.contains("Frozen and available in context"));
+}
+
+#[test]
 fn m4a_restore_revokes_old_authority_and_persists_execution_hold() {
     let source = Fixture::new("m4a-authority-source");
     seed_attempt(&source, "implementation");
@@ -688,6 +994,7 @@ fn m4a_restore_revokes_old_authority_and_persists_execution_hold() {
     let mut decision_connection = Connection::open(&target.database).unwrap();
     let decision_tx = decision_connection.transaction().unwrap();
     let decision_error = agenticjira::permissions::apply_human_decision(
+        &restored,
         &decision_tx,
         "held-decision",
         "missing-request",
@@ -1630,6 +1937,20 @@ fn ambiguous_conversation_delivery_keeps_ownership_and_never_resubmits() {
         .conversation_reserve_input("send-once", &request, "cc", "question", None)
         .unwrap();
     assert!(fresh);
+    assert_eq!(
+        fixture.scalar::<i64>("SELECT COUNT(*) FROM knowledge_manifests"),
+        0
+    );
+    let stored: String = connection
+        .query_row(
+            "SELECT input_json FROM conversation_operations WHERE operation_id='send-once'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
+    assert_eq!(stored["message"], "question");
+    assert_eq!(stored["assembled_input"], "question");
     let mut submissions = 0;
     let (thread, message, _, _) = fixture
         .store
@@ -20692,6 +21013,36 @@ fn scheduled_intake_bounds_missed_fires_and_deduplicates() {
         fire,
         ("task_created".into(), 5, "2026-09-25T09:00:00Z".into())
     );
+    let history = fixture.scalar::<String>(
+        "SELECT json_array(schedule_id,scheduled_for_utc,recipe_revision_id,outcome,task_id,
+         reason,missed_first_utc,missed_last_utc,missed_count,created_at) FROM recipe_schedule_fires",
+    );
+    restore_schema_47_schedule_storage(&fixture);
+    assert!(Store::open_current_readonly(&fixture.database).is_err());
+    let upgraded = Store::open(&fixture.database).unwrap();
+    fixture.assert_scalar("PRAGMA user_version", 50_i64);
+    fixture.assert_scalar(
+        "SELECT json_array(schedule_id,scheduled_for_utc,recipe_revision_id,outcome,task_id,
+         reason,missed_first_utc,missed_last_utc,missed_count,created_at) FROM recipe_schedule_fires",
+        history,
+    );
+    fixture.assert_scalar("SELECT COUNT(*) FROM recipe_schedules WHERE mode='create_draft' AND active_authorization_id IS NULL", 1_i64);
+    fixture.assert_scalar("SELECT COUNT(*) FROM recipe_schedule_authorizations", 0_i64);
+    fixture.assert_scalar("SELECT COUNT(*) FROM recipe_schedule_fires WHERE authorization_id IS NULL AND allowance_reserved=0 AND invocations_spent=0 AND length(id)>0", 1_i64);
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM tasks WHERE lifecycle!='backlog'",
+        0_i64,
+    );
+    assert_eq!(
+        workflow::state(&upgraded).unwrap().recipe_schedules[0]["mode"],
+        "create_draft"
+    );
+    assert_eq!(
+        app.scheduled_intake_tick(time("2026-09-25T09:00:00Z"), time("2026-09-24T12:00:00Z"))
+            .unwrap(),
+        0
+    );
+    drop(upgraded);
     let drain_result = app.begin_drain();
     assert!(!app.dispatch_enabled());
     assert!(app.restart_preview().unwrap().snapshot.draining);
@@ -30166,6 +30517,21 @@ fn ordinary_role_context_exposes_exact_bounded_contract_without_new_authority() 
     let paths = instance_paths(&fixture);
     let project = add_project(&fixture, fixture.repository("repo"), "context");
     let task = create_task(&fixture, &project, "context-task", 1);
+    let knowledge = approved_task_knowledge(
+        &fixture,
+        &project,
+        "The context must contain this exact approved statement",
+    );
+    confirm_task_knowledge(
+        &fixture,
+        task_knowledge_request(
+            &fixture,
+            &project,
+            &task,
+            vec![task_knowledge_selection(&fixture, &knowledge)],
+            None,
+        ),
+    );
     let plan = claim(&fixture, paths.artifacts.clone());
     seed_session(
         &fixture,
@@ -30320,6 +30686,13 @@ fn ordinary_role_context_exposes_exact_bounded_contract_without_new_authority() 
     .unwrap();
 
     let context = app.role_context_payload(&manager).unwrap();
+    let frozen: String = fixture.scalar(&format!("SELECT json_extract(manifest_json,'$.preview.block') FROM knowledge_manifests WHERE attempt_id='{}'", plan.attempt_id));
+    assert_eq!(context["task"]["knowledge"], frozen);
+    archive_task_knowledge(&fixture, &knowledge);
+    assert_eq!(
+        app.role_context_payload(&manager).unwrap()["task"]["knowledge"],
+        frozen
+    );
     let initial_index = app.role_context_delivery_payload(&manager, None).unwrap();
     assert_eq!(
         initial_index,
@@ -38422,168 +38795,6 @@ fn app_wide_provider_model_starts_require_a_project_without_reserving_authority(
     );
     assert!(!paths.artifacts.join("provider-validation").exists());
 }
-
-/// A static argument contract only; it is not evidence that the native
-/// provider honors these options, which stays with native qualification.
-#[test]
-fn provider_check_candidate_arguments_request_no_tools_and_no_customization() {
-    let _home_guard = SYNTHETIC_CODEX_HOME_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    install_synthetic_codex_home();
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
-    let root = home.join(format!(
-        "agenticjira-provider-check-argv-{}",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    let home_alias = root.join("home-alias");
-    std::os::unix::fs::symlink(&home, &home_alias).unwrap();
-    let scope = home_alias.join(root.file_name().unwrap());
-    providers::codex::inspect_observation_account(&scope, providers::codex::EXACT_CODEX_VERSION)
-        .unwrap();
-    let bundles = agenticjira::provider_compatibility::BundleSet::embedded();
-    let launch = |provider: Provider, version: &str| {
-        let installation = providers::ProviderInstallation {
-            provider,
-            executable: agenticjira::domain::ExecutableFingerprint {
-                canonical_path: format!("/synthetic/{provider}").into(),
-                device: 1,
-                inode: 2,
-                bytes: 3,
-                modified_seconds: 4,
-                modified_nanos: 5,
-            },
-            executable_version: version.to_owned(),
-        };
-        let policy = bundles
-            .resolve_policy(
-                provider,
-                version,
-                agenticjira::provider_compatibility::PolicyMode::ProviderObservation,
-            )
-            .unwrap();
-        assert!(
-            policy.native_calls_disabled_reason().is_some(),
-            "the shipped contract stays unqualified"
-        );
-        providers::prepare_observation_launch(
-            &installation,
-            policy,
-            "model-a",
-            "low",
-            &scope,
-            "check prompt",
-            std::path::Path::new("/synthetic/llmrelay"),
-        )
-    };
-    let has = |arguments: &[String], expected: &[&str]| {
-        arguments.windows(expected.len()).any(|window| {
-            window
-                .iter()
-                .map(String::as_str)
-                .eq(expected.iter().copied())
-        })
-    };
-
-    let codex = launch(Provider::Codex, providers::codex::EXACT_CODEX_VERSION).unwrap();
-    for expected in [
-        &["exec", "--strict-config"][..],
-        &["--ephemeral"],
-        &["--ignore-user-config"],
-        &["--ignore-rules"],
-        &["--disable", "shell_tool"][..],
-        &["--disable", "unified_exec"],
-        &["--disable", "view_image"],
-        &["--disable", "sleep_tool"],
-        &["--disable", "tool_suggest"],
-        &["--disable", "goals"],
-        &["--disable", "workspace_dependencies"],
-        &["--sandbox", "read-only"],
-        &["--config", "approval_policy=\"never\""],
-        &["--config", "cli_auth_credentials_store=\"file\""],
-        &["--config", "features.hooks=false"],
-        &["--config", "web_search=\"disabled\""],
-        &["--config", "project_doc_max_bytes=0"],
-        &["--config", "features.skip_host_skill_discovery=true"],
-    ] {
-        assert!(
-            has(&codex.arguments, expected),
-            "{expected:?}: {:?}",
-            codex.arguments
-        );
-    }
-    assert!(codex.environment.is_empty());
-    assert!(!codex
-        .arguments
-        .iter()
-        .any(|argument| argument.starts_with("tools.view_image=")));
-    let mcp_overrides = codex
-        .arguments
-        .windows(2)
-        .filter(|pair| pair[0] == "--config" && pair[1].starts_with("mcp_servers="))
-        .collect::<Vec<_>>();
-    assert_eq!(mcp_overrides.len(), 1);
-    let override_config = mcp_overrides[0][1].parse::<toml::Value>().unwrap();
-    let servers = override_config["mcp_servers"].as_table().unwrap();
-    for name in ["plain", "quoted.dot", "rocket🚀"] {
-        assert!(
-            !servers.contains_key(name),
-            "ignored user server {name} was recreated"
-        );
-    }
-    assert!(servers
-        .values()
-        .all(|server| server.get("enabled").and_then(toml::Value::as_bool) == Some(false)));
-
-    let claude = launch(Provider::Claude, providers::claude::EXACT_CLAUDE_VERSION).unwrap();
-    for expected in [
-        &["--safe-mode"][..],
-        &["--no-session-persistence"],
-        &["--tools", ""],
-        &["--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}"],
-        &["--disable-slash-commands"],
-    ] {
-        assert!(
-            has(&claude.arguments, expected),
-            "{expected:?}: {:?}",
-            claude.arguments
-        );
-    }
-    for launch in [&codex, &claude] {
-        assert_eq!(
-            launch.arguments.last().map(String::as_str),
-            Some("check prompt")
-        );
-        assert!(launch
-            .environment
-            .iter()
-            .all(|(key, _)| !key.starts_with("AGENTICJIRA_")));
-        assert_eq!(launch.process().cwd, scope.as_path());
-    }
-    std::fs::create_dir(scope.join(".codex")).unwrap();
-    std::fs::write(
-        scope.join(".codex/config.toml"),
-        "[mcp_servers.\"quoted.dot\"]\nenabled = true\n",
-    )
-    .unwrap();
-    let account_error = providers::codex::inspect_observation_account(
-        &scope,
-        providers::codex::EXACT_CODEX_VERSION,
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(account_error.contains("conditional server name"));
-    assert!(account_error.contains("user configuration is ignored"));
-    assert_eq!(
-        launch(Provider::Codex, providers::codex::EXACT_CODEX_VERSION)
-            .unwrap_err()
-            .to_string(),
-        account_error
-    );
-    std::fs::remove_dir_all(root).unwrap();
-}
-
 /// A synthetic store whose Single agent writer contracts are qualified. It
 /// proves service-owned transitions only; native spawn still refuses it.
 fn single_agent_fixture(name: &str) -> (Fixture, PathBuf) {
@@ -38811,9 +39022,6 @@ fn prepare_single_agent_fixture_turn(
     providers::SingleAgentLaunch,
 ) {
     let paths = instance_paths(fixture);
-    ReviewService::new(fixture.store.clone(), paths.artifacts.clone())
-        .prepare_research_baseline(&context.attempt_id)
-        .unwrap();
     let hooks = test_hooks(fixture);
     let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
     let bundles = single_agent_bundles();
@@ -38890,20 +39098,12 @@ fn start_single_agent_fixture_turn(
 
 // Only offline fixtures seed activation; this is never native admission proof.
 fn offline_purpose_profile(fixture: &Fixture, setup: &SingleAgentSetup, purpose: &str) -> String {
-    let saved = workflow_command(fixture,serde_json::json!({
-        "kind":"save_agent_profile","operation_id":format!("profile-{purpose}"),"project_id":setup.project_id,
-        "profile":{"display_name":purpose,"purpose":purpose,"provider":"codex","model":"gpt-fixture","effort":"medium","instructions_text":""}
-    })).unwrap();
-    let revision = saved.detail["profile_revision_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let admission = workflow_command(fixture,serde_json::json!({
-        "kind":"prepare_profile_admission","operation_id":format!("prepare-{purpose}"),"project_id":setup.project_id,
-        "profile_revision_id":revision,"execution_config_revision_id":setup.config_id
-    })).unwrap();
-    fixture.execute("UPDATE profile_admissions SET state='activated',capability_key='stage-c-offline-only',proof_hash='offline fixture',activated_at=created_at WHERE id=?1",[&admission.entity_id]);
-    revision
+    let id = format!("historical-{purpose}");
+    fixture.execute("INSERT INTO agent_profiles(id,project_id,display_name,created_at,updated_at) VALUES(?1,?2,?1,'now','now')",params![id,setup.project_id]);
+    fixture.execute("INSERT INTO agent_profile_revisions(id,profile_id,revision,provider,adapter_id,adapter_hash,model,effort,instructions_text,instructions_hash,policy_id,policy_revision,policy_hash,authority,session_contract,profile_hash,created_at,purpose)
+        SELECT ?1,?1,1,provider,adapter_id,adapter_hash,model,effort,instructions_text,instructions_hash,policy_id,policy_revision,policy_hash,'read_only',CASE WHEN ?2='repository_reviewer' THEN 'fresh' ELSE 'retained' END,profile_hash,'now',?2 FROM agent_profile_revisions WHERE id=?3",
+        params![id,purpose,setup.profile_revision_id]);
+    id
 }
 
 fn single_agent_report(
@@ -43204,6 +43404,122 @@ fn single_agent_rework_links_a_fresh_child_and_keeps_the_parent_result() {
 }
 
 #[test]
+fn prepared_knowledge_is_consumed_and_the_next_rework_targets_the_child() {
+    let (fixture, repository) = single_agent_fixture("knowledge-successive-rework");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let (task, _) = single_agent_task(&fixture, &setup);
+    let entry = approved_task_knowledge(&fixture, &setup.project_id, "Child reference");
+    let request = task_knowledge_request(
+        &fixture,
+        &setup.project_id,
+        &task,
+        vec![task_knowledge_selection(&fixture, &entry)],
+        None,
+    );
+    let saved = confirm_task_knowledge(&fixture, request);
+    make_ready(&fixture, &task, saved.version.unwrap()).unwrap();
+    let (parent, _) = running_single_agent(&fixture, &task);
+    let parent_manifest: String = fixture.scalar(&format!(
+        "SELECT manifest_json FROM knowledge_manifests WHERE attempt_id='{}'",
+        parent.attempt_id
+    ));
+    let app = single_agent_application(&fixture);
+    let parent_result =
+        finish_single_agent_writer(&fixture, &app, &parent, "fixture.txt", "parent result\n");
+    let request = task_knowledge_request(
+        &fixture,
+        &setup.project_id,
+        &task,
+        vec![task_knowledge_selection(&fixture, &entry)],
+        Some((
+            &parent.attempt_id,
+            "single_agent_rework",
+            parent_result["result_binding_id"].as_str().unwrap(),
+        )),
+    );
+    let preview = fixture.store.knowledge_preview(&request).unwrap();
+    let command: HumanCommand = serde_json::from_value(serde_json::json!({"kind":"prepare_next_run_knowledge","request":{
+        "operation_id":"prepare-parent-a","project_id":setup.project_id,"task_id":task,
+        "parent_attempt_id":parent.attempt_id,"continuation_kind":"single_agent_rework",
+        "expected_task_version":request.expected_consumer_version,"expected_preparation_version":null,
+        "parent_result_binding_id":parent_result["result_binding_id"],"parent_review_binding_id":null,
+        "selection":request.selection,"preview_fingerprint":preview.fingerprint,"action":"save_and_continue_rework"
+    }})).unwrap();
+    let created = workflow::execute(&fixture.store, &command).unwrap();
+    let child = created.detail["child_attempt_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM tasks WHERE knowledge_preparation_json IS NOT NULL",
+        0_i64,
+    );
+    let child_manifest: String = fixture.scalar(&format!(
+        "SELECT manifest_json FROM knowledge_manifests WHERE attempt_id='{child}'"
+    ));
+    assert_eq!(
+        workflow::execute(&fixture.store, &command).unwrap().detail,
+        created.detail
+    );
+    tick_until(&fixture, &app, "rework_materialized");
+    let child_context = start_single_agent_fixture_turn(
+        &fixture,
+        fixture.store.single_agent_launch_context(&child).unwrap(),
+    );
+    let running = workflow::state(&fixture.store).unwrap();
+    let task_projection = running.tasks.iter().find(|item| item.id == task).unwrap();
+    assert!(task_projection.knowledge["preparation"].is_null());
+    assert_eq!(
+        task_projection.active_attempt.as_ref().unwrap()["id"],
+        child
+    );
+    let result = finish_single_agent_writer(
+        &fixture,
+        &app,
+        &child_context,
+        "fixture.txt",
+        "child result\n",
+    );
+    let request = task_knowledge_request(
+        &fixture,
+        &setup.project_id,
+        &task,
+        vec![task_knowledge_selection(&fixture, &entry)],
+        Some((
+            &child,
+            "single_agent_rework",
+            result["result_binding_id"].as_str().unwrap(),
+        )),
+    );
+    let preview = fixture.store.knowledge_preview(&request).unwrap();
+    let next: HumanCommand = serde_json::from_value(serde_json::json!({"kind":"prepare_next_run_knowledge","request":{
+        "operation_id":"prepare-child-b","project_id":setup.project_id,"task_id":task,
+        "parent_attempt_id":child,"continuation_kind":"single_agent_rework",
+        "expected_task_version":request.expected_consumer_version,"expected_preparation_version":null,
+        "parent_result_binding_id":result["result_binding_id"],"parent_review_binding_id":null,
+        "selection":request.selection,"preview_fingerprint":preview.fingerprint,"action":"save_only"
+    }})).unwrap();
+    workflow::execute(&fixture.store, &next).unwrap();
+    fixture.assert_scalar("SELECT json_extract(knowledge_preparation_json,'$.parent_attempt_id') FROM tasks WHERE knowledge_preparation_json IS NOT NULL", child.clone());
+    assert_eq!(
+        workflow::execute(&fixture.store, &command).unwrap().detail,
+        created.detail
+    );
+    fixture.assert_scalar("SELECT COUNT(*) FROM rework_intents", 1_i64);
+    fixture.assert_scalar(
+        &format!("SELECT manifest_json FROM knowledge_manifests WHERE attempt_id='{child}'"),
+        child_manifest,
+    );
+    fixture.assert_scalar(
+        &format!(
+            "SELECT manifest_json FROM knowledge_manifests WHERE attempt_id='{}'",
+            parent.attempt_id
+        ),
+        parent_manifest,
+    );
+}
+
+#[test]
 fn single_agent_selection_admission_and_profiles_are_exact() {
     let (fixture, repository) = single_agent_fixture("single-agent-admission");
     let setup = admitted_single_agent_project(&fixture, &repository);
@@ -43411,12 +43727,10 @@ fn finish_single_agent_writer(
 fn single_agent_presets_recipe_definitions_and_draft_schedule_are_idempotent() {
     let (fixture, repository) = single_agent_fixture("preset-recipes");
     let setup = admitted_single_agent_project(&fixture, &repository);
-    let reader = offline_purpose_profile(&fixture, &setup, "repository_reader");
-    let reviewer = offline_purpose_profile(&fixture, &setup, "repository_reviewer");
     let app = single_agent_application(&fixture);
     for (preset, primary) in [
         ("single_agent", setup.profile_revision_id.as_str()),
-        ("repository_research", reader.as_str()),
+        ("repository_research", setup.profile_revision_id.as_str()),
         ("build_and_review", setup.profile_revision_id.as_str()),
     ] {
         let mut selection = serde_json::json!({
@@ -43424,7 +43738,7 @@ fn single_agent_presets_recipe_definitions_and_draft_schedule_are_idempotent() {
             "profile_revision_id":primary,"execution_config_revision_id":setup.config_id,"check_ids":[]
         });
         if preset == "build_and_review" {
-            selection["reviewer_profile_revision_id"] = reviewer.clone().into();
+            selection["reviewer_profile_revision_id"] = setup.profile_revision_id.clone().into();
         }
         let command: HumanCommand = serde_json::from_value(serde_json::json!({
             "kind":"upsert_single_agent_recipe","operation_id":format!("recipe-{preset}"),
@@ -43433,6 +43747,13 @@ fn single_agent_presets_recipe_definitions_and_draft_schedule_are_idempotent() {
                 "priority":0,"acceptance_criteria":["Evidence reviewed"],"selection":selection}
         }))
         .unwrap();
+        if preset != "single_agent" {
+            assert!(workflow::execute(&fixture.store, &command)
+                .unwrap_err()
+                .to_string()
+                .contains("retired"));
+            continue;
+        }
         let recipe = workflow::execute(&fixture.store, &command).unwrap();
         let draft = HumanCommand::CreateDraftFromRecipe {
             operation_id: format!("draft-{preset}"),
@@ -43459,318 +43780,1078 @@ fn single_agent_presets_recipe_definitions_and_draft_schedule_are_idempotent() {
     }
     let now = chrono::DateTime::parse_from_rfc3339("2030-01-01T09:00:00Z").unwrap();
     let now = now.with_timezone(&chrono::Utc);
-    assert_eq!(app.scheduled_intake_tick(now, now).unwrap(), 3);
+    assert_eq!(app.scheduled_intake_tick(now, now).unwrap(), 1);
     assert_eq!(app.scheduled_intake_tick(now, now).unwrap(), 0);
     fixture.assert_scalar(
         "SELECT COUNT(DISTINCT version) FROM workflow_definitions",
-        3_i64,
+        1_i64,
     );
-    fixture.assert_scalar("SELECT COUNT(*) FROM task_recipe_bindings WHERE family='single_agent' AND config_revision_id IS NULL AND profile_revision_id IS NULL", 6_i64);
+    fixture.assert_scalar("SELECT COUNT(*) FROM task_recipe_bindings WHERE family='single_agent' AND config_revision_id IS NULL AND profile_revision_id IS NULL", 2_i64);
     fixture.assert_scalar("SELECT COUNT(*) FROM tasks t JOIN task_recipe_bindings b ON b.task_id=t.id WHERE t.lifecycle!='backlog'", 0_i64);
     fixture.assert_scalar("SELECT COUNT(*) FROM trip_runtime_admissions", 0_i64);
     fixture.assert_scalar("SELECT COUNT(*) FROM trip_task_profile_activations", 0_i64);
+    let state = workflow::state(&fixture.store).unwrap();
+    assert_eq!(state.recipe_schedules.len(), 1);
+    let schedule = &state.recipe_schedules[0];
+    assert_eq!(schedule["mode"], "create_draft");
+    assert_eq!(schedule["execution_authorization_supported"], false);
+    assert_eq!(schedule["execution_qualification_state"], "unsupported");
+    assert_eq!(
+        schedule["execution_authorization_reason"],
+        "Automatic recipe execution has been retired. Schedules create drafts only."
+    );
+}
+
+fn schedule_reader_recipe(
+    fixture: &Fixture,
+    setup: &SingleAgentSetup,
+    reader: &str,
+    anchor: &str,
+) -> (agenticjira::domain::OperationResult, String) {
+    // Historical input is seeded directly because current mutation APIs reject it.
+    fixture.execute("INSERT INTO workflow_definitions(id,family,version,content_hash,definition_text,evaluator_id,evaluator_revision,result_schema_revision,check_requirement,provenance,created_at)
+        VALUES('llmrelay-repository-research-v1','single_agent','historical','historical','{}','single_agent',1,1,'none','fixture','now')",[]);
+    fixture.execute("INSERT INTO task_recipes(id,project_id,name,current_revision,version,created_at,updated_at) VALUES('historical-recipe',?1,'Research',1,1,'now','now')",[&setup.project_id]);
+    fixture.execute("INSERT INTO task_recipe_revisions(id,recipe_id,revision,title,description,acceptance_criteria_json,priority,required_check_ids_json,configuration_hash,workflow_version,workflow_hash,created_at,family,preset,definition_id,execution_config_revision_id,primary_profile_revision_id,primary_profile_hash)
+        SELECT 'historical-revision','historical-recipe',1,'Inspect','Pinned reader','[\"Evidence\"]',0,'[]','historical','historical','historical','now','single_agent','repository_research','llmrelay-repository-research-v1',?1,id,profile_hash FROM agent_profile_revisions WHERE id=?2",params![setup.config_id,reader]);
+    fixture.execute("INSERT INTO recipe_schedules(id,project_id,name,recipe_revision_id,cadence,anchor_utc,paused,version,created_at,updated_at)
+        VALUES('historical-schedule',?1,'Research','historical-revision','daily',?2,1,1,'now','now')",params![setup.project_id,anchor]);
+    (
+        agenticjira::domain::OperationResult {
+            operation_id: "historical-input".into(),
+            entity_kind: "recipe_schedule".into(),
+            entity_id: "historical-schedule".into(),
+            version: Some(1),
+            state: "paused".into(),
+            detail: serde_json::Value::Null,
+        },
+        "historical-revision".into(),
+    )
+}
+
+fn reserved_research_schedule(
+    name: &str,
+    reserve: bool,
+) -> (
+    Fixture,
+    String,
+    String,
+    agenticjira::store::SingleAgentLaunchContext,
+) {
+    let (fixture, repository) = single_agent_fixture(name);
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let command: HumanCommand = serde_json::from_value(serde_json::json!({
+        "kind":"upsert_single_agent_recipe","operation_id":"historical-writer-recipe",
+        "project_id":setup.project_id,"recipe_id":null,"expected_version":null,
+        "recipe":{"name":"Writer","title":"Inspect","description":"Pinned writer","priority":0,
+            "acceptance_criteria":["Evidence"],"selection":{"family":"single_agent","preset":"single_agent",
+                "workspace_mode":"isolated_worktree","profile_revision_id":setup.profile_revision_id,
+                "execution_config_revision_id":setup.config_id,"check_ids":[]}}
+    })).unwrap();
+    let recipe = workflow::execute(&fixture.store, &command).unwrap();
+    let revision = recipe.detail["revision_id"].as_str().unwrap();
+    let schedule = workflow::execute(
+        &fixture.store,
+        &HumanCommand::UpsertRecipeSchedule {
+            operation_id: "historical-schedule".into(),
+            project_id: setup.project_id.clone(),
+            schedule_id: None,
+            expected_version: None,
+            name: "Historical automatic writer".into(),
+            recipe_revision_id: revision.into(),
+            cadence: "daily".into(),
+            anchor_utc: "2030-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let (task, version) = single_agent_task(&fixture, &setup);
+    make_ready(&fixture, &task, version).unwrap();
+    let plan = scheduler(&fixture, instance_paths(&fixture).artifacts)
+        .claim_next()
+        .unwrap()
+        .unwrap();
+    let context = fixture
+        .store
+        .single_agent_launch_context(&plan.attempt_id)
+        .unwrap();
+    let (context, launch) = prepare_single_agent_fixture_turn(&fixture, context);
+    fixture
+        .store
+        .reserve_single_agent_invocation(&context, &launch)
+        .unwrap();
+    if !reserve {
+        fixture
+            .store
+            .mark_session_spawning(
+                &context.session_id,
+                &context.transcript_epoch,
+                "fixture-boot",
+            )
+            .unwrap();
+        fixture
+            .store
+            .update_session_running(
+                &context.session_id,
+                &context.transcript_epoch,
+                SINGLE_AGENT_PROCESS,
+            )
+            .unwrap();
+    }
+    let first = chrono::Utc::now().to_rfc3339();
+    let deadline = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+    let scope: String = fixture
+        .connection()
+        .query_row(
+            "SELECT json_object('schema',2,'project_id',?2,'preset','single_agent',
+            'workspace_mode','isolated_worktree','max_repair_attempts',0,'check_ids',json('[]'),
+            'recipe',json_object('definition_id',b.definition_id,'workflow_hash',b.definition_hash),
+            'admission',json_object('session_contract',p.session_contract,
+                'execution_config_revision_id',b.execution_config_revision_id,
+                'execution_config_hash',b.execution_config_hash,
+                'profile_revision_id',p.profile_revision_id,'profile_hash',p.profile_hash,
+                'admission_id',p.admission_id,'policy_hash',p.policy_hash))
+         FROM workflow_run_bindings b JOIN workflow_run_profiles p ON p.attempt_id=b.attempt_id
+         WHERE b.attempt_id=?1 AND p.slot_key='single_agent'",
+            params![context.attempt_id, setup.project_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let scope: serde_json::Value = serde_json::from_str(&scope).unwrap();
+    fixture.execute("INSERT INTO recipe_schedule_authorizations(id,project_id,schedule_id,recipe_revision_id,scope_json,scope_hash,max_occurrences,max_invocations_per_occurrence,max_runtime_seconds,start_window_seconds,created_by,created_at)
+        VALUES('historical-grant',?1,?2,?3,?5,?6,2,2,120,3600,'human',?4)",
+        params![setup.project_id,schedule.entity_id,revision,first,scope.to_string(),agenticjira::store::json_hash(&scope).unwrap()]);
+    fixture.execute("UPDATE recipe_schedules SET mode='run_authorized_recipe',active_authorization_id='historical-grant',paused=0,next_fire_utc=?1,version=2 WHERE id=?2",params![first,schedule.entity_id]);
+    fixture.execute("INSERT INTO task_recipe_bindings(task_id,project_id,recipe_revision_id,required_check_ids_json,configuration_hash,workflow_version,workflow_hash,schedule_id,scheduled_for_utc,created_at,family,preset,definition_id,execution_config_revision_id,primary_profile_revision_id,primary_profile_hash)
+        SELECT ?1,?2,id,required_check_ids_json,configuration_hash,workflow_version,workflow_hash,?3,?4,?4,family,preset,definition_id,execution_config_revision_id,primary_profile_revision_id,primary_profile_hash FROM task_recipe_revisions WHERE id=?5",
+        params![task,setup.project_id,schedule.entity_id,first,revision]);
+    fixture.execute("INSERT INTO recipe_schedule_fires(id,schedule_id,scheduled_for_utc,recipe_revision_id,outcome,task_id,authorization_id,attempt_id,allowance_reserved,invocations_spent,first_reserved_at,runtime_deadline_utc,created_at)
+        VALUES('historical-occurrence',?1,?2,?3,'reserved',?4,'historical-grant',?5,1,1,?2,?6,?2)",
+        params![schedule.entity_id,first,revision,task,context.attempt_id,deadline]);
+    fixture.execute("UPDATE sessions SET schedule_occurrence_id='historical-occurrence',schedule_authorization_id='historical-grant' WHERE id=?1",[&context.session_id]);
+    (
+        fixture,
+        setup.project_id,
+        "historical-occurrence".into(),
+        context,
+    )
+}
+
+#[test]
+fn schedule_comparison_lineage_retains_claimed_grant_after_renewal_without_inventing_usage() {
+    use agenticjira::domain::{
+        ComparisonCohort, ComparisonEvidenceFact, ComparisonEvidenceMetric,
+        ComparisonEvidenceQuery, WorkflowComparisonQuery,
+    };
+    let (fixture, project, occurrence, context) =
+        reserved_research_schedule("schedule-comparison-lineage", true);
+    let (schedule, grant, revision): (String, String, String) = fixture.connection().query_row(
+        "SELECT schedule_id,authorization_id,recipe_revision_id FROM recipe_schedule_fires WHERE id=?1",
+        [&occurrence], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    ).unwrap();
+    fixture.execute("INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,
+        status,scope_hash,configuration_hash,workflow_version,workflow_hash,upstream_source_hash,
+        overlay_hash,legacy_migration_required,created_at,updated_at)
+        SELECT 'unrelated-schedule-attempt',task_id,'unrelated-context',phase,base_revision,configuration_revision,
+        'cancelled',scope_hash,configuration_hash,workflow_version,workflow_hash,upstream_source_hash,
+        overlay_hash,legacy_migration_required,created_at,updated_at FROM attempts WHERE id=?1",
+        [&context.attempt_id]);
+    let selection = WorkflowComparisonQuery {
+        cohort: ComparisonCohort::Run,
+        project_id: Some(project.clone()),
+        ..Default::default()
+    };
+    let read = || {
+        let page = agenticjira::comparisons::workflow_comparisons(
+            &fixture.store,
+            selection.clone(),
+            "schedule-lineage",
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for group in &page.groups {
+            let mut cursor = None;
+            loop {
+                let evidence = agenticjira::comparisons::comparison_evidence(
+                    &fixture.store,
+                    ComparisonEvidenceQuery {
+                        selection: serde_json::to_string(&selection).unwrap(),
+                        snapshot: page.snapshot.clone(),
+                        group: group.key.clone(),
+                        metric: ComparisonEvidenceMetric::All,
+                        cursor,
+                    },
+                    "schedule-lineage",
+                )
+                .unwrap();
+                rows.extend(evidence.rows);
+                cursor = evidence.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+        }
+        (page, rows)
+    };
+    let (before, before_rows) = read();
+    let original = before_rows
+        .iter()
+        .find(|row| {
+            row.attempt_id.as_deref() == Some(&context.attempt_id)
+                && matches!(row.fact, ComparisonEvidenceFact::Run { .. })
+        })
+        .unwrap();
+    let origin = original.recipe_attribution.as_ref().unwrap();
+    assert_eq!(origin.authorization_id.as_deref(), Some(grant.as_str()));
+    assert_eq!(origin.occurrence_id.as_deref(), Some(occurrence.as_str()));
+    assert_eq!(
+        origin.root_attempt_id.as_deref(),
+        Some(context.attempt_id.as_str())
+    );
+    assert_eq!(origin.recipe_revision_id, revision);
+    let historical_title = origin.recipe_title.clone();
+    let request = serde_json::from_value(serde_json::json!({
+        "project_id":project,"schedule_id":schedule,
+        "expected_version":fixture.scalar::<i64>("SELECT version FROM recipe_schedules"),
+        "limits":{"max_occurrences":2,"max_invocations_per_occurrence":1,
+            "max_runtime_seconds":60,"start_window_seconds":3600},"knowledge_selection":[]
+    }))
+    .unwrap();
+    assert!(fixture
+        .store
+        .recipe_schedule_execution_preview(&request)
+        .unwrap_err()
+        .to_string()
+        .contains("retired"));
+    assert!(workflow::execute(
+        &fixture.store,
+        &HumanCommand::AuthorizeRecipeScheduleExecution {
+            operation_id: "comparison-renew".into(),
+            request,
+            preview_digest: "old".into(),
+        }
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("retired"));
+    fixture.execute(
+        "UPDATE recipe_schedules SET name='Current renamed schedule' WHERE id=?1",
+        [&schedule],
+    );
+    fixture.execute("UPDATE task_recipes SET name='Current renamed recipe'", []);
+    let tomorrow = chrono::Utc::now() + chrono::Duration::days(1);
+    agenticjira::recipes::scheduled_intake_tick(&fixture.store, tomorrow, chrono::Utc::now())
+        .unwrap();
+    fixture.assert_scalar::<i64>("SELECT count(*) FROM recipe_schedule_fires WHERE outcome='held' AND task_id IS NULL AND attempt_id IS NULL", 0);
+    let (after, after_rows) = read();
+    assert_eq!(before.total_selected_units, after.total_selected_units);
+    let run = after_rows
+        .iter()
+        .find(|row| {
+            row.attempt_id.as_deref() == Some(&context.attempt_id)
+                && matches!(row.fact, ComparisonEvidenceFact::Run { .. })
+        })
+        .unwrap();
+    let retained = run.recipe_attribution.as_ref().unwrap();
+    assert_eq!(retained.authorization_id.as_deref(), Some(grant.as_str()));
+    assert_eq!(retained.occurrence_id.as_deref(), Some(occurrence.as_str()));
+    assert_eq!(retained.recipe_title, historical_title);
+    assert!(after_rows
+        .iter()
+        .filter(|row| row.task_id != context.task_id)
+        .all(|row| row.recipe_attribution.is_none()));
+    assert!(after_rows
+        .iter()
+        .any(|row| row.attempt_id.as_deref() == Some("unrelated-schedule-attempt")));
+    assert!(after_rows
+        .iter()
+        .filter(|row| row.attempt_id.as_deref() == Some("unrelated-schedule-attempt"))
+        .all(|row| row.recipe_attribution.is_none()));
+    for row in after_rows
+        .iter()
+        .filter(|row| row.task_id == context.task_id)
+    {
+        match &row.fact {
+            ComparisonEvidenceFact::Execution { usage, .. } => assert!(usage.counters.is_none()),
+            ComparisonEvidenceFact::Timing { invocation } => {
+                assert_eq!(
+                    invocation.state,
+                    agenticjira::domain::ComparisonTimingState::NeverExecuted
+                );
+                assert!(invocation.elapsed_millis.is_none());
+            }
+            ComparisonEvidenceFact::UsageObservation { .. } => {
+                panic!("unexecuted reservation has no usage observation")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        after
+            .groups
+            .iter()
+            .map(|group| group.counts.accepted)
+            .sum::<usize>(),
+        0
+    );
+}
+
+#[test]
+fn schedule_cancel_after_valid_reservation_fences_final_spawn() {
+    let (fixture, project, occurrence, context) =
+        reserved_research_schedule("schedule-cancel-reserved", true);
+    // Historical schedule lineage fences the reservation before spawning.
+    let before = fixture
+        .store
+        .mark_session_spawning(&context.session_id, &context.transcript_epoch, "fixture")
+        .unwrap_err();
+    assert!(before.to_string().contains("retired"), "{before:#}");
+    let schedule: String = fixture.scalar("SELECT id FROM recipe_schedules");
+    let grant: String = fixture.scalar("SELECT authorization_id FROM recipe_schedule_fires");
+    let stop = HumanCommand::StopRecipeScheduleOccurrence {
+        operation_id: "cancel-reserved".into(),
+        project_id: project,
+        schedule_id: schedule,
+        expected_version: 2,
+        binding: agenticjira::domain::ScheduleStopBinding {
+            occurrence_id: occurrence,
+            authorization_id: grant,
+            attempt_id: context.attempt_id.clone(),
+            session_id: context.session_id.clone(),
+            resume_invocation_id: None,
+            role_generation_id: context.role_generation_id.clone(),
+            transcript_epoch: context.transcript_epoch.clone(),
+            process: None,
+        },
+    };
+    workflow::execute(&fixture.store, &stop).unwrap();
+    let after = fixture
+        .store
+        .mark_session_spawning(&context.session_id, &context.transcript_epoch, "fixture")
+        .unwrap_err();
+    assert!(after.to_string().contains("retired"), "{after:#}");
+    fixture.assert_scalar("SELECT outcome||':'||invocations_spent||':'||(stop_requested_at IS NOT NULL) FROM recipe_schedule_fires", "stop_requested:1:1".to_owned());
+    fixture.assert_scalar(
+        &format!(
+            "SELECT launch_state||':'||(launch_boot_identity IS NULL) FROM sessions WHERE id='{}'",
+            context.session_id
+        ),
+        "reserved:1".to_owned(),
+    );
+}
+
+fn hold_research_schedule(
+    fixture: &Fixture,
+    app: &Application,
+    project: &str,
+    context: &agenticjira::store::SingleAgentLaunchContext,
+    hold: &str,
+) {
+    if hold == "drain" {
+        // These fixtures never attach a native process to the supervisor.
+        let drained = app.begin_drain().unwrap();
+        assert_eq!(drained["draining"], true);
+        assert!(!app.dispatch_enabled());
+    } else if hold == "project_pause" {
+        let version = fixture.scalar(&format!(
+            "SELECT version FROM projects WHERE id='{project}'"
+        ));
+        workflow::execute(
+            &fixture.store,
+            &HumanCommand::SetQueuePaused {
+                operation_id: "pause-project".into(),
+                project_id: project.into(),
+                expected_version: version,
+                paused: true,
+            },
+        )
+        .unwrap();
+        fixture.assert_scalar(
+            &format!("SELECT queue_paused FROM projects WHERE id='{project}'"),
+            1_i64,
+        );
+    } else if hold == "permission_wait" {
+        fixture.execute("INSERT INTO permission_requests
+            (id,hook_invocation_nonce,connection_nonce,provider,project_id,task_id,attempt_id,session_id,
+             role_generation_id,role,service_boot_id,native_session_id,cwd,policy_fingerprint,tool_name,
+             input_digest,input_json,created_at,deadline_at,state,updated_at)
+            VALUES('schedule-permission','hook','connection','codex',?1,?2,?3,?4,?5,'single_agent',
+             ?8,'fixture-native',?6,'fixture-policy','Bash','digest','{}',?7,'2999-01-01T00:00:00Z','pending',?7)",
+            params![project,context.task_id,context.attempt_id,context.session_id,context.role_generation_id,
+                context.workspace.to_string_lossy(),chrono::Utc::now().to_rfc3339(),app.service_boot_id()]);
+        fixture.assert_scalar(
+            "SELECT COUNT(*) FROM permission_requests WHERE state='pending'",
+            1_i64,
+        );
+    }
+}
+
+#[test]
+fn schedule_expiry_persists_stop_before_ordinary_action_drain_pause_and_permission_wait() {
+    for hold in ["ordinary", "drain", "project_pause", "permission_wait"] {
+        let (fixture, project, _, context) =
+            reserved_research_schedule(&format!("historical-expiry-{hold}"), false);
+        let app = single_agent_application(&fixture);
+        let deadline: String =
+            fixture.scalar("SELECT runtime_deadline_utc FROM recipe_schedule_fires");
+        hold_research_schedule(&fixture, &app, &project, &context, hold);
+        // Drain or retirement may refuse first; neither may reserve launch authority.
+        let launch_authority_sql = "SELECT json_group_array(json_array(id,role_generation_id,
+            transcript_epoch,launch_state,launch_boot_identity,process_identity_json))
+            FROM (SELECT * FROM sessions ORDER BY id)";
+        let launch_authority: String = fixture.scalar(launch_authority_sql);
+        assert!(app.dispatch_single_agent(&context.attempt_id).is_err());
+        fixture.assert_scalar(launch_authority_sql, launch_authority);
+        fixture.assert_scalar("SELECT invocations_spent FROM recipe_schedule_fires", 1_i64);
+        app.coordinator_tick().unwrap();
+        // Schema-2 stops retain invocation identity in the expanded target table.
+        fixture.assert_scalar(
+            "SELECT session_id FROM recipe_schedule_stop_targets WHERE occurrence_id='historical-occurrence' AND target_kind='session'",
+            context.session_id.clone(),
+        );
+        fixture.assert_scalar(
+            "SELECT transcript_epoch FROM recipe_schedule_stop_targets WHERE occurrence_id='historical-occurrence' AND target_kind='session'",
+            context.transcript_epoch.clone(),
+        );
+        fixture.assert_scalar(
+            "SELECT process_identity_json FROM recipe_schedule_stop_targets WHERE occurrence_id='historical-occurrence' AND target_kind='session'",
+            SINGLE_AGENT_PROCESS.to_owned(),
+        );
+        fixture.assert_scalar(
+            "SELECT runtime_deadline_utc FROM recipe_schedule_fires",
+            deadline,
+        );
+        fixture.assert_scalar("SELECT invocations_spent FROM recipe_schedule_fires", 1_i64);
+        fixture.assert_scalar(
+            "SELECT outcome FROM recipe_schedule_fires",
+            "recovery_required".to_owned(),
+        );
+        if hold == "permission_wait" {
+            fixture.assert_scalar("SELECT COUNT(*) FROM permission_requests WHERE state='expired' AND delivery_state='deny_required'",1_i64);
+        }
+    }
+}
+
+#[test]
+fn schedule_restart_safety_precedes_dispatch_holds_without_renewing_deadline() {
+    for hold in ["ordinary", "drain", "project_pause", "permission_wait"] {
+        let (fixture, project, _, context) =
+            reserved_research_schedule(&format!("schedule-restart-{hold}"), true);
+        let deadline: String =
+            fixture.scalar("SELECT runtime_deadline_utc FROM recipe_schedule_fires");
+        let app = single_agent_application(&fixture);
+        hold_research_schedule(&fixture, &app, &project, &context, hold);
+        app.coordinator_tick().unwrap();
+        fixture.assert_scalar("SELECT invocations_spent FROM recipe_schedule_fires", 1_i64);
+        fixture.assert_scalar(
+            "SELECT runtime_deadline_utc FROM recipe_schedule_fires",
+            deadline.clone(),
+        );
+        fixture.assert_scalar(
+            "SELECT stop_reason FROM recipe_schedule_fires",
+            "Runtime origin unavailable after restart; reconcile without replay".to_owned(),
+        );
+        fixture.assert_scalar(
+            "SELECT session_id FROM recipe_schedule_stop_targets WHERE occurrence_id='historical-occurrence' AND target_kind='session'",
+            context.session_id.clone(),
+        );
+        fixture.assert_scalar(
+            "SELECT transcript_epoch FROM recipe_schedule_stop_targets WHERE occurrence_id='historical-occurrence' AND target_kind='session'",
+            context.transcript_epoch.clone(),
+        );
+        fixture.assert_scalar(
+            "SELECT process_identity_json IS NULL FROM recipe_schedule_stop_targets WHERE occurrence_id='historical-occurrence' AND target_kind='session'",
+            true,
+        );
+        fixture.assert_scalar(
+            &format!(
+                "SELECT launch_state FROM sessions WHERE id='{}'",
+                context.session_id
+            ),
+            "failed".to_owned(),
+        );
+        app.coordinator_tick().unwrap();
+        fixture.assert_scalar(
+            "SELECT runtime_deadline_utc FROM recipe_schedule_fires",
+            deadline,
+        );
+        fixture.assert_scalar("SELECT invocations_spent FROM recipe_schedule_fires", 1_i64);
+    }
+}
+
+#[test]
+fn workspace_preparation_guard_retains_ownership_during_retry_and_then_allows_cancellation() {
+    let (fixture, repository) = single_agent_fixture("workspace-preparation-guard");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let (task, version) = single_agent_task(&fixture, &setup);
+    make_ready(&fixture, &task, version).unwrap();
+    let plan = claim(&fixture, fixture.root.join("artifacts"));
+    rewind_workspace_publication(&fixture, &plan, true);
+    let app = single_agent_application(&fixture);
+    let version = fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task}'"));
+    let cancel = HumanCommand::CancelWorkspaceReservation {
+        operation_id: "cancel-active-preparation".into(),
+        task_id: task.clone(),
+        attempt_id: plan.attempt_id.clone(),
+        workspace_id: plan.workspace_id.clone(),
+        expected_version: version,
+    };
+    let mut observed = false;
+    let prepared = app
+        .scheduler
+        .synthetic_workspace_retry_interleaving_for_tests(
+            "guarded-retry",
+            &task,
+            &plan.attempt_id,
+            &plan.workspace_id,
+            version,
+            || {
+                observed = true;
+                let before = workspace_recovery_state(&fixture, &plan);
+                let refused = app.execute_human_command(&cancel).unwrap_err();
+                assert!(
+                    format!("{refused:#}").contains("Root preparation is active or uncertain"),
+                    "{refused:#}"
+                );
+                assert_eq!(workspace_recovery_state(&fixture, &plan), before);
+                let retry = app
+                    .scheduler
+                    .synthetic_workspace_retry_interleaving_for_tests(
+                        "contending-retry",
+                        &task,
+                        &plan.attempt_id,
+                        &plan.workspace_id,
+                        version,
+                        || panic!("contending retry must not materialize"),
+                    );
+                assert!(retry
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Root preparation is active or uncertain"));
+            },
+        )
+        .unwrap();
+    assert!(observed);
+    assert_eq!(prepared.state, "workspace_reservation_recovered");
+    rewind_workspace_publication(&fixture, &plan, true);
+    let version = fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task}'"));
+    let cancelled = app
+        .execute_human_command(&HumanCommand::CancelWorkspaceReservation {
+            operation_id: "cancel-settled-preparation".into(),
+            task_id: task,
+            attempt_id: plan.attempt_id.clone(),
+            workspace_id: plan.workspace_id.clone(),
+            expected_version: version,
+        })
+        .unwrap();
+    assert_eq!(cancelled.state, "workspace_reservation_cancelled");
+    assert!(plan.workspace_path.exists());
+}
+
+#[test]
+fn schedule_explicit_reader_resume_retains_allowance_deadline_and_exact_stop_binding() {
+    let (fixture, _, _, context) = reserved_research_schedule("retired-schedule-resume", false);
+    let state = workflow::state(&fixture.store).unwrap();
+    let schedule = &state.recipe_schedules[0];
+    assert_eq!(schedule["mode"], "run_authorized_recipe");
+    assert_eq!(schedule["active_authorization_id"], "historical-grant");
+    assert_eq!(schedule["authorization"]["id"], "historical-grant");
+    assert_eq!(schedule["execution_intake_enabled"], false);
+    assert_eq!(schedule["execution_authorization_supported"], false);
+    assert_eq!(schedule["execution_qualification_state"], "unsupported");
+    assert_eq!(
+        schedule["execution_authorization_reason"],
+        "Automatic recipe execution has been retired. Schedules create drafts only."
+    );
+    let app = single_agent_application(&fixture);
+    let deadline: String = fixture.scalar("SELECT runtime_deadline_utc FROM recipe_schedule_fires");
+    let before: i64 = fixture.scalar("SELECT COUNT(*) FROM sessions");
+    assert!(app
+        .resume_single_agent(&context.attempt_id, None)
+        .unwrap_err()
+        .to_string()
+        .contains("retired"));
+    assert!(fixture
+        .store
+        .single_agent_launch_context(&context.attempt_id)
+        .unwrap_err()
+        .to_string()
+        .contains("retired"));
+    fixture.assert_scalar("SELECT COUNT(*) FROM sessions", before);
+    fixture.assert_scalar("SELECT COUNT(*) FROM resume_invocations", 0_i64);
+    fixture.assert_scalar(
+        "SELECT runtime_deadline_utc FROM recipe_schedule_fires",
+        deadline,
+    );
+    fixture.assert_scalar("SELECT invocations_spent FROM recipe_schedule_fires", 1_i64);
+    // A stale client can still submit a fresh Run next for a historical Ready task.
+    fixture.execute(
+        "UPDATE tasks SET lifecycle='ready',attention='none' WHERE id=?1",
+        [&context.task_id],
+    );
+    let version: i64 = fixture.scalar(&format!(
+        "SELECT version FROM tasks WHERE id='{}'",
+        context.task_id
+    ));
+    let authority_sql = format!(
+        "SELECT json_object('lifecycle',t.lifecycle,'attention',t.attention,'version',t.version,
+            'updated_at',t.updated_at,'knowledge_preparation',t.knowledge_preparation_json,
+            'admission_state',s.admission_state,'admitted_task_version',s.admitted_task_version,
+            'selection_updated_at',s.updated_at)
+         FROM tasks t JOIN task_workflow_selections s ON s.task_id=t.id WHERE t.id='{}'",
+        context.task_id
+    );
+    let authority: String = fixture.scalar(&authority_sql);
+    let denied = workflow::execute(
+        &fixture.store,
+        &HumanCommand::Control {
+            operation_id: "retired-ready-run-next".into(),
+            task_id: context.task_id.clone(),
+            expected_version: version,
+            action: "run_next".into(),
+            payload: serde_json::Value::Null,
+        },
+    )
+    .unwrap_err();
+    assert!(denied.to_string().contains("retired"), "{denied:#}");
+    fixture.assert_scalar(&authority_sql, authority);
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='retired-ready-run-next'",
+        0_i64,
+    );
+}
+
+#[test]
+fn schedule_restore_invalidates_reserved_stop_authority_before_application_safety() {
+    let (fixture, _, occurrence, context) =
+        reserved_research_schedule("retired-schedule-restore", true);
+    let grant: String = fixture.scalar("SELECT active_authorization_id FROM recipe_schedules");
+    let deadline: String = fixture.scalar("SELECT runtime_deadline_utc FROM recipe_schedule_fires");
+    fixture.execute("UPDATE recipe_schedule_fires SET outcome='stop_requested',stop_requested_at=?1,stop_reason='human' WHERE id=?2",
+        params![chrono::Utc::now().to_rfc3339(),occurrence]);
+    fixture.execute("INSERT INTO recipe_schedule_stop_targets(id,occurrence_id,authorization_id,attempt_id,target_kind,session_id,role_generation_id,transcript_epoch,created_at,observed_at)
+        VALUES('historical-target',?1,?2,?3,'session',?4,?5,?6,'now','now')",params![occurrence,grant,context.attempt_id,context.session_id,context.role_generation_id,context.transcript_epoch]);
+    let mut paths = m4a_paths("retired-schedule-backup");
+    paths.database = fixture.database.clone();
+    paths.state = fixture.root.clone();
+    let backup = m4a_backup_path(&database::backup(&paths, None).unwrap());
+    let target = m4a_paths("retired-schedule-restore-target");
+    database::restore(&target, &backup).unwrap();
+    let store = Store::open(&target.database).unwrap();
+    let connection = rusqlite::Connection::open(&target.database).unwrap();
+    let inert: bool = connection.query_row("SELECT mode='run_authorized_recipe' AND active_authorization_id=?1 AND paused=1 AND next_fire_utc IS NULL FROM recipe_schedules",[&grant],|row|row.get(0)).unwrap();
+    assert!(inert);
+    let invalid: bool = connection.query_row("SELECT revoked_at IS NOT NULL AND restore_invalidated_at IS NOT NULL FROM recipe_schedule_authorizations WHERE id=?1",[&grant],|row|row.get(0)).unwrap();
+    assert!(invalid);
+    assert_eq!(connection.query_row("SELECT COUNT(*) FROM recipe_schedule_stop_targets WHERE restore_invalidated_at IS NOT NULL",[],|row|row.get::<_,i64>(0)).unwrap(),1);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT runtime_deadline_utc FROM recipe_schedule_fires",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        deadline
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT outcome FROM recipe_schedule_fires", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "recovery_required"
+    );
+    assert_eq!(connection.query_row("SELECT COUNT(*) FROM recovery_records WHERE id='database-restore-hold' AND state='attention_required'",[],|row|row.get::<_,i64>(0)).unwrap(),1);
+    assert!(store
+        .single_agent_launch_context(&context.attempt_id)
+        .is_err());
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM resume_invocations", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(connection.query_row("SELECT COUNT(*) FROM recovery_records WHERE session_id=?1 AND state='attention_required'",[&context.session_id],|row|row.get::<_,i64>(0)).unwrap(),1);
+}
+
+#[test]
+fn schedule_execution_storage_preserves_authority_and_invocation_identity() {
+    let (fixture, repository) = single_agent_fixture("schedule-storage-authority");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let reader = offline_purpose_profile(&fixture, &setup, "repository_reader");
+    let (schedule, revision) =
+        schedule_reader_recipe(&fixture, &setup, &reader, "2030-01-01T09:00:00Z");
+    let revision = revision.as_str();
+    let connection = fixture.connection();
+    connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    let insert_grant = "INSERT INTO recipe_schedule_authorizations
+        (id,project_id,schedule_id,recipe_revision_id,scope_json,scope_hash,max_occurrences,
+         max_invocations_per_occurrence,max_runtime_seconds,start_window_seconds,created_by,created_at)
+        VALUES(?1,?2,?3,?4,'{\"schema\":1}',?5,1,2,120,60,'human','2029-12-31T09:00:00Z')";
+    let hash = "a".repeat(64);
+    let before = committed_state_revision(&connection);
+    connection
+        .execute(
+            insert_grant,
+            params![
+                "grant",
+                setup.project_id,
+                schedule.entity_id,
+                revision,
+                hash
+            ],
+        )
+        .unwrap();
+    assert_eq!(committed_state_revision(&connection), before + 1);
+    connection
+        .execute(
+            insert_grant,
+            params![
+                "renewal",
+                setup.project_id,
+                schedule.entity_id,
+                revision,
+                hash
+            ],
+        )
+        .unwrap();
+    let error = connection
+        .execute(
+            insert_grant,
+            params![
+                "malformed",
+                setup.project_id,
+                schedule.entity_id,
+                revision,
+                "not-a-scope-hash"
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("CHECK constraint failed"), "{error}");
+    for sql in [
+        "UPDATE recipe_schedule_authorizations SET max_occurrences=2 WHERE id='grant'",
+        "UPDATE recipe_schedule_authorizations SET scope_json='{\"changed\":true}' WHERE id='grant'",
+        "DELETE FROM recipe_schedule_authorizations WHERE id='grant'",
+    ] {
+        let error = connection.execute(sql, []).unwrap_err().to_string();
+        assert!(error.contains("immutable"), "{error}");
+    }
+    connection.execute("INSERT INTO recipe_schedules(id,project_id,name,recipe_revision_id,cadence,anchor_utc,paused,version,created_at,updated_at)
+        VALUES('other-schedule',?1,'Other',?2,'daily','2030-01-01T09:00:00Z',1,1,'now','now')",params![setup.project_id,revision]).unwrap();
+    let mut other = schedule.clone();
+    other.entity_id = "other-schedule".into();
+    let error = connection.execute(
+        "UPDATE recipe_schedules SET mode='run_authorized_research',active_authorization_id='grant' WHERE id=?1",
+        [&other.entity_id],
+    ).unwrap_err().to_string();
+    assert!(error.contains("own active authorization"), "{error}");
+    connection.execute(
+        "UPDATE recipe_schedules SET mode='run_authorized_research',active_authorization_id='grant',paused=0,next_fire_utc='2030-01-01T09:00:00Z' WHERE id=?1",
+        [&schedule.entity_id],
+    ).unwrap();
+    let app = single_agent_application(&fixture);
+    let now = chrono::DateTime::parse_from_rfc3339("2030-01-01T09:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let before_intake: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT (SELECT count(*) FROM tasks),(SELECT count(*) FROM attempts),
+                    (SELECT count(*) FROM sessions)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let version_before_intake: i64 = connection
+        .query_row(
+            "SELECT version FROM recipe_schedules WHERE id=?1",
+            [&schedule.entity_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(app.scheduled_intake_tick(now, now).unwrap(), 0);
+    let fires: i64 = connection
+        .query_row("SELECT count(*) FROM recipe_schedule_fires", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(fires, 0);
+    let materialized: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM task_recipe_bindings WHERE schedule_id=?1",
+            [&schedule.entity_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(materialized, 0);
+    let after_intake: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT (SELECT count(*) FROM tasks),(SELECT count(*) FROM attempts),
+                    (SELECT count(*) FROM sessions)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(after_intake, before_intake);
+    let version: i64 = connection
+        .query_row(
+            "SELECT version FROM recipe_schedules WHERE id=?1",
+            [&schedule.entity_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, version_before_intake);
+    connection
+        .execute(
+            "UPDATE recipe_schedules SET version=version+1 WHERE id=?1",
+            [&schedule.entity_id],
+        )
+        .unwrap();
+    connection.execute(
+        "INSERT INTO recipe_schedule_fires(id,schedule_id,scheduled_for_utc,recipe_revision_id,outcome,authorization_id,created_at)
+         VALUES('occurrence',?1,'2030-01-01T09:00:00Z',?2,'held','grant','2030-01-01T09:00:00Z')",
+        params![other.entity_id,revision],
+    ).unwrap_err();
+    for (task, attempt) in [
+        ("owned-task", "owned-attempt"),
+        ("other-task", "other-attempt"),
+    ] {
+        connection.execute("INSERT INTO tasks(id,project_id,title,lifecycle,created_at,updated_at) VALUES(?1,?2,'Inspect','backlog','2030-01-01T09:00:00Z','2030-01-01T09:00:00Z')", params![task,setup.project_id]).unwrap();
+        connection.execute("INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,created_at,updated_at) VALUES(?1,?2,'context','agent_execution','base',1,'running','2030-01-01T09:00:00Z','2030-01-01T09:00:00Z')", params![attempt,task]).unwrap();
+        connection.execute("INSERT INTO task_recipe_bindings
+            (task_id,project_id,recipe_revision_id,profile_revision_id,required_check_ids_json,
+             config_revision_id,configuration_hash,workflow_version,workflow_hash,schedule_id,
+             scheduled_for_utc,created_at,family,preset,definition_id,execution_config_revision_id,
+             primary_profile_revision_id,primary_profile_hash,reviewer_profile_revision_id,reviewer_profile_hash)
+            SELECT ?1,?2,id,profile_revision_id,required_check_ids_json,config_revision_id,
+             configuration_hash,workflow_version,workflow_hash,?3,?4,'2030-01-01T09:00:00Z',
+             family,preset,definition_id,execution_config_revision_id,primary_profile_revision_id,
+             primary_profile_hash,reviewer_profile_revision_id,reviewer_profile_hash
+            FROM task_recipe_revisions WHERE id=?5",
+            params![task,setup.project_id,schedule.entity_id,
+                if task=="owned-task" { "2030-01-02T09:00:00Z" } else { "2030-01-03T09:00:00Z" },revision]
+        ).unwrap();
+    }
+    let insert_occurrence = "INSERT INTO recipe_schedule_fires(id,schedule_id,scheduled_for_utc,
+        recipe_revision_id,outcome,authorization_id,task_id,attempt_id,allowance_reserved,
+        invocations_spent,first_reserved_at,runtime_deadline_utc,created_at)
+        VALUES(?1,?2,?3,?4,'reserved','grant',?5,?6,1,1,'2030-01-02T09:00:00Z',
+               '2030-01-02T09:02:00Z','2030-01-02T09:00:00Z')";
+    let error = connection
+        .execute(
+            insert_occurrence,
+            params![
+                "occurrence",
+                schedule.entity_id,
+                "2030-01-02T09:00:00Z",
+                revision,
+                "owned-task",
+                "other-attempt"
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("scope or allowance"), "{error}");
+    connection
+        .execute(
+            insert_occurrence,
+            params![
+                "occurrence",
+                schedule.entity_id,
+                "2030-01-02T09:00:00Z",
+                revision,
+                "owned-task",
+                "owned-attempt"
+            ],
+        )
+        .unwrap();
+    let error = connection
+        .execute(
+            insert_occurrence,
+            params![
+                "excess",
+                schedule.entity_id,
+                "2030-01-03T09:00:00Z",
+                revision,
+                "other-task",
+                "other-attempt"
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("scope or allowance"), "{error}");
+    for sql in [
+        "UPDATE recipe_schedule_fires SET authorization_id='renewal' WHERE id='occurrence'",
+        "UPDATE recipe_schedule_fires SET invocations_spent=0 WHERE id='occurrence'",
+        "UPDATE recipe_schedule_fires SET runtime_deadline_utc='2030-01-02T09:03:00Z' WHERE id='occurrence'",
+        "DELETE FROM recipe_schedule_fires WHERE id='occurrence'",
+    ] {
+        let error = connection.execute(sql, []).unwrap_err().to_string();
+        assert!(error.contains("cannot be rewritten") || error.contains("immutable") || error.contains("scope or allowance"), "{error}");
+    }
+    let error = connection
+        .execute(
+            "UPDATE recipe_schedule_fires SET invocations_spent=3 WHERE id='occurrence'",
+            [],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("scope or allowance"), "{error}");
+    seed_session(
+        &fixture,
+        "owned-attempt",
+        "implementer",
+        "owned-generation",
+        "owned-session",
+        "exited",
+    );
+    seed_session(
+        &fixture,
+        "other-attempt",
+        "implementer",
+        "other-generation",
+        "other-session",
+        "exited",
+    );
+    let binding = "UPDATE sessions SET schedule_occurrence_id='occurrence',schedule_authorization_id='grant' WHERE id=?1";
+    let error = connection
+        .execute(binding, ["other-session"])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("occurrence attempt"), "{error}");
+    let before = committed_state_revision(&connection);
+    connection.execute(binding, ["owned-session"]).unwrap();
+    assert_eq!(committed_state_revision(&connection), before + 1);
+    let error = connection
+        .execute(
+            "UPDATE sessions SET schedule_authorization_id=NULL WHERE id='owned-session'",
+            [],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("occurrence attempt"), "{error}");
+    let insert_resume =
+        "INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,
+        launch_config_json,capability_key,capability_identity_json,state,created_at,updated_at,
+        schedule_occurrence_id,schedule_authorization_id)
+        VALUES('resume',?1,1,'resume-epoch','{}','capability','{}','reserved',
+               '2030-01-02T09:00:30Z','2030-01-02T09:00:30Z',?2,?3)";
+    let error = connection
+        .execute(
+            insert_resume,
+            params![
+                "owned-session",
+                Option::<String>::None,
+                Option::<String>::None
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("must match its session"), "{error}");
+    connection
+        .execute(
+            "UPDATE recipe_schedule_fires SET invocations_spent=2 WHERE id='occurrence'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            insert_resume,
+            params!["owned-session", "occurrence", "grant"],
+        )
+        .unwrap();
+    let error = connection
+        .execute(
+            "UPDATE resume_invocations SET session_id='other-session' WHERE id='resume'",
+            [],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("must match its session"), "{error}");
+    connection.execute("UPDATE recipe_schedule_fires SET outcome='stop_requested',stop_requested_at='2030-01-02T09:01:30Z',stop_reason='deadline',stop_session_id='owned-session',stop_resume_invocation_id='resume',stop_transcript_epoch='resume-epoch' WHERE id='occurrence'", []).unwrap();
+    let error = connection.execute("UPDATE recipe_schedule_fires SET stop_transcript_epoch='new-epoch' WHERE id='occurrence'", []).unwrap_err().to_string();
+    assert!(
+        error.contains("cannot be rewritten") || error.contains("stop target"),
+        "{error}"
+    );
+    connection.execute("UPDATE recipe_schedule_authorizations SET revoked_at='2030-01-02T09:01:40Z',revoked_by='human',revocation_reason='paused' WHERE id='grant'", []).unwrap();
+    let error = connection.execute("UPDATE recipe_schedule_authorizations SET revoked_at=NULL,revoked_by=NULL,revocation_reason=NULL WHERE id='grant'", []).unwrap_err().to_string();
+    assert!(error.contains("immutable"), "{error}");
+    assert_eq!(connection.query_row("SELECT authorization_id||':'||invocations_spent||':'||runtime_deadline_utc FROM recipe_schedule_fires WHERE id='occurrence'", [], |row| row.get::<_, String>(0)).unwrap(), "grant:2:2030-01-02T09:02:00Z");
+    let violations: i64 = connection
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0);
 }
 
 #[test]
 fn single_agent_reader_initial_resume_policy_and_reviewer_credentials_are_separate() {
-    use agenticjira::domain::ProfilePurpose;
-    use agenticjira::permissions::{begin_actor_request, BridgeStart, PermissionActor};
-    let (fixture, repository) = single_agent_fixture("reader-boundaries");
+    let (fixture, repository) = single_agent_fixture("retired-read-profiles");
     let setup = admitted_single_agent_project(&fixture, &repository);
-    let reader = offline_purpose_profile(&fixture, &setup, "repository_reader");
-    let task = workflow_command(&fixture, serde_json::json!({
-        "kind":"create_task","operation_id":"research","project_id":setup.project_id,
-        "title":"Inspect","description":"Read only","acceptance_criteria":["Evidence reviewed"],"priority":0,
-        "selection":{"family":"single_agent","preset":"repository_research",
-            "execution_config_revision_id":setup.config_id,"profile_revision_id":reader,"check_ids":[]}
-    })).unwrap();
-    make_ready(&fixture, &task.entity_id, task.version.unwrap()).unwrap();
-    let (context, _) = running_single_agent(&fixture, &task.entity_id);
-    let native = single_agent_session_start(&fixture, &context);
-    let channel = single_agent_channel(&fixture, &context);
-    let actor = PermissionActor::single_agent(&fixture.store, &channel).unwrap();
-    assert!(!actor.writer);
-    let payload = permission_payload(
-        &native,
-        "deny-read-escalation",
-        serde_json::json!({"command":"touch forbidden","cwd":context.workspace}),
-        None,
-    );
-    let result = begin_actor_request(&fixture.store, &actor, &payload, "boot", "reader").unwrap();
-    assert!(
-        matches!(result, BridgeStart::Immediate(ref answer) if response_behavior(answer)=="deny")
-    );
-    let paths = instance_paths(&fixture);
-    let hooks = test_hooks(&fixture);
-    let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
-    let bundles = single_agent_bundles();
-    let mut request = providers::SingleAgentLaunchRequest {
-        purpose: ProfilePurpose::RepositoryReader,
-        provider: context.provider,
-        model: &context.model,
-        effort: &context.effort,
-        cwd: &context.workspace,
-        read_denials: &context.read_denials,
-        service_root: &paths.root,
-        prompt: "fixture",
-        role_socket: &paths.role_socket,
-        token: &context.token,
-        role_generation_id: &context.role_generation_id,
-        session_id: &context.session_id,
-        native_session_id: None,
-        assets: &hooks,
-        executable_path: &executable,
-        bundles: &bundles,
-        checkout_scope: None,
-    };
-    let first = providers::prepare_single_agent_launch(&request).unwrap();
-    request.native_session_id = Some(&native);
-    let resumed = providers::prepare_single_agent_launch(&request).unwrap();
-    assert_eq!(
-        first.identity.security_policy,
-        resumed.identity.security_policy
-    );
-    let profile: toml::Value = resumed
-        .arguments
-        .iter()
-        .find(|arg| arg.starts_with("permissions.agenticjira_role="))
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert_eq!(
-        profile["permissions"]["agenticjira_role"]["filesystem"]
-            [context.workspace.to_str().unwrap()]
-        .as_str(),
-        Some("read")
-    );
-    assert!(resumed
-        .arguments
-        .windows(2)
-        .any(|args| args[0] == "--ask-for-approval" && args[1] == "never"));
-    request.purpose = ProfilePurpose::RepositoryReviewer;
-    assert!(providers::prepare_single_agent_launch(&request).is_err());
-    request.native_session_id = None;
-    let reviewer = providers::prepare_single_agent_launch(&request).unwrap();
-    assert_ne!(
-        reviewer.identity.policy_binding_hash,
-        first.identity.policy_binding_hash
-    );
-    let mut forged = channel.clone();
-    forged.purpose = ProfilePurpose::RepositoryReviewer;
-    assert!(PermissionActor::single_agent(&fixture.store, &forged).is_err());
-    exit_single_agent(&fixture, &context);
-    let reviews = ReviewService::new(fixture.store.clone(), paths.artifacts);
-    reviews
-        .prepare_research_baseline(&context.attempt_id)
-        .unwrap();
-    std::fs::write(context.workspace.join("unexpected.txt"), "changed").unwrap();
-    assert!(reviews
-        .prepare_research_baseline(&context.attempt_id)
-        .is_err());
-}
-
-#[test]
-fn single_agent_review_exact_quiescence_repair_restart_recheck_and_delivery_cap() {
-    let (mut fixture, repository) = single_agent_fixture("independent-review");
-    let mut previous_candidate = repository.clone();
-    let setup = admitted_single_agent_project(&fixture, &repository);
-    let reviewer = offline_purpose_profile(&fixture, &setup, "repository_reviewer");
-    let task = workflow_command(&fixture, serde_json::json!({
-        "kind":"create_task","operation_id":"build-review","project_id":setup.project_id,
-        "title":"Say done","description":"Write DONE","acceptance_criteria":["The fixture says done"],"priority":0,
-        "selection":{"family":"single_agent","preset":"build_and_review","profile_revision_id":setup.profile_revision_id,
-            "execution_config_revision_id":setup.config_id,"reviewer_profile_revision_id":reviewer,"check_ids":[]}
-    })).unwrap();
-    make_ready(&fixture, &task.entity_id, task.version.unwrap()).unwrap();
-    let (mut writer, _) = running_single_agent(&fixture, &task.entity_id);
-    for (ordinal, verdict, findings) in [
-        (1, "changes_requested", vec!["Include date"]),
-        (2, "approved", vec![]),
+    // Admission already ran and settled its probe task and writer session.
+    // Refused profile creation must preserve that authority, not assume it is empty.
+    let connection = fixture.connection();
+    let mut baseline = Vec::new();
+    for table in [
+        "tasks",
+        "attempts",
+        "sessions",
+        "role_generations",
+        "role_credentials",
+        "launch_permits",
+        "resume_invocations",
+        "agent_profiles",
+        "agent_profile_revisions",
+        "profile_admissions",
+        "capabilities",
+        "operation_receipts",
     ] {
-        let app = single_agent_application(&fixture);
-        single_agent_session_start(&fixture, &writer);
-        let result = finish_single_agent_writer(&fixture, &app, &writer, "result.txt", "DONE\n");
-        let attempt = &writer.attempt_id;
-        let control = |operation: &str, action: &str| {
-            let version: i64 = fixture.scalar(&format!(
-                "SELECT version FROM tasks WHERE id='{}'",
-                task.entity_id
-            ));
-            workflow::execute(
-                &fixture.store,
-                &HumanCommand::Control {
-                    operation_id: operation.into(),
-                    task_id: task.entity_id.clone(),
-                    expected_version: version,
-                    action: action.into(),
-                    payload: serde_json::json!({}),
-                },
-            )
-        };
-        let delivery = app.reviews.prepare_single_agent_review(attempt).unwrap();
-        let repeated = app.reviews.prepare_single_agent_review(attempt).unwrap();
-        assert_eq!(repeated, delivery);
-        let context = fixture.store.single_agent_launch_context(attempt).unwrap();
-        assert_ne!(context.workspace, writer.workspace);
-        let bytes = std::fs::read(context.workspace.join("result.txt")).unwrap();
-        assert_eq!(bytes, b"DONE\n");
-        let (context, launch) = prepare_single_agent_fixture_turn(&fixture, context);
-        for kind in ["pause_now", "pause_after_role", "cancel"] {
-            control(&format!("before-{ordinal}-{kind}"), kind).unwrap();
-            assert!(fixture
-                .store
-                .reserve_single_agent_invocation(&context, &launch)
-                .is_err());
-            assert!(app.reviews.prepare_single_agent_review(attempt).is_err());
-            fixture.assert_scalar(&format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id='{attempt}' AND g.role='single_agent_reviewer'"), 0_i64);
-            fixture.execute(
-                "UPDATE controls SET state='finished' WHERE requested_operation_id=?1",
-                [format!("before-{ordinal}-{kind}")],
-            );
-            fixture.execute(
-                "UPDATE tasks SET attention='none' WHERE id=?1",
-                [&task.entity_id],
-            );
-        }
-        // Commit a human pause after reservation, before actual spawn admission.
-        fixture.execute(&format!("CREATE TRIGGER pause_reserved_review AFTER UPDATE OF state ON single_agent_review_deliveries
-            WHEN NEW.id='{delivery}' AND NEW.state='launched' BEGIN
-            INSERT INTO controls(id,attempt_id,kind,state,expected_version,payload_json,created_at,updated_at)
-            VALUES('after-{ordinal}',NEW.attempt_id,'pause_now','requested',1,'{{}}','2026-01-01','2026-01-01'); END"),[]);
-        let deferred = app.coordinator_tick().unwrap();
-        assert_eq!(deferred["action"], "pause_now");
-        fixture.execute("DROP TRIGGER pause_reserved_review", []);
-        fixture.assert_scalar(&format!("SELECT COUNT(*) FROM single_agent_review_deliveries d JOIN attempts a ON a.id=d.attempt_id WHERE d.id='{delivery}' AND d.state='ready' AND d.ordinal={ordinal} AND d.candidate_hash=a.candidate_hash AND a.phase='awaiting_review'"), 1_i64);
-        fixture.assert_scalar(&format!("SELECT COUNT(*) FROM single_agent_review_deliveries d JOIN sessions s ON s.id=d.session_id JOIN role_credentials c ON c.id=d.credential_id JOIN audit_events e ON e.entity_id=s.id AND e.event_code='single_agent_review.launch_deferred' WHERE d.id='{delivery}' AND s.status='launch_failed' AND s.process_identity_json IS NULL AND s.native_session_id IS NULL AND c.revoked_at IS NOT NULL AND json_extract(s.exit_json,'$.native_spawned')=0"), 1_i64);
-        let refused: String = fixture.scalar(&format!(
-            "SELECT session_id FROM single_agent_review_deliveries WHERE id='{delivery}'"
-        ));
-        let epoch: String = fixture.scalar(&format!(
-            "SELECT transcript_epoch FROM sessions WHERE id='{refused}'"
-        ));
-        assert!(fixture
-            .store
-            .mark_session_spawning(&refused, &epoch, "stale")
-            .is_err());
-        assert!(fixture.store.single_agent_launch_context(attempt).is_err());
-        let projected = workflow::state(&fixture.store).unwrap();
-        let controls = &projected
-            .decisions
-            .iter()
-            .find(|decision| decision.subject.attempt_id.as_deref() == Some(attempt.as_str()))
-            .unwrap()
-            .control_policy
-            .allowed_controls;
-        assert!(controls.contains(&"continue".to_owned()));
-        control(&format!("release-{ordinal}"), "continue").unwrap();
-        tick_until(&fixture, &app, "continued");
-        assert_eq!(
-            app.reviews.prepare_single_agent_review(attempt).unwrap(),
-            delivery
-        );
-        let context = fixture.store.single_agent_launch_context(attempt).unwrap();
-        let review = start_single_agent_fixture_turn(&fixture, context);
-        assert_ne!(review.session_id, refused);
-        let channel = single_agent_channel(&fixture, &review);
-        let native = uuid::Uuid::new_v4().to_string();
-        let sibling = review.workspace.with_file_name("sibling-review");
-        std::fs::create_dir_all(&sibling).unwrap();
-        for cwd in [
-            &writer.workspace,
-            &sibling,
-            &previous_candidate,
-            &review.workspace,
-        ] {
-            assert!(cwd.is_dir());
-            let valid = cwd == &review.workspace;
-            for event in ["SessionStart", "UserPromptSubmit", "Stop"] {
-                let hook = fixture
-                    .store
-                    .save_single_agent_hook_event(
-                        &channel,
-                        &HookEnvelope {
-                            provider: review.provider,
-                            payload: serde_json::json!({"hook_event_name":event,"session_id":native,"cwd":cwd}),
-                        },
-                        &RolePeerProvenance {
-                            peer_pid: 4242,
-                            peer_process_group_id: 4242,
-                            peer_start_marker: "single-agent-peer".into(),
-                            managed_root_pid: 4242,
-                            managed_root_start_marker: "fixture".into(),
-                            state: "managed_process_group_untrusted_payload".into(),
-                        },
-                    )
-                    .unwrap();
-                assert_eq!(hook["native_identity_candidate"], valid);
-                assert_eq!(hook["safe_idle_boundary"], valid && event == "Stop");
-            }
-        }
-        previous_candidate = review.workspace.clone();
-        let restart = recovery::prepare_restart_candidates(&fixture.store).unwrap();
-        assert!(restart.is_empty());
-        assert_ne!(review.credential_id, writer.credential_id);
-        assert!(fixture.store.single_agent_launch_context(attempt).is_err());
-        let candidate: String = fixture.scalar(&format!(
-            "SELECT candidate_hash FROM attempts WHERE id='{attempt}'"
-        ));
-        let revision: i64 = fixture.scalar(&format!("SELECT selected_check_revision FROM single_agent_review_deliveries WHERE id='{delivery}'"));
-        let report = RoleResultReport {
-            operation_id: format!("review-{ordinal}"),
-            outcome: "review_complete".into(),
-            summary: "Independent inspection".into(),
-            evidence: vec![],
-            metadata: serde_json::json!({"delivery_id":delivery,"result_binding_id":result["result_binding_id"],
-                "candidate_hash":candidate,"selected_check_revision":revision,"verdict":verdict,"findings":findings}),
-        };
-        let recorded = fixture
-            .store
-            .save_single_agent_result(&channel, &report)
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
             .unwrap();
-        assert_eq!(recorded["accepted"], true);
-        let decide = |kind: &str, operation: &str| {
-            let version: i64 = fixture.scalar(&format!(
-                "SELECT version FROM tasks WHERE id='{}'",
-                task.entity_id
-            ));
-            let mut command = serde_json::json!({"kind":kind,"operation_id":operation,"task_id":task.entity_id,
-                "attempt_id":attempt,"expected_version":version,"result_binding_id":result["result_binding_id"],"candidate_hash":candidate});
-            if kind == "request_rework" {
-                command["feedback"] = "One more repair".into();
+        let columns = statement.column_count();
+        let rows = statement
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|column| row.get(column))
+                    .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        baseline.push((table, rows));
+    }
+    for provider in ["codex", "claude"] {
+        for purpose in ["repository_reader", "repository_reviewer"] {
+            let denied = workflow_command(&fixture,serde_json::json!({
+                "kind":"save_agent_profile","operation_id":format!("retired-{provider}-{purpose}"),"project_id":setup.project_id,
+                "profile":{"display_name":purpose,"purpose":purpose,"provider":provider,"model":"fixture","effort":"medium"}
+            })).unwrap_err();
+            assert!(
+                denied.to_string().contains("retired"),
+                "{provider}/{purpose}: {denied}"
+            );
+            for (table, before) in &baseline {
+                let mut statement = connection
+                    .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                    .unwrap();
+                let columns = statement.column_count();
+                let after = statement
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|column| row.get(column))
+                            .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(&after, before, "{provider}/{purpose} changed {table}");
             }
-            workflow_command(&fixture, command)
-        };
-        assert!(decide("accept_result", "accept-live").is_err());
-        exit_single_agent(&fixture, &review);
-        tick_until(&fixture, &app, "single_agent_review_settled");
-        assert!(fixture.store.execution_context(&review.token).is_err());
-        if ordinal == 1 {
-            fixture.assert_scalar("SELECT COUNT(*) FROM single_agent_repair_receipts", 1_i64);
-            fixture.assert_scalar("SELECT COUNT(*) FROM workflow_result_acceptances WHERE decision='changes_requested'", 0_i64);
-            tick_until(&fixture, &app, "rework_materialized");
-            let child: String =
-                fixture.scalar("SELECT child_attempt_id FROM single_agent_repair_receipts");
-            drop(app);
-            fixture.store = Store::open(&fixture.database)
-                .unwrap()
-                .with_synthetic_bundles_for_tests(single_agent_bundles())
-                .unwrap();
-            let context = fixture.store.single_agent_launch_context(&child).unwrap();
-            writer = start_single_agent_fixture_turn(&fixture, context);
-        } else {
-            assert!(decide("request_rework", "third-delivery").is_err());
-            std::fs::write(review.workspace.join("result.txt"), "tampered").unwrap();
-            assert!(decide("accept_result", "accept-tampered").is_err());
-            std::fs::write(review.workspace.join("result.txt"), "DONE\n").unwrap();
-            let accepted = decide("accept_result", "accept-exact").unwrap();
-            assert_eq!(accepted.state, "accepted");
         }
     }
-    fixture.assert_scalar("SELECT COUNT(*) FROM single_agent_review_deliveries", 2_i64);
-    fixture.assert_scalar(
-        "SELECT COUNT(*) FROM single_agent_review_budgets WHERE repair_attempt_id IS NOT NULL",
-        1_i64,
-    );
 }
 
 #[test]
@@ -44069,48 +45150,6 @@ fn single_agent_selected_checks_run_only_under_exact_human_authorization() {
         .iter()
         .any(|item| item.id == review_notice));
 
-    // The checked preset reaches independent review before human acceptance.
-    let reviewer = offline_purpose_profile(&fixture, &setup, "repository_reviewer");
-    let checked = workflow_command(&fixture, serde_json::json!({
-        "kind":"create_task","operation_id":"checked-review","project_id":setup.project_id,
-        "title":"Say done","description":"Write DONE","acceptance_criteria":["The fixture says done"],"priority":0,
-        "selection":{"family":"single_agent","preset":"build_and_review","profile_revision_id":setup.profile_revision_id,
-            "execution_config_revision_id":setup.config_id,"reviewer_profile_revision_id":reviewer,"check_ids":[check_id]}
-    })).unwrap();
-    make_ready(&fixture, &checked.entity_id, checked.version.unwrap()).unwrap();
-    let (writer, _) = running_single_agent(&fixture, &checked.entity_id);
-    single_agent_session_start(&fixture, &writer);
-    finish_single_agent_writer(&fixture, &app, &writer, "result.txt", "DONE\n");
-    let check = single_agent_run(&fixture, &checked.entity_id).checks[0].clone();
-    workflow_command(&fixture, serde_json::json!({
-        "kind":"authorize_check","operation_id":"checked-review-allow","task_id":checked.entity_id,
-        "attempt_id":writer.attempt_id,"check_id":check_id,"exact_command_hash":check.exact_command_hash,
-        "scope_hash":check.scope_hash,"decision":"authorized","lifetime":"once"
-    })).unwrap();
-    tick_until(&fixture, &app, "single_agent_check_finished");
-    tick_until(&fixture, &app, "single_agent_checks_passed");
-    let checked_run = single_agent_run(&fixture, &checked.entity_id);
-    assert_eq!(
-        checked_run.stage,
-        agenticjira::domain::SingleAgentStage::AwaitingReview
-    );
-    assert!(!checked_run
-        .available_actions
-        .contains(&"accept_result".into()));
-    let delivery = app
-        .reviews
-        .prepare_single_agent_review(&writer.attempt_id)
-        .unwrap();
-    fixture.assert_scalar(&format!("SELECT json_array_length(check_receipts_json) FROM single_agent_review_deliveries WHERE id='{delivery}'"), 1_i64);
-    fixture.execute(
-        "UPDATE check_runs SET freshness_state='stale' WHERE attempt_id=?1",
-        [&writer.attempt_id],
-    );
-    assert!(app
-        .reviews
-        .prepare_single_agent_review(&writer.attempt_id)
-        .is_err());
-
     // Only verified integration of this accepted manifest counts.
     let (dependent, version) = single_agent_task(&fixture, &setup);
     let version = workflow::execute(
@@ -44295,9 +45334,59 @@ fn single_agent_writer_resumes_only_its_exact_retained_conversation() {
     let native = single_agent_session_start(&fixture, &context);
     let app = single_agent_application(&fixture);
 
-    // A planned shutdown records the working writer, which then resumes on
-    // its own, in the same session and native conversation.
-    agenticjira::recovery::capture_desired_running_before_drain(&fixture.store).unwrap();
+    // A denied tool can leave an unmatched Pre even after authenticated Stop.
+    // Retained interruption must preserve that unknown outcome, not assert idle.
+    for event in ["UserPromptSubmit", "PreToolUse", "Stop"] {
+        let recorded = fixture
+            .store
+            .save_single_agent_hook_event(
+                &single_agent_channel(&fixture, &context),
+                &HookEnvelope {
+                    provider: context.provider,
+                    payload: serde_json::json!({"hook_event_name":event,"session_id":native,
+                    "cwd":context.workspace,"tool_use_id":"denied-tool",
+                    "tool_name":"Bash","tool_input":{"command":"curl -I https://example.com"}}),
+                },
+                &RolePeerProvenance {
+                    peer_pid: 4242,
+                    peer_process_group_id: 4242,
+                    peer_start_marker: "single-agent-peer".into(),
+                    managed_root_pid: 4242,
+                    managed_root_start_marker: "fixture".into(),
+                    state: "managed_process_group_untrusted_payload".into(),
+                },
+            )
+            .unwrap();
+        if event == "Stop" {
+            assert_eq!(recorded["safe_idle_boundary"], false, "{recorded}");
+        }
+    }
+    let history = || -> String {
+        fixture.scalar(&format!(
+            "SELECT json_group_array(json_object('id',id,'event',event_name,
+            'payload',payload_json,'provenance',provenance_state)) FROM
+            (SELECT * FROM hook_events WHERE session_id='{}' ORDER BY rowid)",
+            context.session_id
+        ))
+    };
+    let unresolved_history = history();
+    fixture.assert_scalar(
+        &format!(
+            "SELECT readiness_state FROM sessions WHERE id='{}'",
+            context.session_id
+        ),
+        "busy_unresolved_hook_work".to_owned(),
+    );
+    let captured =
+        agenticjira::recovery::capture_desired_running_before_drain(&fixture.store).unwrap();
+    assert!(captured.contains(&context.session_id));
+    // This existing host fixture stands in for the managed process. Exercise
+    // the production interrupt reservation before its exact quiescent exit.
+    fixture
+        .store
+        .mark_interrupt_requested(&context.session_id)
+        .unwrap();
+    assert!(fixture.store.execution_context(&context.token).is_err());
     exit_single_agent(&fixture, &context);
     let resumed = tick_until(&fixture, &app, "single_agent_resumed");
     assert_eq!(resumed["session_id"], context.session_id);
@@ -44314,6 +45403,22 @@ fn single_agent_writer_resumes_only_its_exact_retained_conversation() {
     );
     // The earlier turn's credential no longer authorizes anything.
     assert!(fixture.store.execution_context(&context.token).is_err());
+    assert_eq!(history(), unresolved_history);
+    let (new_credential, prior_epoch, quiescent, hook_boundary): (String, String, bool, i64) = fixture.connection().query_row(
+        "SELECT rc.id,ri.prior_transcript_epoch,json_extract(ri.prior_exit_json,'$.process_group_quiescent'),
+            ri.hook_event_boundary_rowid FROM resume_invocations ri JOIN sessions s ON s.id=ri.session_id
+            JOIN role_credentials rc ON rc.role_generation_id=s.role_generation_id AND rc.revoked_at IS NULL
+            WHERE s.id=?1", params![context.session_id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+    ).unwrap();
+    assert_ne!(new_credential, context.credential_id);
+    assert_eq!(prior_epoch, context.transcript_epoch);
+    assert!(quiescent);
+    let last_hook: i64 = fixture.scalar(&format!(
+        "SELECT MAX(rowid) FROM hook_events WHERE session_id='{}'",
+        context.session_id
+    ));
+    assert_eq!(hook_boundary, last_hook);
 
     // A writer that stops on its own without a result waits for a person.
     let (epoch, process): (String, String) = fixture
@@ -44346,6 +45451,53 @@ fn single_agent_writer_resumes_only_its_exact_retained_conversation() {
     assert!(resume.available, "{resume:?}");
     assert!(run.available_actions.contains(&"resume_run".to_owned()));
     assert!(run.available_actions.contains(&"cancel".to_owned()));
+    let prior_exit: String = fixture.scalar(&format!(
+        "SELECT exit_json FROM sessions WHERE id='{}'",
+        context.session_id
+    ));
+    fixture.execute(
+        "UPDATE sessions SET exit_json='{}' WHERE id=?1",
+        params![context.session_id],
+    );
+    assert!(
+        !single_agent_run(&fixture, &task_id)
+            .resume
+            .unwrap()
+            .available,
+        "an exit without group quiescence cannot authorize resume"
+    );
+    fixture.execute(
+        "UPDATE sessions SET exit_json=?1,native_session_id=NULL WHERE id=?2",
+        params![prior_exit, context.session_id],
+    );
+    assert!(
+        !single_agent_run(&fixture, &task_id)
+            .resume
+            .unwrap()
+            .available,
+        "an unidentified native conversation cannot authorize resume"
+    );
+    fixture.execute(
+        "UPDATE sessions SET native_session_id=?1 WHERE id=?2",
+        params![native, context.session_id],
+    );
+    fixture.execute("INSERT INTO recovery_records(id,session_id,attempt_id,state,process_identity_json,detail_json,created_at,updated_at)
+        VALUES('writer-independent-recovery',?1,?2,'attention_required','{}','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        params![context.session_id,context.attempt_id]);
+    assert!(
+        !single_agent_run(&fixture, &task_id)
+            .resume
+            .unwrap()
+            .available,
+        "independent recovery still owns the conversation"
+    );
+    fixture.execute("UPDATE recovery_records SET state='resolved_quiescent' WHERE id='writer-independent-recovery'", []);
+    assert!(
+        single_agent_run(&fixture, &task_id)
+            .resume
+            .unwrap()
+            .available
+    );
     let decision = workflow::state(&fixture.store)
         .unwrap()
         .decisions
@@ -44709,10 +45861,49 @@ fn single_agent_question_stops_its_own_turn_once() {
     let (first_task, version) = single_agent_task(&fixture, &setup);
     make_ready(&fixture, &first_task, version).unwrap();
     let (first, _) = running_single_agent(&fixture, &first_task);
+    let native = single_agent_session_start(&fixture, &first);
+    for event in ["UserPromptSubmit", "PreToolUse", "Stop"] {
+        let recorded = fixture
+            .store
+            .save_single_agent_hook_event(
+                &single_agent_channel(&fixture, &first),
+                &HookEnvelope {
+                    provider: first.provider,
+                    payload: serde_json::json!({"hook_event_name":event,"session_id":native,
+                    "cwd":first.workspace,"tool_use_id":"unresolved-report-tool",
+                    "tool_name":"Bash","tool_input":{"command":"curl -I https://example.com"}}),
+                },
+                &RolePeerProvenance {
+                    peer_pid: 4242,
+                    peer_process_group_id: 4242,
+                    peer_start_marker: "single-agent-peer".into(),
+                    managed_root_pid: 4242,
+                    managed_root_start_marker: "fixture".into(),
+                    state: "managed_process_group_untrusted_payload".into(),
+                },
+            )
+            .unwrap();
+        if event == "Stop" {
+            assert_eq!(recorded["safe_idle_boundary"], false);
+        }
+    }
+    fixture.assert_scalar(
+        &format!(
+            "SELECT readiness_state FROM sessions WHERE id='{}'",
+            first.session_id
+        ),
+        "busy_unresolved_hook_work".to_owned(),
+    );
+    // An unsafe Stop alone supplies no report-stop authority.
+    app.coordinator_tick().unwrap();
+    assert_eq!(stop_reservations(), 0);
     single_agent_question(&fixture, &first, "question-1");
     let stop = tick_until(&fixture, &app, "single_agent_writer_stop");
     assert_eq!(stop["session_id"], first.session_id);
     assert_eq!(stop["transcript_epoch"], first.transcript_epoch);
+    let report_id: String =
+        fixture.scalar("SELECT id FROM role_results WHERE operation_id='question-1'");
+    assert_eq!(stop["role_result_id"], report_id);
     fixture.assert_scalar(
         &format!(
             "SELECT status FROM sessions WHERE id='{}'",
@@ -45592,36 +46783,6 @@ args = ["--unicode"]
             account_error.contains("shared app-server"),
             "{account_error}"
         );
-        let observation_installation = providers::ProviderInstallation {
-            provider: Provider::Codex,
-            executable: providers::capability_identity(&manager_fresh.config)
-                .unwrap()
-                .executable,
-            executable_version: providers::codex::EXACT_CODEX_VERSION.to_owned(),
-        };
-        let observation_policy = agenticjira::provider_compatibility::BundleSet::embedded()
-            .resolve_policy(
-                Provider::Codex,
-                providers::codex::EXACT_CODEX_VERSION,
-                agenticjira::provider_compatibility::PolicyMode::ProviderObservation,
-            )
-            .unwrap();
-        let observation_error = providers::prepare_observation_launch(
-            &observation_installation,
-            observation_policy,
-            "gpt-5.6-sol",
-            "high",
-            &floor_repo,
-            "socket-present observation must be refused",
-            &supervision_executable,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            observation_error.contains("shared app-server"),
-            "{observation_error}"
-        );
-
         for (role, effort, socket_absent_launch) in [
             (RoleKind::Implementer, "medium", &implementer),
             (RoleKind::Manager, "high", &manager_fresh),
@@ -48762,7 +49923,8 @@ fn mb14_stale_exit_cannot_mutate_reserved_or_running_replacement_generation() {
 }
 
 /// Tables read directly or through helper decisions by `workflow::state`.
-const STATE_PROJECTED_TABLES: [&str; 98] = [
+const STATE_PROJECTED_TABLES: [&str; 99] = [
+    "recipe_schedule_authorizations",
     "single_agent_admission_challenges",
     "single_agent_review_budgets",
     "single_agent_review_deliveries",
@@ -48892,6 +50054,31 @@ const CONVERSATION_CURSOR_TABLES: [(&str, bool, bool, bool); 9] = [
     ("conversation_requests", false, false, false),
 ];
 
+const KNOWLEDGE_CURSOR_TABLES: [(&str, &str, bool, bool); 7] = [
+    ("knowledge_entries", "knowledge_entry", true, true),
+    ("knowledge_revisions", "knowledge_revision", false, false),
+    ("knowledge_events", "knowledge_event", false, false),
+    (
+        "knowledge_observations",
+        "knowledge_observation",
+        false,
+        false,
+    ),
+    (
+        "knowledge_operation_receipts",
+        "knowledge_receipt",
+        false,
+        false,
+    ),
+    ("knowledge_manifests", "knowledge_manifest", false, false),
+    (
+        "knowledge_manifest_items",
+        "knowledge_manifest_item",
+        false,
+        false,
+    ),
+];
+
 fn state_untracked_columns(table: &str) -> &'static [&'static str] {
     match table {
         "input_leases" => &["expires_at", "updated_at"],
@@ -48930,6 +50117,9 @@ fn state_revision_triggers_cover_exactly_the_projection_tables() {
         .chain(STATE_UNPROJECTED_TABLES.iter())
         .chain(["state_revision"].iter())
         .chain(CONVERSATION_CURSOR_TABLES.iter().map(|(table, ..)| table))
+        .chain(KNOWLEDGE_CURSOR_TABLES.iter().map(|(table, ..)| table))
+        // Stop-target cursor and immutable identity have causal schema_49 module coverage.
+        .chain(["recipe_schedule_stop_targets"].iter())
         .map(|table| table.to_string())
         .collect::<Vec<_>>();
     classified.sort();
@@ -48951,11 +50141,40 @@ fn state_revision_triggers_cover_exactly_the_projection_tables() {
             DROP TRIGGER single_agent_review_results_immutable; DROP TRIGGER single_agent_repair_receipts_immutable;
             DROP TRIGGER task_conversation_source_immutable_update; DROP TRIGGER task_conversation_source_immutable_delete;")
         .unwrap();
+    // Knowledge immutability has causal module coverage; isolate cursor effects here.
+    connection.execute_batch("DROP TRIGGER knowledge_entry_identity_update; DROP TRIGGER knowledge_revision_immutable_update; DROP TRIGGER knowledge_revision_immutable_delete; DROP TRIGGER knowledge_event_immutable_update; DROP TRIGGER knowledge_event_immutable_delete; DROP TRIGGER knowledge_observation_immutable_update; DROP TRIGGER knowledge_observation_immutable_delete; DROP TRIGGER knowledge_receipt_immutable_update; DROP TRIGGER knowledge_receipt_immutable_delete; DROP TRIGGER knowledge_manifest_immutable_update; DROP TRIGGER knowledge_manifest_immutable_delete; DROP TRIGGER knowledge_manifest_item_immutable_update; DROP TRIGGER knowledge_manifest_item_immutable_delete; ").unwrap();
+    for declaration in include_str!("../migrations/049_recipe_writer_schedules.sql")
+        .split("CREATE TRIGGER ")
+        .skip(1)
+    {
+        let name = declaration.split_whitespace().next().unwrap();
+        if !name.starts_with("state_revision_") {
+            connection
+                .execute_batch(&format!("DROP TRIGGER {name};"))
+                .unwrap();
+        }
+    }
+    // Scope columns are immutable; the cursor tracks their allowed lifecycle changes.
+    let authorization_scope_columns = [
+        "id",
+        "project_id",
+        "schedule_id",
+        "recipe_revision_id",
+        "scope_json",
+        "scope_hash",
+        "max_occurrences",
+        "max_invocations_per_occurrence",
+        "max_runtime_seconds",
+        "start_window_seconds",
+        "created_by",
+        "created_at",
+    ];
     let mut marker = 1_000_000_i64;
     for table in STATE_PROJECTED_TABLES
         .iter()
         .chain(STATE_UNPROJECTED_TABLES.iter())
         .chain(CONVERSATION_CURSOR_TABLES.iter().map(|(table, ..)| table))
+        .chain(KNOWLEDGE_CURSOR_TABLES.iter().map(|(table, ..)| table))
     {
         // Only open observations are projected; their cursor has its own test.
         if *table == "attention_observations" {
@@ -48967,6 +50186,12 @@ fn state_revision_triggers_cover_exactly_the_projection_tables() {
             .find(|(name, ..)| name == table);
         let (insert_advances, update_advances, delete_advances) = conversation
             .map(|(_, insert, update, delete)| (*insert, *update, *delete))
+            .or_else(|| {
+                KNOWLEDGE_CURSOR_TABLES
+                    .iter()
+                    .find(|(name, ..)| name == table)
+                    .map(|(_, _, update, delete)| (true, *update, *delete))
+            })
             .unwrap_or((projected, projected, projected));
         let columns = connection
             .prepare(&format!("PRAGMA table_info({table})"))
@@ -49056,8 +50281,10 @@ fn state_revision_triggers_cover_exactly_the_projection_tables() {
                 )
                 .unwrap();
             assert_eq!(updated, 1, "{table}.{column}");
-            let semantic =
-                update_advances && !state_untracked_columns(table).contains(&column.as_str());
+            let semantic = update_advances
+                && !state_untracked_columns(table).contains(&column.as_str())
+                && !(*table == "recipe_schedule_authorizations"
+                    && authorization_scope_columns.contains(&column.as_str()));
             assert_step(before, semantic, &format!("update {column}"));
             rowid = connection
                 .query_row(
@@ -49239,6 +50466,10 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
             ["insert", "update", "delete"].map(|event| format!("state_revision_{table}_{event}"))
         })
         .collect::<Vec<_>>();
+    expected_triggers.extend([
+        "state_revision_recipe_schedule_stop_targets_insert".to_owned(),
+        "state_revision_recipe_schedule_stop_targets_update".to_owned(),
+    ]);
     for (table, insert, update, delete) in CONVERSATION_CURSOR_TABLES {
         for (event, advances) in [("insert", insert), ("update", update), ("delete", delete)] {
             if advances {
@@ -49246,13 +50477,23 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
             }
         }
     }
+    for (_, stem, update, delete) in KNOWLEDGE_CURSOR_TABLES {
+        expected_triggers.push(format!("state_revision_{stem}_insert"));
+        if update {
+            expected_triggers.push(format!("state_revision_{stem}_update"));
+        }
+        if delete {
+            expected_triggers.push(format!("state_revision_{stem}_delete"));
+        }
+    }
     expected_triggers.sort();
     let mut actual_triggers = triggers.clone();
     actual_triggers.sort();
     assert_eq!(actual_triggers, expected_triggers);
+    restore_schema_47_schedule_storage(&fixture);
     for trigger in &triggers {
         connection
-            .execute_batch(&format!("DROP TRIGGER {trigger}"))
+            .execute_batch(&format!("DROP TRIGGER IF EXISTS {trigger}"))
             .unwrap();
     }
     connection
@@ -49271,6 +50512,7 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
     connection
         .execute_batch(
             "DROP TRIGGER IF EXISTS state_revision_guidance_messages_update;
+             DROP TRIGGER IF EXISTS state_revision_tasks_update;
              DROP TABLE state_revision;
              PRAGMA user_version=28;
              INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
@@ -49285,7 +50527,7 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
         .contains("unsupported database schema version 28"));
 
     let migrated = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 46_i64);
+    fixture.assert_scalar("PRAGMA user_version", 50_i64);
     let migrated_triggers = connection
         .prepare(
             "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'state_revision_%' ORDER BY name",
@@ -49309,6 +50551,7 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
 #[test]
 fn recipe_migration_upgrades_genuine_schema_29_and_readonly_refuses_it() {
     let fixture = Fixture::new("m9-schema-29");
+    restore_schema_47_schedule_storage(&fixture);
     fixture
         .connection()
         .execute_batch(&format!(
@@ -49326,7 +50569,7 @@ fn recipe_migration_upgrades_genuine_schema_29_and_readonly_refuses_it() {
         .unwrap();
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 46_i64);
+    fixture.assert_scalar("PRAGMA user_version", 50_i64);
     assert_eq!(workflow::state(&upgraded).unwrap().schema, 8);
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='recipe_schedule_fires'",
@@ -57910,15 +59153,16 @@ fn final_repair_recheck_reviewer_exit_without_result_closes_through_the_coordina
 #[test]
 fn final_repair_recheck_migration_keeps_the_historical_sixth_ordinary_review() {
     let fixture = final_repair_recheck_fixture("final-repair-recheck-migration");
-    fixture.assert_scalar("PRAGMA user_version", 46_i64);
+    fixture.assert_scalar("PRAGMA user_version", 50_i64);
     let ledger = fixture.scalar::<String>(FINAL_REPAIR_LEDGER);
+    restore_schema_47_schedule_storage(&fixture);
     fixture.execute_batch(&format!(
         "{DROP_AFTER_SCHEMA_32} DROP TABLE final_repair_rechecks; PRAGMA user_version=30;"
     ));
     restore_schema_30_recipe_tables(&fixture);
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 46_i64);
+    fixture.assert_scalar("PRAGMA user_version", 50_i64);
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM final_repair_rechecks", 0);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
@@ -58695,10 +59939,116 @@ fn stale_restart_candidate_cancellation_refuses_live_sessions_and_pending_admiss
 }
 
 const MIGRATION_031_SQL: &str = include_str!("../migrations/031_final_repair_recheck.sql");
+
+fn restore_schema_47_schedule_storage(fixture: &Fixture) {
+    let connection = fixture.connection();
+    connection
+        .execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")
+        .unwrap();
+    for declaration in include_str!("../migrations/049_recipe_writer_schedules.sql")
+        .split("CREATE TRIGGER ")
+        .skip(1)
+    {
+        let name = declaration.split_whitespace().next().unwrap();
+        connection
+            .execute_batch(&format!("DROP TRIGGER IF EXISTS {name};"))
+            .unwrap();
+    }
+    connection
+        .execute_batch("DROP TABLE recipe_schedule_stop_targets;")
+        .unwrap();
+    for table in ["sessions", "resume_invocations"] {
+        connection
+            .execute_batch(&format!(
+                "DROP INDEX IF EXISTS {table}_schedule_occurrence;
+             ALTER TABLE {table} DROP COLUMN schedule_occurrence_id;
+             ALTER TABLE {table} DROP COLUMN schedule_authorization_id;"
+            ))
+            .unwrap();
+    }
+    let historical = include_str!("../migrations/030_recipes.sql");
+    for (table, columns) in [
+        ("recipe_schedule_fires", "schedule_id,scheduled_for_utc,recipe_revision_id,outcome,task_id,reason,missed_first_utc,missed_last_utc,missed_count,created_at"),
+        ("recipe_schedules", "id,project_id,name,recipe_revision_id,cadence,anchor_utc,next_fire_utc,paused,version,archived_at,created_at,updated_at"),
+    ] {
+        let declaration = historical.split_once(&format!("CREATE TABLE {table} (")).unwrap().1
+            .split_once("\n);").unwrap().0;
+        connection.execute_batch(&format!(
+            "CREATE TEMP TABLE schedule_schema_47_rows AS SELECT {columns} FROM {table};
+             DROP TABLE {table}; CREATE TABLE {table} ({declaration}\n);
+             INSERT INTO {table} ({columns}) SELECT {columns} FROM schedule_schema_47_rows;
+             DROP TABLE schedule_schema_47_rows;"
+        )).unwrap();
+    }
+    connection
+        .execute_batch("DROP TABLE recipe_schedule_authorizations;")
+        .unwrap();
+    for (source, table, events) in [
+        (
+            historical,
+            "recipe_schedules",
+            &["insert", "update", "delete"][..],
+        ),
+        (
+            historical,
+            "recipe_schedule_fires",
+            &["insert", "update", "delete"][..],
+        ),
+        (
+            include_str!("../migrations/044_agent_conversations.sql"),
+            "sessions",
+            &["update"][..],
+        ),
+        (
+            include_str!("../migrations/029_state_revision.sql"),
+            "resume_invocations",
+            &["update"][..],
+        ),
+    ] {
+        for event in events {
+            let name = format!("CREATE TRIGGER state_revision_{table}_{event}");
+            let body = source
+                .split_once(&name)
+                .unwrap()
+                .1
+                .split_once("END;")
+                .unwrap()
+                .0;
+            connection
+                .execute_batch(&format!("{name}{body}END;"))
+                .unwrap();
+        }
+    }
+    connection
+        .execute_batch("PRAGMA user_version=47; COMMIT; PRAGMA foreign_keys=ON;")
+        .unwrap();
+}
+
 /// Drops post-32 tables and undoes the sessions owner rebuilds (including the
 /// conversation column, its index and cursor triggers). Callers retaining
-/// recipes also restore their schema-30 shape before upgrading through 046.
+/// recipes also restore their schema-30 shape before upgrading through 049.
 const DROP_AFTER_SCHEMA_32: &str = "PRAGMA foreign_keys=OFF;
+     DROP TRIGGER IF EXISTS state_revision_tasks_update;
+     ALTER TABLE tasks DROP COLUMN knowledge_selection_json;
+     ALTER TABLE tasks DROP COLUMN knowledge_preparation_json;
+     CREATE TRIGGER state_revision_tasks_update AFTER UPDATE ON tasks
+WHEN OLD.id IS NOT NEW.id OR OLD.project_id IS NOT NEW.project_id OR OLD.title IS NOT NEW.title
+  OR OLD.description IS NOT NEW.description
+  OR OLD.acceptance_criteria_json IS NOT NEW.acceptance_criteria_json
+  OR OLD.priority IS NOT NEW.priority OR OLD.manual_order IS NOT NEW.manual_order
+  OR OLD.lifecycle IS NOT NEW.lifecycle OR OLD.attention IS NOT NEW.attention
+  OR OLD.version IS NOT NEW.version OR OLD.archived_at IS NOT NEW.archived_at
+  OR OLD.created_at IS NOT NEW.created_at OR OLD.updated_at IS NOT NEW.updated_at
+  OR OLD.role_overrides_json IS NOT NEW.role_overrides_json OR OLD.ready_at IS NOT NEW.ready_at
+  OR OLD.legacy_json IS NOT NEW.legacy_json
+BEGIN UPDATE state_revision SET revision = revision + 1; END;
+     DROP TABLE knowledge_manifest_items;
+     DROP TABLE knowledge_manifests;
+     DROP TABLE knowledge_operation_receipts;
+     DROP TABLE knowledge_observations;
+     DROP TABLE knowledge_events;
+     DROP TABLE knowledge_revisions;
+     DROP TABLE knowledge_entries;
      DROP TABLE workflow_execution_boundary_conflicts;
      DROP TABLE workflow_execution_boundaries;
      DROP TRIGGER task_conversation_source_task_delete;
@@ -58849,6 +60199,7 @@ const SCHEMA_31_RECEIPT_ROWS: &str = "SELECT group_concat(
 /// authenticated final result; every other receipt has its own attempt.
 fn schema_31_receipt_fixture(name: &str) -> Fixture {
     let fixture = final_repair_recheck_fixture(name);
+    restore_schema_47_schedule_storage(&fixture);
     fixture.execute_batch(&format!(
         "{DROP_AFTER_SCHEMA_32} DROP TABLE final_repair_rechecks; {MIGRATION_031_SQL}
          PRAGMA user_version=31;"
@@ -58927,7 +60278,7 @@ fn normal_final_repair_migration_keeps_every_receipt_and_rolls_back_whole() {
     fixture.assert_scalar("PRAGMA user_version", 31_i64);
 
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 46_i64);
+    fixture.assert_scalar("PRAGMA user_version", 50_i64);
     assert_eq!(fixture.scalar::<String>(SCHEMA_31_RECEIPT_ROWS), rows);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(
@@ -63013,7 +64364,7 @@ fn late_workspace_retry_preserves_winning_cancel_or_recovery() {
                 workspace_id: plan.workspace_id.clone(),
                 expected_version: version,
             };
-            let winning_command = if cancel {
+            let contending_command = if cancel {
                 HumanCommand::CancelWorkspaceReservation {
                     operation_id: "winning-cancel".into(),
                     task_id: plan.task_id.clone(),
@@ -63031,32 +64382,138 @@ fn late_workspace_retry_preserves_winning_cancel_or_recovery() {
                 }
             };
             let bytes = std::fs::read(plan.workspace_path.join("fixture.txt")).unwrap();
+            let main_note =
+                main.then(|| std::fs::read(plan.workspace_path.join("user-note.txt")).unwrap());
             let sessions: i64 = fixture.scalar("SELECT COUNT(*) FROM sessions");
-            let mut winning_result = None;
-            let mut winning_state = None;
-            let late = app.scheduler.synthetic_workspace_retry_interleaving_for_tests(
+            let mut observed = false;
+            let owner = app.scheduler.synthetic_workspace_retry_interleaving_for_tests(
                 "late-retry",
                 &plan.task_id,
                 &plan.attempt_id,
                 &plan.workspace_id,
                 version,
                 || {
-                    // The older Retry has reserved its receipt and completed
-                    // filesystem work; the competing command commits first.
+                    observed = true;
                     fixture.assert_scalar("SELECT json_extract(result_json,'$.state') FROM operation_receipts WHERE operation_id='late-retry'", "workspace_recovery_reserved".to_owned());
-                    let result = app.execute_human_command(&winning_command).unwrap();
-                    assert_eq!(result.state, if cancel { "workspace_reservation_cancelled" } else { "workspace_reservation_recovered" });
-                    winning_result = Some(serde_json::to_value(result).unwrap());
-                    winning_state = Some(workspace_recovery_state(&fixture, &plan));
+                    let before = workspace_recovery_state(&fixture, &plan);
+                    let receipts: i64 = fixture.scalar("SELECT COUNT(*) FROM operation_receipts");
+                    let audit: i64 = fixture.scalar("SELECT COUNT(*) FROM audit_events");
+                    let refused = app.execute_human_command(&contending_command).unwrap_err();
+                    assert!(format!("{refused:#}").contains("Root preparation is active or uncertain"),"{label}: {refused:#}");
+                    assert_eq!(workspace_recovery_state(&fixture, &plan), before);
+                    fixture.assert_scalar("SELECT COUNT(*) FROM operation_receipts",receipts);
+                    fixture.assert_scalar("SELECT COUNT(*) FROM audit_events",audit);
+                    fixture.assert_scalar("SELECT COUNT(*) FROM operation_receipts WHERE operation_id IN ('winning-cancel','winning-retry')",0_i64);
+                    fixture.assert_scalar("SELECT json_extract(result_json,'$.state') FROM operation_receipts WHERE operation_id='late-retry'", "workspace_recovery_reserved".to_owned());
                 },
             ).unwrap();
-            assert_eq!(late.state, "workspace_recovery_stale", "{label}: {late:?}");
-            let winning_state = winning_state.unwrap();
+            assert!(observed, "{label}: retry never reached publication");
             assert_eq!(
-                workspace_recovery_state(&fixture, &plan),
-                winning_state,
-                "{label}"
+                owner.state, "workspace_reservation_recovered",
+                "{label}: {owner:?}"
             );
+            let prepared = workspace_recovery_state(&fixture, &plan);
+            assert_eq!(prepared["claim"]["state"], "running");
+            assert_eq!(prepared["workspace"]["state"], "ready");
+            assert_eq!(
+                prepared["attempt"]["status"],
+                if main { "held" } else { "running" }
+            );
+            assert_eq!(prepared["task"]["version"], version + 1);
+
+            // An intervening control or pin change can still invalidate a late callback.
+            // Enter a new explicit recovery tuple only after the producer released its guard.
+            rewind_workspace_publication(&fixture, &plan, true);
+            let recovery_version: i64 = fixture.scalar(&format!(
+                "SELECT version FROM tasks WHERE id='{}'",
+                plan.task_id
+            ));
+            let mut intervening_state = None;
+            let mut cancellation = None;
+            let interrupted = app.scheduler.synthetic_workspace_retry_interleaving_for_tests(
+                "interrupted-retry", &plan.task_id, &plan.attempt_id, &plan.workspace_id, recovery_version,
+                || {
+                    if cancel {
+                        let requested = app.execute_human_command(&HumanCommand::Control {
+                            operation_id: "cancel-during-late-retry".into(), task_id: plan.task_id.clone(),
+                            expected_version: recovery_version, action: "cancel".into(), payload: serde_json::json!({}),
+                        }).unwrap();
+                        assert_eq!(requested.state,"control_requested");
+                        cancellation = Some(fixture.scalar::<String>("SELECT json_object('state',state,'payload',payload_json,'updated_at',updated_at) FROM controls WHERE requested_operation_id='cancel-during-late-retry'"));
+                    } else {
+                        fixture.execute("UPDATE workflow_run_profiles SET profile_hash='changed-before-publication' WHERE attempt_id=?1",params![plan.attempt_id]);
+                    }
+                    intervening_state = Some(workspace_recovery_state(&fixture, &plan));
+                },
+            ).unwrap();
+            assert!(
+                intervening_state.is_some(),
+                "{label}: invalidation callback did not run"
+            );
+            assert_eq!(
+                interrupted.state,
+                if cancel {
+                    "workspace_recovery_stale"
+                } else {
+                    "workspace_recovery_required"
+                },
+                "{label}: {interrupted:?}"
+            );
+            if cancel {
+                assert_eq!(
+                    workspace_recovery_state(&fixture, &plan),
+                    intervening_state.unwrap()
+                );
+            } else {
+                assert!(
+                    interrupted.detail["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Single agent"),
+                    "{label}: {interrupted:?}"
+                );
+                fixture.execute("UPDATE workflow_run_profiles SET profile_hash=(SELECT profile_hash FROM agent_profile_revisions WHERE id=workflow_run_profiles.profile_revision_id) WHERE attempt_id=?1",params![plan.attempt_id]);
+            }
+            let held = workspace_recovery_state(&fixture, &plan);
+            assert_eq!(held["claim"]["state"], "unknown");
+            assert_eq!(held["attempt"]["status"], "needs_recovery");
+            assert_eq!(held["workspace"]["state"], "recovery_required");
+            assert!(fixture
+                .store
+                .single_agent_launch_context(&plan.attempt_id)
+                .is_err());
+            let fresh_version: i64 = fixture.scalar(&format!(
+                "SELECT version FROM tasks WHERE id='{}'",
+                plan.task_id
+            ));
+            let winning_command = if cancel {
+                HumanCommand::CancelWorkspaceReservation {
+                    operation_id: "winning-cancel".into(),
+                    task_id: plan.task_id.clone(),
+                    attempt_id: plan.attempt_id.clone(),
+                    workspace_id: plan.workspace_id.clone(),
+                    expected_version: fresh_version,
+                }
+            } else {
+                HumanCommand::RetryWorkspaceReservation {
+                    operation_id: "winning-retry".into(),
+                    task_id: plan.task_id.clone(),
+                    attempt_id: plan.attempt_id.clone(),
+                    workspace_id: plan.workspace_id.clone(),
+                    expected_version: fresh_version,
+                }
+            };
+            let winning_result = app.execute_human_command(&winning_command).unwrap();
+            assert_eq!(
+                winning_result.state,
+                if cancel {
+                    "workspace_reservation_cancelled"
+                } else {
+                    "workspace_reservation_recovered"
+                },
+                "{label}: {winning_result:?}"
+            );
+            let winning_state = workspace_recovery_state(&fixture, &plan);
             assert_eq!(
                 winning_state["claim"]["state"],
                 if cancel { "cancelled" } else { "running" }
@@ -63079,21 +64536,53 @@ fn late_workspace_retry_preserves_winning_cancel_or_recovery() {
                 winning_state["task"]["lifecycle"],
                 if cancel { "cancelled" } else { "in_progress" }
             );
-            assert_eq!(winning_state["task"]["version"], version + 1);
+            assert_eq!(winning_state["task"]["version"], fresh_version + 1);
+            let audit: i64 = fixture.scalar("SELECT COUNT(*) FROM audit_events");
+            let receipts: i64 = fixture.scalar("SELECT COUNT(*) FROM operation_receipts");
             assert_eq!(
                 serde_json::to_value(app.execute_human_command(&late_command).unwrap()).unwrap(),
-                serde_json::to_value(late).unwrap()
+                serde_json::to_value(owner).unwrap()
+            );
+            let interrupted_command = HumanCommand::RetryWorkspaceReservation {
+                operation_id: "interrupted-retry".into(),
+                task_id: plan.task_id.clone(),
+                attempt_id: plan.attempt_id.clone(),
+                workspace_id: plan.workspace_id.clone(),
+                expected_version: recovery_version,
+            };
+            assert_eq!(
+                serde_json::to_value(app.execute_human_command(&interrupted_command).unwrap())
+                    .unwrap(),
+                serde_json::to_value(interrupted).unwrap()
             );
             assert_eq!(
                 serde_json::to_value(app.execute_human_command(&winning_command).unwrap()).unwrap(),
-                winning_result.unwrap()
+                serde_json::to_value(winning_result).unwrap()
             );
+            if let Some(cancellation) = cancellation {
+                fixture.assert_scalar("SELECT json_object('state',state,'payload',payload_json,'updated_at',updated_at) FROM controls WHERE requested_operation_id='cancel-during-late-retry'",cancellation);
+            }
             assert_eq!(workspace_recovery_state(&fixture, &plan), winning_state);
+            fixture.assert_scalar("SELECT COUNT(*) FROM audit_events", audit);
+            fixture.assert_scalar("SELECT COUNT(*) FROM operation_receipts", receipts);
             assert_eq!(
                 std::fs::read(plan.workspace_path.join("fixture.txt")).unwrap(),
                 bytes
             );
+            if let Some(main_note) = main_note {
+                assert_eq!(
+                    std::fs::read(plan.workspace_path.join("user-note.txt")).unwrap(),
+                    main_note
+                );
+            }
             fixture.assert_scalar("SELECT COUNT(*) FROM sessions", sessions);
+            fixture.assert_scalar(
+                &format!(
+                    "SELECT COUNT(*) FROM role_generations WHERE attempt_id='{}'",
+                    plan.attempt_id
+                ),
+                0_i64,
+            );
         }
     }
 }
@@ -64698,4 +66187,556 @@ fn stage_a_comments_replay_and_task_activity_isolates_durable_pages() {
         .any(|event| event["body"] == "another task"));
     assert!(workflow::task_activity(&fixture.store, &other, Some(&cursor)).is_err());
     assert!(workflow::task_activity(&fixture.store, &task, Some("malformed")).is_err());
+}
+
+fn approved_task_knowledge(
+    fixture: &Fixture,
+    project: &str,
+    statement: &str,
+) -> agenticjira::domain::KnowledgeEntry {
+    use agenticjira::domain::{KnowledgeMutationRequest, KnowledgeUserActor};
+    let actor = KnowledgeUserActor {
+        user_id: "fixture-human".into(),
+    };
+    let draft: KnowledgeMutationRequest = serde_json::from_value(serde_json::json!({
+        "operation_id":uuid::Uuid::new_v4().to_string(),"project_id":project,
+        "mutation":{"kind":"draft","entry_id":null,"expected_version":null,
+            "body":{"title":"Task reference","statement":statement,"category":"decision","tags":[],"sources":[{"kind":"user_assertion"}]}}
+    })).unwrap();
+    let entry = fixture.store.knowledge_mutate(&actor, &draft).unwrap();
+    let approve = serde_json::from_value(serde_json::json!({
+        "operation_id":uuid::Uuid::new_v4().to_string(),"project_id":project,
+        "mutation":{"kind":"approve","entry_id":entry.id,"expected_version":entry.version,
+            "revision_id":entry.latest_draft_id,"replaces_revision_id":null}
+    }))
+    .unwrap();
+    fixture.store.knowledge_mutate(&actor, &approve).unwrap()
+}
+
+fn task_knowledge_selection(
+    fixture: &Fixture,
+    entry: &agenticjira::domain::KnowledgeEntry,
+) -> agenticjira::domain::KnowledgeSelection {
+    let revision = entry.approved_revision_id.as_ref().unwrap();
+    agenticjira::domain::KnowledgeSelection {
+        entry_id: entry.id.clone(),
+        revision_id: revision.clone(),
+        expected_entry_version: entry.version,
+        observation_fingerprint: fixture
+            .store
+            .knowledge_freshness(&entry.project_id, &entry.id, revision)
+            .unwrap()
+            .fingerprint,
+        acknowledged_warning: false,
+    }
+}
+
+fn task_knowledge_request(
+    fixture: &Fixture,
+    project: &str,
+    task: &str,
+    selection: Vec<agenticjira::domain::KnowledgeSelection>,
+    continuation: Option<(&str, &str, &str)>,
+) -> agenticjira::domain::KnowledgePreviewRequest {
+    use agenticjira::domain::{KnowledgeConsumer, KnowledgePreviewRequest};
+    let (title, description, criteria, version): (String, String, String, i64) = fixture
+        .connection()
+        .query_row(
+            "SELECT title,description,acceptance_criteria_json,version FROM tasks WHERE id=?1",
+            [task],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    KnowledgePreviewRequest {
+        project_id: project.into(),
+        consumer: KnowledgeConsumer::Task {
+            task_id: task.into(),
+            parent_attempt_id: continuation.map(|value| value.0.into()),
+            continuation: continuation.map(|value| value.1.into()),
+            parent_binding_id: continuation.map(|value| value.2.into()),
+        },
+        expected_consumer_version: version,
+        user_text: agenticjira::store::json_hash(
+            &serde_json::json!({"title":title,"description":description,
+            "acceptance_criteria":serde_json::from_str::<serde_json::Value>(&criteria).unwrap()}),
+        )
+        .unwrap(),
+        selection,
+    }
+}
+
+fn confirm_task_knowledge(
+    fixture: &Fixture,
+    request: agenticjira::domain::KnowledgePreviewRequest,
+) -> OperationResult {
+    let preview = fixture.store.knowledge_preview(&request).unwrap();
+    workflow::execute(
+        &fixture.store,
+        &HumanCommand::SetTaskKnowledge {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            request,
+            preview_fingerprint: preview.fingerprint,
+        },
+    )
+    .unwrap()
+}
+
+fn archive_task_knowledge(fixture: &Fixture, entry: &agenticjira::domain::KnowledgeEntry) {
+    fixture.store.knowledge_mutate(&agenticjira::domain::KnowledgeUserActor { user_id: "fixture-human".into() },
+        &serde_json::from_value(serde_json::json!({"operation_id":uuid::Uuid::new_v4().to_string(),"project_id":entry.project_id,
+            "mutation":{"kind":"archive","entry_id":entry.id,"expected_version":entry.version}})).unwrap()).unwrap();
+}
+
+#[test]
+fn repository_knowledge_uses_committed_bytes_and_rejects_unsafe_sources_atomically() {
+    use agenticjira::domain::{KnowledgeMutationRequest, KnowledgeUserActor};
+    use sha2::{Digest, Sha256};
+    let fixture = Fixture::new("knowledge-committed-source");
+    let repository = fixture.repository("repo");
+    std::os::unix::fs::symlink("fixture.txt", repository.join("linked.txt")).unwrap();
+    run(&repository, &["add", "linked.txt"]);
+    run(
+        &repository,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-qm",
+            "source link",
+        ],
+    );
+    let commit = agenticjira::workspace::inspect(&repository).unwrap().head;
+    let project = add_project(&fixture, repository.clone(), "knowledge-source");
+    std::fs::write(
+        repository.join("fixture.txt"),
+        "different dirty worktree bytes\n",
+    )
+    .unwrap();
+    let actor = KnowledgeUserActor {
+        user_id: "fixture-human".into(),
+    };
+    let request = |operation: &str, path: &str| -> KnowledgeMutationRequest {
+        serde_json::from_value(serde_json::json!({"operation_id":operation,"project_id":project,
+            "mutation":{"kind":"draft","entry_id":null,"expected_version":null,
+            "body":{"title":"Committed reference","statement":"Pinned evidence","category":"design","tags":[],
+                "sources":[{"kind":"repository","commit":commit,"path":path}]}}})).unwrap()
+    };
+    let entry = fixture
+        .store
+        .knowledge_mutate(&actor, &request("committed-source", "fixture.txt"))
+        .unwrap();
+    let revision_id = entry.latest_draft_id.as_ref().unwrap();
+    let source = fixture
+        .store
+        .knowledge_source(&project, &entry.id, revision_id, 0)
+        .unwrap();
+    assert_eq!(source.text.as_bytes(), b"base\n");
+    let revision = fixture
+        .store
+        .knowledge_revision(&project, &entry.id, revision_id)
+        .unwrap();
+    assert_eq!(
+        revision.sources[0].content_hash,
+        format!("{:x}", Sha256::digest(b"base\n"))
+    );
+    let unsafe_request = request("linked-source", "linked.txt");
+    let error = fixture
+        .store
+        .knowledge_mutate(&actor, &unsafe_request)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("nonregular Git tree entry"),
+        "{error:#}"
+    );
+    fixture.execute(
+        "UPDATE projects SET repository_identity='different-registration' WHERE id=?1",
+        params![project],
+    );
+    let error = fixture
+        .store
+        .knowledge_mutate(&actor, &request("wrong-registration", "fixture.txt"))
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("registered repository identity changed"),
+        "{error:#}"
+    );
+    fixture.assert_scalar("SELECT COUNT(*) FROM knowledge_entries", 1_i64);
+    fixture.assert_scalar("SELECT COUNT(*) FROM knowledge_revisions", 1_i64);
+    fixture.assert_scalar("SELECT COUNT(*) FROM knowledge_operation_receipts", 1_i64);
+    fixture.assert_scalar("SELECT COUNT(*) FROM knowledge_operation_receipts WHERE operation_id IN ('linked-source','wrong-registration')", 0_i64);
+}
+
+#[test]
+fn task_knowledge_admission_rejects_stale_preview_and_rolls_back_attempt_claim_and_manifest() {
+    let fixture = Fixture::new("knowledge-admission");
+    let paths = instance_paths(&fixture);
+    let project = add_project(&fixture, fixture.repository("repo"), "knowledge");
+    let task = create_task(&fixture, &project, "knowledge-task", 1);
+    let entry = approved_task_knowledge(&fixture, &project, "Use the exact selected revision");
+    let request = task_knowledge_request(
+        &fixture,
+        &project,
+        &task,
+        vec![task_knowledge_selection(&fixture, &entry)],
+        None,
+    );
+    let preview = fixture.store.knowledge_preview(&request).unwrap();
+    let mut stale = request.clone();
+    stale.expected_consumer_version -= 1;
+    assert!(workflow::execute(
+        &fixture.store,
+        &HumanCommand::SetTaskKnowledge {
+            operation_id: "stale-task-preview".into(),
+            request: stale,
+            preview_fingerprint: preview.fingerprint,
+        }
+    )
+    .is_err());
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM tasks WHERE knowledge_selection_json IS NOT NULL",
+        0_i64,
+    );
+    confirm_task_knowledge(&fixture, request);
+    seed_supported_capabilities(&fixture);
+    fixture.execute_batch("CREATE TRIGGER refuse_knowledge_admission BEFORE INSERT ON knowledge_manifests BEGIN SELECT RAISE(ABORT,'knowledge admission failure'); END;");
+    let admission = scheduler(&fixture, paths.artifacts.clone());
+    assert!(admission
+        .claim_next()
+        .unwrap_err()
+        .to_string()
+        .contains("knowledge admission failure"));
+    for table in ["attempts", "claims"] {
+        fixture.assert_scalar(
+            &format!("SELECT COUNT(*) FROM {table} WHERE task_id='{task}'"),
+            0_i64,
+        );
+    }
+    fixture.assert_scalar("SELECT COUNT(*) FROM knowledge_manifests", 0_i64);
+    fixture.assert_scalar(&format!("SELECT COUNT(*) FROM trip_attempt_profiles WHERE attempt_id IN (SELECT id FROM attempts WHERE task_id='{task}')"), 0_i64);
+    fixture.execute("DROP TRIGGER refuse_knowledge_admission", []);
+    archive_task_knowledge(&fixture, &entry);
+    let version: i64 = fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task}'"));
+    assert!(workflow::execute(
+        &fixture.store,
+        &HumanCommand::Control {
+            operation_id: "stale-knowledge-run-next".into(),
+            task_id: task.clone(),
+            expected_version: version,
+            action: "run_next".into(),
+            payload: serde_json::Value::Null,
+        }
+    )
+    .is_err());
+    fixture.assert_scalar(
+        &format!("SELECT version FROM tasks WHERE id='{task}'"),
+        version,
+    );
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='stale-knowledge-run-next'",
+        0_i64,
+    );
+    assert!(admission.claim_next().unwrap().is_none());
+    fixture.assert_scalar(
+        &format!("SELECT COUNT(*) FROM attempts WHERE task_id='{task}'"),
+        0_i64,
+    );
+    fixture.assert_scalar("SELECT COUNT(*) FROM claims", 0_i64);
+    let state = workflow::state(&fixture.store).unwrap();
+    let projected = state.tasks.iter().find(|item| item.id == task).unwrap();
+    assert!(projected.knowledge["admission_hold"]
+        .as_str()
+        .unwrap()
+        .contains("archived"));
+    assert!(state
+        .decisions
+        .iter()
+        .any(|decision| serde_json::to_string(decision)
+            .unwrap()
+            .contains("scheduler.knowledge_hold")));
+}
+
+#[test]
+fn task_knowledge_confirmation_survives_ready_and_run_next_with_exact_replay() {
+    let (fixture, repository) = single_agent_fixture("knowledge-run-next");
+    let setup = admitted_single_agent_project(&fixture, &repository);
+    let (task, _) = single_agent_task(&fixture, &setup);
+    let entry = approved_task_knowledge(&fixture, &setup.project_id, "Exact admitted reference");
+    let request = task_knowledge_request(
+        &fixture,
+        &setup.project_id,
+        &task,
+        vec![task_knowledge_selection(&fixture, &entry)],
+        None,
+    );
+    let preview = fixture.store.knowledge_preview(&request).unwrap();
+    let saved = confirm_task_knowledge(&fixture, request);
+    let ready = make_ready(&fixture, &task, saved.version.unwrap()).unwrap();
+    let command = HumanCommand::Control {
+        operation_id: "knowledge-run-next".into(),
+        task_id: task.clone(),
+        expected_version: ready,
+        action: "run_next".into(),
+        payload: serde_json::Value::Null,
+    };
+    let first = workflow::execute(&fixture.store, &command).unwrap();
+    let replay = workflow::execute(&fixture.store, &command).unwrap();
+    assert_eq!(
+        serde_json::to_value(&first).unwrap(),
+        serde_json::to_value(&replay).unwrap()
+    );
+    let plan = scheduler(&fixture, instance_paths(&fixture).artifacts)
+        .claim_next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.task_id, task);
+    fixture.assert_scalar(
+        &format!("SELECT COUNT(*) FROM attempts WHERE task_id='{task}'"),
+        1_i64,
+    );
+    let raw: String = fixture.scalar(&format!(
+        "SELECT manifest_json FROM knowledge_manifests WHERE attempt_id='{}'",
+        plan.attempt_id
+    ));
+    let manifest: agenticjira::domain::KnowledgeManifest = serde_json::from_str(&raw).unwrap();
+    assert_eq!(manifest.preview.block, preview.block);
+    assert_eq!(manifest.preview.effective_digest, preview.effective_digest);
+    assert_eq!(
+        manifest.request.selection[0].revision_id,
+        entry.approved_revision_id.unwrap()
+    );
+    assert_eq!(
+        workflow::execute(&fixture.store, &command).unwrap().version,
+        first.version
+    );
+    fixture.assert_scalar(
+        &format!(
+            "SELECT manifest_json FROM knowledge_manifests WHERE attempt_id='{}'",
+            plan.attempt_id
+        ),
+        raw,
+    );
+}
+
+fn freeze_fixture_task_knowledge(
+    fixture: &Fixture,
+    plan: &DispatchPlan,
+    selection: Vec<agenticjira::domain::KnowledgeSelection>,
+) -> String {
+    let request = task_knowledge_request(fixture, &plan.project_id, &plan.task_id, selection, None);
+    let preview = fixture.store.knowledge_preview(&request).unwrap();
+    let mut connection = fixture.connection();
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let manifest = agenticjira::knowledge::prepare_knowledge_manifest_in(
+        &tx,
+        &request,
+        &preview.fingerprint,
+        agenticjira::domain::KnowledgeManifestBinding::TaskAttempt {
+            attempt_id: plan.attempt_id.clone(),
+        },
+    )
+    .unwrap();
+    agenticjira::knowledge::insert_knowledge_manifest_in(&tx, &manifest).unwrap();
+    tx.commit().unwrap();
+    serde_json::to_string(&manifest).unwrap()
+}
+
+#[test]
+fn terminal_knowledge_hold_preserves_parent_and_corrected_preparation_continues_once() {
+    let (fixture, _paths, plan, task, candidate) =
+        terminal_replan_fixture("terminal-knowledge-hold");
+    let entry = approved_task_knowledge(&fixture, &plan.project_id, "Parent terminal reference");
+    let parent_manifest = freeze_fixture_task_knowledge(
+        &fixture,
+        &plan,
+        vec![task_knowledge_selection(&fixture, &entry)],
+    );
+    archive_task_knowledge(&fixture, &entry);
+    let evidence = replan_parent_evidence(&fixture, &plan.attempt_id);
+    let command = terminal_replan_command(
+        &fixture,
+        &plan,
+        &task,
+        &candidate,
+        "terminal-knowledge-request",
+        serde_json::json!({}),
+    );
+    let held = workflow::execute(&fixture.store, &command).unwrap();
+    assert_eq!(held.state, "knowledge_hold");
+    assert_eq!(
+        workflow::execute(&fixture.store, &command).unwrap().state,
+        "knowledge_hold"
+    );
+    assert_eq!(replan_parent_evidence(&fixture, &plan.attempt_id), evidence);
+    fixture.assert_scalar("SELECT COUNT(*) FROM rework_intents", 0_i64);
+    let pending_raw: String = fixture.scalar(
+        "SELECT knowledge_preparation_json FROM tasks WHERE knowledge_preparation_json IS NOT NULL",
+    );
+    let pending: serde_json::Value = serde_json::from_str(&pending_raw).unwrap();
+    let request = task_knowledge_request(
+        &fixture,
+        &plan.project_id,
+        &task,
+        vec![],
+        Some((&plan.attempt_id, "terminal_replan", "terminal-result")),
+    );
+    let preview = fixture.store.knowledge_preview(&request).unwrap();
+    let mut input = serde_json::json!({"kind":"prepare_next_run_knowledge","request":{
+        "operation_id":"terminal-knowledge-save","project_id":plan.project_id,"task_id":task,
+        "parent_attempt_id":plan.attempt_id,"continuation_kind":"terminal_replan",
+        "expected_task_version":request.expected_consumer_version,"expected_preparation_version":pending["version"],
+        "parent_result_binding_id":"terminal-result","parent_review_binding_id":"terminal-review",
+        "selection":[],"preview_fingerprint":preview.fingerprint,"action":"save_only"}});
+    let mut stale = input.clone();
+    stale["request"]["parent_result_binding_id"] = "other-result".into();
+    assert!(workflow::execute(&fixture.store, &serde_json::from_value(stale).unwrap()).is_err());
+    fixture.assert_scalar(
+        "SELECT knowledge_preparation_json FROM tasks WHERE knowledge_preparation_json IS NOT NULL",
+        pending_raw,
+    );
+    let saved = workflow::execute(
+        &fixture.store,
+        &serde_json::from_value(input.clone()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved.state, "knowledge_prepared");
+    fixture.assert_scalar("SELECT COUNT(*) FROM rework_intents", 0_i64);
+    input["request"]["expected_preparation_version"] = saved.detail["preparation_version"].clone();
+    input["request"]["operation_id"] = "terminal-knowledge-continue".into();
+    input["request"]["action"] = "save_and_continue_rework".into();
+    let command: HumanCommand = serde_json::from_value(input).unwrap();
+    let child = workflow::execute(&fixture.store, &command).unwrap();
+    assert_eq!(child.state, "replan_created_pending_quiescence");
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM tasks WHERE knowledge_preparation_json IS NOT NULL",
+        0_i64,
+    );
+    assert_eq!(
+        workflow::execute(&fixture.store, &command)
+            .unwrap()
+            .entity_id,
+        child.entity_id
+    );
+    fixture.assert_scalar("SELECT COUNT(*) FROM rework_intents", 1_i64);
+    fixture.assert_scalar(
+        &format!("SELECT phase FROM attempts WHERE id='{}'", child.entity_id),
+        "planning".to_owned(),
+    );
+    fixture.assert_scalar(&format!("SELECT json_extract(manifest_json,'$.preview.block') FROM knowledge_manifests WHERE attempt_id='{}'", child.entity_id), String::new());
+    fixture.assert_scalar(
+        &format!(
+            "SELECT manifest_json FROM knowledge_manifests WHERE attempt_id='{}'",
+            plan.attempt_id
+        ),
+        parent_manifest,
+    );
+    assert_eq!(replan_parent_evidence(&fixture, &plan.attempt_id), evidence);
+}
+
+#[test]
+fn trip_plan_carry_distinguishes_material_knowledge_change_from_freshness_reacknowledgement() {
+    for material_change in [false, true] {
+        let (fixture, _paths, plan, task, candidate) =
+            terminal_replan_fixture(&format!("knowledge-carry-{material_change}"));
+        let entry =
+            approved_task_knowledge(&fixture, &plan.project_id, "Approved parent reference");
+        let parent_manifest = freeze_fixture_task_knowledge(
+            &fixture,
+            &plan,
+            vec![task_knowledge_selection(&fixture, &entry)],
+        );
+        let selected = if material_change {
+            approved_task_knowledge(&fixture, &plan.project_id, "Different material reference")
+        } else {
+            let revision = entry.approved_revision_id.as_ref().unwrap();
+            let observation = fixture
+                .store
+                .knowledge_freshness(&plan.project_id, &entry.id, revision)
+                .unwrap();
+            fixture
+                .store
+                .knowledge_revalidate(
+                    &agenticjira::domain::KnowledgeUserActor {
+                        user_id: "fixture-human".into(),
+                    },
+                    &plan.project_id,
+                    "knowledge-freshness-reack",
+                    &entry.id,
+                    revision,
+                    entry.version,
+                    &observation.fingerprint,
+                )
+                .unwrap();
+            entry
+        };
+        fixture.execute(
+            "UPDATE tasks SET lifecycle='awaiting_review',attention='none' WHERE id=?1",
+            [&task],
+        );
+        fixture.execute("UPDATE attempts SET phase='awaiting_human_review',candidate_hash=?1,accepted_snapshot_id='rejected-snapshot' WHERE id=?2",
+            params![candidate,plan.attempt_id]);
+        let request = task_knowledge_request(
+            &fixture,
+            &plan.project_id,
+            &task,
+            vec![task_knowledge_selection(&fixture, &selected)],
+            Some((&plan.attempt_id, "trip_rework", "rejected-snapshot")),
+        );
+        let preview = fixture.store.knowledge_preview(&request).unwrap();
+        let prepared: HumanCommand = serde_json::from_value(serde_json::json!({"kind":"prepare_next_run_knowledge","request":{
+            "operation_id":"knowledge-carry-prepare","project_id":plan.project_id,"task_id":task,
+            "parent_attempt_id":plan.attempt_id,"continuation_kind":"trip_rework","expected_task_version":request.expected_consumer_version,
+            "expected_preparation_version":null,"parent_result_binding_id":"rejected-snapshot","parent_review_binding_id":null,
+            "selection":request.selection,"preview_fingerprint":preview.fingerprint,"action":"save_only"}})).unwrap();
+        assert_eq!(
+            workflow::execute(&fixture.store, &prepared).unwrap().state,
+            "knowledge_prepared"
+        );
+        let child = workflow::execute(
+            &fixture.store,
+            &HumanCommand::HumanReview {
+                operation_id: "knowledge-carry-child".into(),
+                task_id: task,
+                attempt_id: plan.attempt_id.clone(),
+                expected_version: request.expected_consumer_version,
+                decision: "request_changes".into(),
+                feedback: "Continue the reviewed candidate".into(),
+                carry_plan_approval: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(child.state, "rework_created");
+        fixture.assert_scalar(
+            &format!("SELECT phase FROM attempts WHERE id='{}'", child.entity_id),
+            if material_change {
+                "planning".to_owned()
+            } else {
+                "implementation".to_owned()
+            },
+        );
+        fixture.assert_scalar(
+            &format!(
+                "SELECT plan_approved_at IS NOT NULL FROM attempts WHERE id='{}'",
+                child.entity_id
+            ),
+            !material_change,
+        );
+        fixture.assert_scalar(
+            "SELECT carry_plan_approval FROM rework_intents",
+            !material_change,
+        );
+        fixture.assert_scalar(
+            &format!(
+                "SELECT manifest_json FROM knowledge_manifests WHERE attempt_id='{}'",
+                plan.attempt_id
+            ),
+            parent_manifest,
+        );
+        fixture.assert_scalar(&format!("SELECT json_extract(manifest_json,'$.preview.block') FROM knowledge_manifests WHERE attempt_id='{}'", child.entity_id), preview.block);
+    }
 }

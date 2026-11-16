@@ -185,8 +185,7 @@ export function SingleAgentSelectionFields(
     profile.current_revision ? [{ profile, revision: profile.current_revision }] : []
   );
   const preset = value.preset ?? "single_agent";
-  const profiles = allProfiles.filter(({ revision }) => (revision.purpose ?? "workspace_writer") === (preset === "repository_research" ? "repository_reader" : "workspace_writer"));
-  const reviewers = allProfiles.filter(({ revision }) => revision.purpose === "repository_reviewer");
+  const profiles = allProfiles.filter(({ revision }) => (revision.purpose ?? "workspace_writer") === "workspace_writer");
   if (!execution?.configurations.length) {
     return (
       <p className="hint">
@@ -212,11 +211,10 @@ export function SingleAgentSelectionFields(
           onChange({ execution_config_revision_id: value.execution_config_revision_id, profile_revision_id: "", check_ids: [], ...(preset !== "single_agent" ? { preset } : {}) });
         }}>
           <option value="single_agent">Build with one agent</option>
-          <option value="repository_research">Research the repository</option>
-          <option value="build_and_review">Build and review independently</option>
+          {preset !== "single_agent" && <option value={preset} disabled>Retired · {preset.replaceAll("_", " ")}</option>}
         </select>
       </label>
-      <p className="hint">{preset === "repository_research" ? "Reads an isolated repository and returns a report. Cannot change files or run service checks." : preset === "build_and_review" ? "A writer builds the result. A fresh reader reviews an exact frozen copy before you can accept it. At most one repair and two reviews." : "One writer completes the task in its retained conversation."}</p>
+      <p className="hint">{preset === "single_agent" ? "One writer completes the task in its retained conversation." : "This saved preset has been retired. Choose a writer for a new task; historical runs cannot resume."}</p>
       <label>
         Execution configuration
         <select
@@ -238,17 +236,7 @@ export function SingleAgentSelectionFields(
           ))}
         </select>
       </label>
-      {profiles.length === 0 && <p className="warning">Add a {preset === "repository_research" ? "repository reader" : "workspace writer"} profile in Project settings. Its exact provider version must be qualified and admitted before it can run.</p>}
-      {preset === "build_and_review" && <>
-        <label>Independent reviewer
-          <select value={value.reviewer_profile_revision_id ?? ""} onChange={(event) => onChange({ ...value, reviewer_profile_revision_id: event.target.value })}>
-            <option value="">Choose a fresh read-only reviewer</option>
-            {value.reviewer_profile_revision_id && !reviewers.some(({ revision }) => revision.id === value.reviewer_profile_revision_id) && <option value={value.reviewer_profile_revision_id} disabled>Saved reviewer revision is unavailable</option>}
-            {reviewers.map(({ profile, revision }) => <option key={revision.id} value={revision.id}>{profile.display_name} · {providerName(revision.provider)} · {revision.model} · {revision.effort}</option>)}
-          </select>
-        </label>
-        <p className="hint">{admissionSummary(latestAdmission(execution, value.reviewer_profile_revision_id ?? "", value.execution_config_revision_id))}</p>
-      </>}
+      {profiles.length === 0 && <p className="warning">Add a workspace writer profile in Project settings. Its exact provider version must be qualified and admitted before it can run.</p>}
       <label>
         Agent profile
         <select

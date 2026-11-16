@@ -664,6 +664,13 @@ pub fn begin_actor_request(
             initial_reason
         ],
     )?;
+    // Freeze the epoch and schedule from persisted execution, not the bridge payload.
+    let execution: (String, String, Option<String>, Option<String>) = transaction.query_row(
+        "SELECT transcript_epoch,role_generation_id,schedule_occurrence_id,schedule_authorization_id
+         FROM sessions WHERE id=?1 AND role_generation_id=?2 AND transcript_epoch=?3",
+        params![context.session_id,context.role_generation_id,context.transcript_epoch],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+    )?;
     if !actionable {
         transaction.execute(
             "UPDATE permission_requests SET decision_kind='policy_denied',decision_actor='service_policy',
@@ -712,13 +719,28 @@ pub fn begin_actor_request(
                 "role":context.actor,
                 "tool_name":tool_name,
                 "input_digest":input_digest,
-                "request_hook_event_id":request_hook_event_id
+                "request_hook_event_id":request_hook_event_id,
+                "transcript_epoch":execution.0,
+                "role_generation_id":execution.1,
+                "occurrence_id":execution.2,
+                "authorization_id":execution.3
             })
             .to_string(),
             now.to_rfc3339()
         ],
     )?;
     if actionable {
+        if let Err(error) = require_scheduled_allow_in(store, &transaction, &request_id) {
+            expire_request(
+                &transaction,
+                &request_id,
+                &format!("{error:#}"),
+                &now.to_rfc3339(),
+                None,
+            )?;
+            transaction.commit()?;
+            return Ok(BridgeStart::Pending { request_id });
+        }
         if let (Some(candidate), Some(request_context)) =
             (family.as_ref(), request_context.as_ref())
         {
@@ -1103,6 +1125,92 @@ pub fn native_resolution_bridge_response(
     Ok(response)
 }
 
+// Invalidation changes delivery ownership, never an already recorded human decision.
+pub(crate) fn invalidate_schedule_in(
+    connection: &Connection,
+    occurrence: &str,
+    reason: &str,
+    now: &str,
+) -> Result<()> {
+    let ids = permission_ids(
+        connection,
+        "SELECT pr.id FROM permission_requests pr JOIN sessions s ON s.id=pr.session_id
+         JOIN attempts run ON run.id=pr.attempt_id
+         JOIN recipe_schedule_fires f ON f.id=?1
+         WHERE (s.schedule_occurrence_id=f.id OR run.task_id=f.task_id)
+           AND pr.delivery_state IN ('not_reserved','reserved')",
+        occurrence,
+    )?;
+    for id in ids {
+        expire_request(connection, &id, reason, now, None)?;
+    }
+    Ok(())
+}
+
+fn require_scheduled_allow_in(store: &Store, connection: &Connection, request: &str) -> Result<()> {
+    let binding: Option<(String, String, String, String, String)> = connection
+        .query_row(
+            "SELECT f.id,pr.task_id,pr.attempt_id,s.transcript_epoch,pr.role_generation_id
+         FROM permission_requests pr JOIN sessions s ON s.id=pr.session_id
+         JOIN attempts run ON run.id=pr.attempt_id
+         JOIN recipe_schedule_fires f ON f.task_id=run.task_id OR f.id=s.schedule_occurrence_id
+         WHERE pr.id=?1 AND f.authorization_id IS NOT NULL",
+            [request],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((occurrence, task, attempt, epoch, generation)) = binding else {
+        return Ok(());
+    };
+    let exact: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM permission_requests pr
+         JOIN sessions s ON s.id=pr.session_id AND s.role_generation_id=pr.role_generation_id
+         JOIN role_generations g ON g.id=s.role_generation_id AND g.attempt_id=pr.attempt_id
+         JOIN attempts run ON run.id=g.attempt_id AND run.task_id=pr.task_id
+         JOIN tasks t ON t.id=run.task_id AND t.project_id=pr.project_id
+         JOIN recipe_schedule_fires f ON f.id=?2 AND f.task_id=t.id
+         JOIN execution_bindings e ON e.role_generation_id=g.id AND e.attempt_id=run.id
+           AND e.actor=g.role AND e.slot_key=g.role
+         JOIN workflow_run_profiles rp ON rp.attempt_id=run.id AND rp.slot_key=e.slot_key
+           AND rp.policy_hash=e.policy_hash AND rp.session_contract=e.session_contract
+         WHERE pr.id=?1 AND s.schedule_occurrence_id=f.id AND s.schedule_authorization_id=f.authorization_id
+           AND s.status='running' AND g.status NOT IN ('replaced','revoked','exited')
+           AND g.role=pr.role AND g.provider=pr.provider AND s.provider=pr.provider
+           AND s.native_session_id=pr.native_session_id AND s.capability_key=pr.policy_fingerprint
+           AND EXISTS(SELECT 1 FROM audit_events audit WHERE audit.entity_kind='permission_request'
+             AND audit.entity_id=pr.id AND audit.event_code='permission.requested'
+             AND json_extract(audit.detail_json,'$.transcript_epoch')=s.transcript_epoch
+             AND json_extract(audit.detail_json,'$.role_generation_id')=g.id
+             AND json_extract(audit.detail_json,'$.occurrence_id')=f.id
+             AND json_extract(audit.detail_json,'$.authorization_id')=f.authorization_id)
+           AND NOT EXISTS(SELECT 1 FROM recovery_records WHERE id='database-restore-hold' AND state='attention_required'))",
+        params![request,occurrence], |row| row.get(0),
+    )?;
+    if !exact || epoch.is_empty() || generation.is_empty() {
+        bail!("Scheduled permission no longer matches its exact execution identity")
+    }
+    store.require_schedule_permission_clock_in(connection, &occurrence)?;
+    crate::recipes::schedule_authority_in(
+        connection,
+        &store.compatibility_bundles,
+        &occurrence,
+        &task,
+        Some(&attempt),
+        false,
+        Utc::now(),
+    )?;
+    store.require_schedule_permission_clock_in(connection, &occurrence)?;
+    Ok(())
+}
+
 pub fn consume_ready_response(
     store: &Store,
     request_id: &str,
@@ -1277,7 +1385,13 @@ pub fn consume_actor_response(
     } else {
         false
     };
-    let mut invalid = row.delivery_state == "deny_required"
+    let actor_epoch_current: bool = transaction.query_row(
+        "SELECT transcript_epoch=?2 FROM sessions WHERE id=?1",
+        params![row.session, credential_context.transcript_epoch],
+        |row| row.get(0),
+    )?;
+    let mut invalid = !actor_epoch_current
+        || row.delivery_state == "deny_required"
         || !credential_current
         || row.boot != service_boot_id
         || row.connection != connection_nonce
@@ -1377,6 +1491,12 @@ pub fn consume_actor_response(
                  WHERE id=?2 AND delivery_state IN ('not_reserved','deny_required')",
                 params![now, request_id],
             )?;
+        }
+    }
+    if matches!(state.as_str(), "approved_once" | "approved_rule") && !invalid {
+        if let Err(error) = require_scheduled_allow_in(store, &transaction, request_id) {
+            expire_request(&transaction, request_id, &format!("{error:#}"), &now, None)?;
+            invalid = true;
         }
     }
     let allow = matches!(state.as_str(), "approved_once" | "approved_rule") && !invalid;
@@ -1661,6 +1781,7 @@ fn matching_rule_current(
 }
 
 pub fn apply_human_decision(
+    store: &Store,
     transaction: &Transaction<'_>,
     operation_id: &str,
     request_id: &str,
@@ -1793,6 +1914,7 @@ pub fn apply_human_decision(
         }
     }
     if decision != PermissionDecision::Deny {
+        require_scheduled_allow_in(store, transaction, request_id)?;
         let provider_kind: Provider = provider.parse().map_err(|error: String| anyhow!(error))?;
         let exact_input: serde_json::Value = serde_json::from_str(&input_json)
             .context("permission request no longer contains its exact structured action")?;
@@ -2093,13 +2215,14 @@ fn request_context(
              FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
              JOIN attempts a ON a.id=rg.attempt_id JOIN tasks t ON t.id=a.task_id
              JOIN projects p ON p.id=t.project_id JOIN workspaces w ON w.attempt_id=a.id
-             WHERE s.id=?1 AND rg.id=?2 AND a.id=?3 AND t.id=?4 AND p.id=?5",
+             WHERE s.id=?1 AND rg.id=?2 AND a.id=?3 AND t.id=?4 AND p.id=?5 AND s.transcript_epoch=?6",
             params![
                 context.session_id,
                 context.role_generation_id,
                 context.attempt_id,
                 context.task_id,
-                context.project_id
+                context.project_id,
+                context.transcript_epoch
             ],
             |row| {
                 Ok((

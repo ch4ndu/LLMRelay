@@ -424,6 +424,7 @@ struct ComparisonTask {
     lifecycle: String,
     archived: bool,
     runs: Vec<ComparisonRun>,
+    recipe_attribution: Option<crate::domain::ComparisonRecipeAttribution>,
 }
 
 struct ComparisonRun {
@@ -436,6 +437,7 @@ struct ComparisonRun {
     candidate: Option<String>,
     selection_revision: i64,
     executions: Vec<ComparisonExecution>,
+    recipe_attribution: Option<crate::domain::ComparisonRecipeAttribution>,
 }
 
 struct ComparisonExecution {
@@ -538,10 +540,12 @@ fn read_tasks(connection: &Connection) -> Result<Vec<ComparisonTask>> {
                 lifecycle: row.get(3)?,
                 archived: row.get(4)?,
                 runs: Vec::new(),
+                recipe_attribution: None,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for task in &mut tasks {
+        task.recipe_attribution = read_recipe_attribution(connection, &task.id, None)?;
         let mut statement = connection.prepare(
             "SELECT a.id,a.created_at,a.status,a.human_acceptance_at,b.family,b.definition_id,
                     a.candidate_hash,a.selected_checks_revision,a.workflow_version
@@ -566,10 +570,12 @@ fn read_tasks(connection: &Connection) -> Result<Vec<ComparisonTask>> {
                     candidate: row.get(6)?,
                     selection_revision: row.get(7)?,
                     executions: Vec::new(),
+                    recipe_attribution: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for run in &mut task.runs {
+            run.recipe_attribution = read_recipe_attribution(connection, &task.id, Some(&run.id))?;
             if run.workflow.as_deref() == Some("single_agent") {
                 run.preset = crate::workflow::run_preset(connection, &run.id)
                     .ok()
@@ -582,6 +588,46 @@ fn read_tasks(connection: &Connection) -> Result<Vec<ComparisonTask>> {
         }
     }
     Ok(tasks)
+}
+
+fn read_recipe_attribution(
+    connection: &Connection,
+    task: &str,
+    attempt: Option<&str>,
+) -> Result<Option<crate::domain::ComparisonRecipeAttribution>> {
+    // A task's schedule is origin evidence, not authority for unrelated attempts.
+    let attribution = connection
+        .query_row(
+            "WITH RECURSIVE lineage(id) AS (
+            SELECT id FROM attempts WHERE id=?2 AND task_id=?1
+            UNION
+            SELECT a.parent_attempt_id FROM attempts a JOIN lineage l ON l.id=a.id
+             WHERE a.task_id=?1 AND a.parent_attempt_id IS NOT NULL
+         )
+         SELECT b.recipe_revision_id,r.title,b.schedule_id,b.scheduled_for_utc,
+                f.id,f.authorization_id,f.attempt_id,f.outcome,f.reason
+         FROM task_recipe_bindings b JOIN task_recipe_revisions r ON r.id=b.recipe_revision_id
+         LEFT JOIN recipe_schedule_fires f ON f.task_id=b.task_id AND f.schedule_id=b.schedule_id
+           AND f.scheduled_for_utc=b.scheduled_for_utc AND f.recipe_revision_id=b.recipe_revision_id
+         WHERE b.task_id=?1 AND (?2 IS NULL OR (f.attempt_id IS NOT NULL
+             AND f.attempt_id IN (SELECT id FROM lineage)))",
+            params![task, attempt],
+            |row| {
+                Ok(crate::domain::ComparisonRecipeAttribution {
+                    recipe_revision_id: row.get(0)?,
+                    recipe_title: row.get(1)?,
+                    schedule_id: row.get(2)?,
+                    scheduled_for_utc: row.get(3)?,
+                    occurrence_id: row.get(4)?,
+                    authorization_id: row.get(5)?,
+                    root_attempt_id: row.get(6)?,
+                    occurrence_outcome: row.get(7)?,
+                    occurrence_reason: row.get(8)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(attribution)
 }
 
 fn read_executions(
@@ -969,6 +1015,14 @@ fn evidence_row(
         unit_id: unit.id.into(),
         task_id: unit.task.id.clone(),
         attempt_id: run.map(|run| run.id.clone()),
+        recipe_attribution: match run {
+            Some(run) => run.recipe_attribution.clone(),
+            None if unit.id == unit.task.id => unit.task.recipe_attribution.clone(),
+            None => unit
+                .runs
+                .first()
+                .and_then(|run| run.recipe_attribution.clone()),
+        },
         source: source.map(|(kind, id)| HistoricalSourceKey {
             task_id: unit.task.id.clone(),
             attempt_id: run.map(|run| run.id.clone()),
@@ -1940,13 +1994,23 @@ fn bound_evidence_text(row: &mut ComparisonEvidenceRow) {
         ComparisonEvidenceFact::Timing { invocation } => invocation.unavailable_reason.as_mut(),
         _ => None,
     };
+    let mut texts = Vec::new();
     if let Some(reason) = reason {
-        if reason.len() > 4096 {
+        texts.push(reason);
+    }
+    if let Some(attribution) = &mut row.recipe_attribution {
+        texts.push(&mut attribution.recipe_title);
+        if let Some(reason) = &mut attribution.occurrence_reason {
+            texts.push(reason);
+        }
+    }
+    for text in texts {
+        if text.len() > 4096 {
             let mut end = 4096;
-            while !reason.is_char_boundary(end) {
+            while !text.is_char_boundary(end) {
                 end -= 1;
             }
-            reason.truncate(end);
+            text.truncate(end);
             row.truncated = true;
         }
     }
