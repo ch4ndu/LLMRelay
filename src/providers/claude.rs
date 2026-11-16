@@ -8,6 +8,9 @@ pub const LAUNCH_CONTRACT_REVISION: &str = "llmrelay-claude-launch-v2";
 pub const RESUME_CONTRACT_REVISION: &str = "llmrelay-claude-resume-v2";
 pub const CREDENTIAL_CONTRACT_REVISION: &str = "llmrelay-local-credential-v1";
 pub const EXACT_CLAUDE_VERSION: &str = "2.1.289 (Claude Code)";
+pub(crate) const CURRENT_SINGLE_AGENT_VERSION: &str = "2.1.325 (Claude Code)";
+pub(crate) const CURRENT_SINGLE_AGENT_MODEL: &str = "claude-opus-5-5";
+pub(crate) const CURRENT_SINGLE_AGENT_EFFORT: &str = "high";
 pub const OBSERVATION_LAUNCH_REVISION: &str = "llmrelay-claude-observation-launch-v1";
 pub const OBSERVATION_POLICY_REVISION: &str = "claude-observation-no-tools-v1";
 pub const SINGLE_AGENT_LAUNCH_REVISION: &str = "llmrelay-claude-single-agent-launch-v2";
@@ -368,6 +371,34 @@ pub(crate) fn prepare_with_bundles(
     })
 }
 
+fn single_agent_revision_and_write_denials<'a>(
+    version: &str,
+    request: &super::SingleAgentLaunchRequest<'_>,
+    scope: &'a super::SingleAgentReadScope,
+) -> Result<(&'static str, Option<&'a [PathBuf]>)> {
+    let (_, revision) = crate::provider_compatibility::expected_native_revisions(
+        Provider::Claude,
+        version,
+        crate::provider_compatibility::PolicyMode::SingleAgentWriter,
+    )
+    .map_err(|()| anyhow::anyhow!("No exact Claude Single agent writer native policy"))?;
+    if version == CURRENT_SINGLE_AGENT_VERSION {
+        if request.model != CURRENT_SINGLE_AGENT_MODEL
+            || request.effort != CURRENT_SINGLE_AGENT_EFFORT
+        {
+            bail!("Claude Code 2.1.325 requires claude-opus-5-5 with high effort")
+        }
+        if request.checkout_scope.is_some() {
+            bail!(
+                "Claude Code 2.1.325 requires an isolated worktree; Main checkout is not qualified"
+            )
+        }
+        Ok((revision, Some(&scope.write_denials)))
+    } else {
+        Ok((revision, None))
+    }
+}
+
 /// The Single agent writer's native Claude invocation under its own compiled
 /// policy: worktree edits in the native sandbox, the channel's context and
 /// report commands, and permission prompts a person decides through LLMRelay.
@@ -389,12 +420,14 @@ pub(crate) fn single_agent_native(
     } else {
         super::executable_and_version(Provider::Claude)?
     };
+    let (policy_revision, write_denials) =
+        single_agent_revision_and_write_denials(&version, request, &scope)?;
     let canonical_role_socket = canonical_role_socket(request.role_socket)?;
     let settings_argument = native_sandbox_settings_argument(
         &request.assets.claude_implementer_settings,
         &canonical_role_socket,
         &scope.denied_roots,
-        None,
+        write_denials,
         Some(&scope),
     )?;
     let channel = request.executable_path.display();
@@ -477,7 +510,7 @@ pub(crate) fn single_agent_native(
         .pointer_mut("/sandbox/filesystem/allowRead/0")
         .context("Claude Single agent settings lack the current worktree read grant")? =
         serde_json::json!("<worktree>");
-    let security_policy = serde_json::json!({
+    let mut security_policy = serde_json::json!({
         "restricted": true,
         "permission_mode": "default",
         "permission_request_timeout_seconds": crate::permissions::PROVIDER_PERMISSION_TIMEOUT_SECONDS,
@@ -486,7 +519,7 @@ pub(crate) fn single_agent_native(
         "denied": denied,
         "mcp": "strict_empty",
         "native_sandbox": {
-            "policy_revision": SINGLE_AGENT_POLICY_REVISION,
+            "policy_revision": policy_revision,
             "fail_if_unavailable": true,
             "allow_unsandboxed_commands": false,
             "network_allow_unix_sockets": [&canonical_role_socket],
@@ -499,6 +532,10 @@ pub(crate) fn single_agent_native(
         "additional_directories": [],
         "hooks": "native_explicit_trust",
     });
+    if let Some(write_denials) = write_denials {
+        security_policy["native_sandbox"]["filesystem_deny_write"] =
+            serde_json::json!(write_denials);
+    }
     Ok(super::SingleAgentNative {
         executable,
         executable_version: version,
@@ -507,7 +544,7 @@ pub(crate) fn single_agent_native(
         role_socket: canonical_role_socket,
         account_identity: inspect_observation_account().account_identity,
         config_identity: serde_json::json!({
-            "revision": SINGLE_AGENT_POLICY_REVISION,
+            "revision": policy_revision,
             "settings_sha256": hex::encode(sha2::Sha256::digest(serde_json::to_vec(&settings_identity)?)),
         }),
         security_policy,
@@ -1470,6 +1507,157 @@ mod tests {
         assert!(writer_identity.security_policy["native_sandbox"]
             .get("filesystem_deny_write")
             .is_none());
+
+        let service_root = paths.root.canonicalize().unwrap();
+        let worktree = service_root.join("artifacts/worktrees/claude-v3");
+        let repository = root.join("repository");
+        let git_common = repository.join(".git");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&git_common).unwrap();
+        let roots = vec![
+            git_common.canonicalize().unwrap(),
+            repository.canonicalize().unwrap(),
+        ];
+        let mut request = super::super::SingleAgentLaunchRequest {
+            purpose: crate::domain::ProfilePurpose::WorkspaceWriter,
+            provider: Provider::Claude,
+            model: CURRENT_SINGLE_AGENT_MODEL,
+            effort: "high",
+            cwd: &worktree,
+            read_denials: &roots,
+            service_root: &service_root,
+            prompt: "writer policy",
+            role_socket: &paths.role_socket,
+            token: "writer-token",
+            role_generation_id: "writer-generation",
+            session_id: "writer-session",
+            native_session_id: None,
+            assets: &assets,
+            executable_path: &executable,
+            bundles: &bundles,
+            checkout_scope: None,
+        };
+        let scope = super::super::single_agent_read_scope(&request).unwrap();
+        let mut expected_roots = roots.clone();
+        expected_roots.sort();
+        assert_eq!(scope.write_denials, expected_roots);
+        assert!(scope.denied_roots.contains(&service_root));
+        assert!(scope
+            .write_denials
+            .iter()
+            .all(|root| !worktree.starts_with(root)));
+        let (revision, write_denials) =
+            single_agent_revision_and_write_denials(CURRENT_SINGLE_AGENT_VERSION, &request, &scope)
+                .unwrap();
+        assert_eq!(revision, "claude-single-agent-writer-v3");
+        assert_eq!(write_denials, Some(expected_roots.as_slice()));
+        let settings: serde_json::Value = serde_json::from_str(
+            &native_sandbox_settings_argument(
+                &assets.claude_implementer_settings,
+                &paths.role_socket,
+                &scope.denied_roots,
+                write_denials,
+                Some(&scope),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            settings["sandbox"]["filesystem"]["denyWrite"],
+            serde_json::json!(expected_roots)
+        );
+        assert!(!settings["sandbox"]["filesystem"]["denyWrite"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(service_root)));
+        assert_eq!(
+            single_agent_revision_and_write_denials(EXACT_CLAUDE_VERSION, &request, &scope)
+                .unwrap(),
+            (SINGLE_AGENT_POLICY_REVISION, None)
+        );
+        let historical_settings: serde_json::Value = serde_json::from_str(
+            &native_sandbox_settings_argument(
+                &assets.claude_implementer_settings,
+                &paths.role_socket,
+                &scope.denied_roots,
+                None,
+                Some(&scope),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(historical_settings["sandbox"]["filesystem"]
+            .get("denyWrite")
+            .is_none());
+        assert_ne!(
+            crate::store::json_hash(&settings).unwrap(),
+            crate::store::json_hash(&historical_settings).unwrap()
+        );
+
+        let main_scope = serde_json::json!({"workspace_mode":"main_checkout"});
+        for (model, effort, main) in [
+            ("claude-opus-4-1", "high", false),
+            (CURRENT_SINGLE_AGENT_MODEL, "medium", false),
+            (CURRENT_SINGLE_AGENT_MODEL, "high", true),
+        ] {
+            request.model = model;
+            request.effort = effort;
+            request.checkout_scope = main.then_some(&main_scope);
+            assert!(single_agent_revision_and_write_denials(
+                CURRENT_SINGLE_AGENT_VERSION,
+                &request,
+                &scope
+            )
+            .is_err());
+        }
+        request.model = CURRENT_SINGLE_AGENT_MODEL;
+        request.effort = CURRENT_SINGLE_AGENT_EFFORT;
+        request.checkout_scope = None;
+        let binding = crate::provider_compatibility::BundleSet::embedded()
+            .resolve_policy(
+                Provider::Claude,
+                CURRENT_SINGLE_AGENT_VERSION,
+                crate::provider_compatibility::PolicyMode::SingleAgentWriter,
+            )
+            .unwrap();
+        for fault in 0..5 {
+            // Use generated v3 settings without native executable discovery.
+            let mut native = single_agent_native(&request).unwrap();
+            native.executable_version = CURRENT_SINGLE_AGENT_VERSION.into();
+            native.config_identity["revision"] = revision.into();
+            let mut settings_identity = settings.clone();
+            settings_identity["sandbox"]["filesystem"]["allowRead"][0] = "<worktree>".into();
+            native.config_identity["settings_sha256"] =
+                crate::store::json_hash(&settings_identity).unwrap().into();
+            let index = native
+                .arguments
+                .iter()
+                .position(|a| a == "--settings")
+                .unwrap()
+                + 1;
+            native.arguments[index] = settings.to_string();
+            native.security_policy["native_sandbox"]["policy_revision"] = revision.into();
+            native.security_policy["native_sandbox"]["filesystem_deny_write"] =
+                serde_json::json!(expected_roots);
+            let mut bound = binding.clone();
+            match fault {
+                1 => native.executable_version = EXACT_CLAUDE_VERSION.into(),
+                2 => bound.launch_revision = Some(SINGLE_AGENT_LAUNCH_REVISION.into()),
+                3 => bound.contract_revision = "guessed".into(),
+                4 => native.config_identity["revision"] = SINGLE_AGENT_POLICY_REVISION.into(),
+                _ => {}
+            }
+            let assembled = super::super::assemble_single_agent_launch(&request, native, &bound);
+            assert_eq!(assembled.is_ok(), fault == 0);
+            if let Ok(launch) = assembled {
+                let identity = launch.identity;
+                assert_eq!(identity.policy_binding_hash, binding.effective_hash);
+                assert_eq!(
+                    identity.security_policy["native_sandbox"]["filesystem_deny_write"],
+                    serde_json::json!(expected_roots)
+                );
+            }
+        }
 
         let mut corrupted = identity.clone();
         let settings = corrupted

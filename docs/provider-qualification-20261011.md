@@ -62,6 +62,41 @@ The original writer pair used application executable SHA-256 `406e03b398c972c99a
 
 Raw evidence remains in the ignored qualification ledger.
 
+## Claude 2.1.325 Single agent writer
+
+Independent final review F1 on 2026-11-16 approved the exact Claude Code
+`2.1.325 (Claude Code)` / `claude-opus-5-5` / `high` / isolated-worktree
+candidate evidence. Policy pack revision 3 qualifies only that v3 writer.
+Its retained internal candidate IDs preserve effective authority SHA-256
+`6a4286c71321235917bbd2d48de51b5af735684e8392d8b2bae6e7d2b72868fe`.
+The stored profile policy remains v2; exact native launch and sandbox revisions
+are v3. The 2.1.289 selector and its earlier evidence remain unchanged.
+
+The initial and resumed turns established owned worktree controls, nine
+protected-target denials per turn (six shell EPERM results and three restricted
+Read refusals), control-socket EPERM, retained nonce recall, one accepted
+authenticated report, correlated Stop and revocation of both credentials.
+Independent review correlated all thirteen inline hooks, runner, native
+version/model/effort/settings-source captures, workspace trust and authenticated
+writer-hook delivery. Dependency-aware batching was accepted; strict one-call
+sequencing was not established. No report permission prompt occurred, which
+establishes no allowlist cause. The raw receipt remains incomplete / exit 101
+with independent-review flags false; separate review adjudicates that evidence.
+
+Production integration preserves the candidate's argv, environment, generated
+settings, security/config identity, hooks, prompt, role channel and resume path
+for the approved tuple. Only pre-spawn eligibility checks and binding
+qualification/pack provenance change; the full bundle hash changes. Source
+comparison supports reuse, subject to integration verification and final review;
+it is not a fresh native run. Retained evidence and F1 remain in the ignored
+`claude_probe_dependencies_20261116` ledger.
+
+Main checkout, other models/efforts/versions, reader/reviewer/observation modes,
+six-role TRIP and literal-guidance delivery gain no 325 qualification. Native
+folder/hook trust remains a manual operator decision for the intended scope.
+Every project profile still requires a fresh matching probe and admission;
+2.1.289 proofs cannot authorize 325, and projects are never automatically trusted.
+
 ## Codex observation restriction repair
 
 The original observation argv exposed `view_image`: the retained `observation-policy-diagnostics` record contains a native image-load attempt against an absent owned file despite the expected nonce response. That is counterevidence to no-tool exclusion. The `observation-policy-candidate` record shows strict configuration rejected `tools.view_image=false` before a native session; this key is not shipped.

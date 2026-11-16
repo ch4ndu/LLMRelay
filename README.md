@@ -13,7 +13,7 @@ A **workflow** is the sequence of steps a task follows.
 | **Single agent** | One agent works on the task, submits a result, and runs any checks you selected. You review and accept it or request changes. | A small fix, a focused change, or your first task. No TRIP installation is needed. |
 | **TRIP** | Separate agent sessions plan, implement and review the change. You approve the plan and implementation, then review the final result. | A larger change where you want a structured plan and independent reviews. |
 
-Both workflows are implemented. Single-agent execution has native verification records for Codex and Claude. Complete TRIP tasks have also reached acceptance using only Codex and only Claude. Your own project profiles still need their setup checks before they can run.
+Both workflows are implemented. Single-agent execution has native verification records for Codex and Claude. Complete TRIP tasks have also reached acceptance using only Codex and only Claude. Exact Claude Code 2.1.325 supports the Single agent writer only with Opus 5.5 at high effort in an isolated worktree; see the [qualified scope and evidence limits](docs/provider-qualification-20261011.md#claude-21325-single-agent-writer). Your own project profiles still need fresh matching setup checks before they can run.
 
 Recipes and draft schedules support TRIP and the ordinary Single agent writer. The unqualified Repository research and Build and review presets, and automatic recipe execution, are retired. Historical records remain readable. Codex and Claude provider support remains available under their qualified contracts. Custom workflow editing is not available.
 

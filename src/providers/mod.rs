@@ -587,6 +587,7 @@ pub struct SingleAgentLaunchRequest<'a> {
 struct SingleAgentReadScope {
     worktree: PathBuf,
     denied_roots: Vec<PathBuf>,
+    write_denials: Vec<PathBuf>,
     executable_read: Option<PathBuf>,
 }
 
@@ -622,6 +623,7 @@ fn single_agent_read_scope(request: &SingleAgentLaunchRequest<'_>) -> Result<Sin
         return Ok(SingleAgentReadScope {
             worktree: root,
             denied_roots,
+            write_denials: Vec::new(),
             executable_read,
         });
     }
@@ -654,6 +656,7 @@ fn single_agent_read_scope(request: &SingleAgentLaunchRequest<'_>) -> Result<Sin
     if denied_roots.len() != 2 {
         bail!("Single agent read scope requires distinct repository and Git common directory roots")
     }
+    let write_denials = denied_roots.iter().cloned().collect();
     denied_roots.insert(service_root);
     let socket_directory = request
         .role_socket
@@ -687,6 +690,7 @@ fn single_agent_read_scope(request: &SingleAgentLaunchRequest<'_>) -> Result<Sin
     Ok(SingleAgentReadScope {
         worktree,
         denied_roots: denied_roots.into_iter().collect(),
+        write_denials,
         executable_read,
     })
 }
@@ -1290,6 +1294,31 @@ fn assemble_single_agent_launch(
         request.provider,
         request.purpose,
     );
+    if request.provider == Provider::Claude {
+        let native_revision = binding.native_policy_revision.as_deref();
+        if identity.config_identity["revision"].as_str() != native_revision
+            || identity.security_policy["native_sandbox"]["policy_revision"].as_str()
+                != native_revision
+        {
+            bail!("Claude native settings do not match the resolved policy revision")
+        }
+        let (expected_launch, expected_native) =
+            crate::provider_compatibility::expected_native_revisions(
+                request.provider,
+                &binding.exact_version,
+                binding.mode,
+            )
+            .map_err(|()| anyhow::anyhow!("No exact Claude native contract for this binding"))?;
+        if binding.provider != request.provider
+            || binding.mode != policy.mode
+            || identity.executable_version != binding.exact_version
+            || binding.launch_revision.as_deref() != Some(expected_launch)
+            || native_revision != Some(expected_native)
+            || (request.purpose.is_writer() && binding.contract_revision != expected_native)
+        {
+            bail!("Claude native contract does not match the exact executable version and mode")
+        }
+    }
     let mut arguments = native.arguments;
     arguments.push(format!(
         "{}\n\n{}",

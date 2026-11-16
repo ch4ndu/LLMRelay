@@ -141,8 +141,16 @@ Earlier implementer proofs without this restriction require fresh verification.
 ## Claude terminal permissions
 
 The embedded compatibility bundle accepts exact Claude Code `2.1.289 (Claude
-Code)` for all six roles. Other versions require a reviewed compatibility
-update. Matching the bundle makes a profile eligible for verification; it does
+Code)` for all six roles. Exact `2.1.325 (Claude Code)` is additionally
+qualified only for the Single agent writer with `claude-opus-5-5`, `high` effort
+and an isolated worktree. Its v3 sandbox denies writes to the canonical source
+repository and Git common directory, retaining service-root read denials and
+the owned worktree grant. Main checkout and other 325 modes or tuples are
+refused before launch. Native revisions are selected by exact executable version
+without changing stored v2 profile policy; fingerprint, settings and exact native
+binding require fresh per-profile admission. See the [325 evidence boundary](provider-qualification-20261011.md#claude-21325-single-agent-writer).
+Other versions require a reviewed compatibility update. Matching the bundle
+makes a profile eligible for verification; it does
 not mark the profile Supported or reuse evidence from another executable,
 model, effort, role, or policy. Run the selected profile's setup and runtime
 verification before assigning it work. Claude's `default` permission mode is

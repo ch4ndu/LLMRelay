@@ -541,28 +541,21 @@ impl BundleSet {
         version: &str,
     ) -> anyhow::Result<Self> {
         if exact_policy(provider, version, PolicyMode::SingleAgentWriter).is_err()
-            || (provider != Provider::Codex && version != "2.1.312 (Claude Code)")
+            || (provider != Provider::Codex
+                && version != crate::providers::claude::CURRENT_SINGLE_AGENT_VERSION)
         {
             anyhow::bail!("No provisional predicate for this exact native version")
         }
         let mut bundles = Self::embedded();
         if provider == Provider::Claude {
             let mut pack: serde_json::Value = serde_json::from_str(&bundles.claude_policy)?;
-            let mut writer = pack["selectors"][0]["contracts"]
+            let mut selector = pack["selectors"]
                 .as_array()
-                .and_then(|contracts| {
-                    contracts
-                        .iter()
-                        .find(|c| c["mode"] == "single_agent_writer")
-                })
+                .and_then(|selectors| selectors.iter().find(|s| s["exact_version"] == version))
                 .cloned()
-                .ok_or_else(|| anyhow::anyhow!("Missing historical Claude writer contract"))?;
-            writer["contract_id"] = "claude-single-agent-writer-2-1-312-candidate".into();
-            writer["qualification"] = serde_json::json!({"state":"unqualified","reason":"Test-only acquisition; independent native evidence review required"});
-            pack["selectors"] = serde_json::json!([{
-                "predicate_id":"claude-code-2.1.312-candidate", "exact_version":version,
-                "contracts":[writer]
-            }]);
+                .ok_or_else(|| anyhow::anyhow!("Missing exact Claude writer selector"))?;
+            selector["contracts"][0]["qualification"] = serde_json::json!({"state":"unqualified","reason":"Test-only acquisition; independent native evidence review required"});
+            pack["selectors"] = serde_json::json!([selector]);
             bundles.claude_policy = serde_json::to_string(&pack)?;
             return Ok(bundles);
         }
@@ -978,12 +971,9 @@ fn validate_policy_pack(pack: &PolicyPack, provider: Provider) -> Result<(), ()>
         }
         let current_codex = provider == Provider::Codex
             && selector.exact_version == crate::providers::codex::CURRENT_SINGLE_AGENT_VERSION;
-        let candidate_claude = cfg!(test)
-            && provider == Provider::Claude
-            && selector.exact_version == "2.1.312 (Claude Code)";
-        if (!current_codex
-            && !candidate_claude
-            && !modes.contains(&PolicyMode::ProviderObservation))
+        let current_claude = provider == Provider::Claude
+            && selector.exact_version == crate::providers::claude::CURRENT_SINGLE_AGENT_VERSION;
+        if (!current_codex && !current_claude && !modes.contains(&PolicyMode::ProviderObservation))
             || !modes.contains(&PolicyMode::SingleAgentWriter)
         {
             return Err(());
@@ -1012,17 +1002,34 @@ fn exact_policy(provider: Provider, version: &str, mode: PolicyMode) -> Result<C
         }
         Provider::Claude => {
             version == crate::providers::claude::EXACT_CLAUDE_VERSION
-                || (cfg!(test)
-                    && version == "2.1.312 (Claude Code)"
+                || (version == crate::providers::claude::CURRENT_SINGLE_AGENT_VERSION
                     && mode == PolicyMode::SingleAgentWriter)
         }
     };
     if !supported {
         return Err(());
     }
+    if provider == Provider::Claude
+        && version == crate::providers::claude::CURRENT_SINGLE_AGENT_VERSION
+        && mode == PolicyMode::SingleAgentWriter
+    {
+        let mut policy = compiled_policy(provider, mode);
+        policy.2 = "llmrelay-claude-single-agent-launch-v3";
+        policy.3 = "claude-single-agent-writer-v3";
+        return Ok(policy);
+    }
     // Current Codex uses the same native restrictions; exact version remains
     // part of canonical authority without changing profile-policy hashes.
     Ok(compiled_policy(provider, mode))
+}
+
+pub(crate) fn expected_native_revisions(
+    provider: Provider,
+    version: &str,
+    mode: PolicyMode,
+) -> Result<(&'static str, &'static str), ()> {
+    let (_, _, launch, native, _, _, _) = exact_policy(provider, version, mode)?;
+    Ok((launch, native))
 }
 
 fn compiled_policy(provider: Provider, mode: PolicyMode) -> CompiledPolicy {
@@ -1297,7 +1304,7 @@ mod tests {
             )
             .is_err());
 
-        let claude_version = "2.1.312 (Claude Code)";
+        let claude_version = "2.1.325 (Claude Code)";
         let claude =
             BundleSet::provisional_native_fixture_for(Provider::Claude, claude_version).unwrap();
         assert_eq!(claude.codex_policy, CODEX_POLICY_BYTES);
@@ -1310,19 +1317,73 @@ mod tests {
             )
             .unwrap();
         assert!(!candidate.synthetic_origin);
+        assert_eq!(candidate.contract_revision, "claude-single-agent-writer-v3");
+        assert_eq!(
+            candidate.launch_revision.as_deref(),
+            Some("llmrelay-claude-single-agent-launch-v3")
+        );
+        assert_eq!(
+            candidate.native_policy_revision.as_deref(),
+            Some("claude-single-agent-writer-v3")
+        );
+        let historical_binding = BundleSet::embedded()
+            .resolve_policy(
+                Provider::Claude,
+                crate::providers::claude::EXACT_CLAUDE_VERSION,
+                PolicyMode::SingleAgentWriter,
+            )
+            .unwrap();
+        assert_eq!(
+            historical_binding.launch_revision.as_deref(),
+            Some("llmrelay-claude-single-agent-launch-v2")
+        );
+        assert_eq!(
+            historical_binding.native_policy_revision.as_deref(),
+            Some("claude-single-agent-writer-v2")
+        );
+        assert_ne!(candidate.effective_hash, historical_binding.effective_hash);
+        for (provider, expected_hash) in [
+            (
+                Provider::Claude,
+                "f1bae566cfcf822e309ac5031e0bb1d29b4328fa534660de2290c501146f85ed",
+            ),
+            (
+                Provider::Codex,
+                "c85c06510e4163096f9617b76d873cb8a82680b2c73eb1829fabcfb59bdb45df",
+            ),
+        ] {
+            let policy = ExecutionPolicy::for_purpose(
+                provider,
+                crate::domain::ProfilePurpose::WorkspaceWriter,
+            );
+            assert_eq!(policy.content_hash(), expected_hash);
+            assert_eq!(policy, ExecutionPolicy::single_agent_writer(provider));
+        }
         assert!(matches!(
             candidate.qualification,
             PolicyQualification::Unqualified { .. }
         ));
         // Ordinary dispatch uses this same qualification refusal.
         assert!(candidate.native_calls_disabled_reason().is_some());
-        assert!(BundleSet::embedded()
+        let production = BundleSet::embedded()
             .resolve_policy(
                 Provider::Claude,
                 claude_version,
-                PolicyMode::SingleAgentWriter
+                PolicyMode::SingleAgentWriter,
             )
-            .is_err());
+            .unwrap();
+        for binding in [&candidate, &production] {
+            assert_eq!(
+                binding.effective_hash,
+                "6a4286c71321235917bbd2d48de51b5af735684e8392d8b2bae6e7d2b72868fe"
+            );
+        }
+        assert!(production.native_calls_disabled_reason().is_none());
+        assert!(BundleSet::embedded()
+            .admission_policy(Provider::Claude, PolicyMode::SingleAgentWriter)
+            .unwrap()
+            .native_calls_disabled_reason()
+            .is_none());
         assert!(claude
             .resolve(Provider::Claude, claude_version, RoleKind::Implementer)
             .is_err());
@@ -1333,7 +1394,7 @@ mod tests {
         );
         assert_eq!(
             pack["selectors"][0]["contracts"][0]["contract_id"],
-            "claude-single-agent-writer-2-1-312-candidate"
+            "claude-single-agent-writer-2-1-325-candidate"
         );
         for mode in [
             PolicyMode::ProviderObservation,
@@ -1343,8 +1404,18 @@ mod tests {
             assert!(claude
                 .resolve_policy(Provider::Claude, claude_version, mode)
                 .is_err());
+            assert!(BundleSet::embedded()
+                .resolve_policy(Provider::Claude, claude_version, mode)
+                .is_err());
         }
-        for version in ["2.1.313 (Claude Code)", "2.1.312", "unknown"] {
+        for version in [
+            "2.1.289 (Claude Code)",
+            "2.1.312 (Claude Code)",
+            "2.1.324 (Claude Code)",
+            "2.1.326 (Claude Code)",
+            "2.1.325",
+            "unknown",
+        ] {
             assert!(BundleSet::provisional_native_fixture_for(Provider::Claude, version).is_err());
         }
         let mut malformed = pack.clone();
