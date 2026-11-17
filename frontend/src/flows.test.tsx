@@ -21110,6 +21110,90 @@ Deno.test("Audit a valid saved task edit reuses its original identity", async ()
   }
 });
 
+Deno.test("Board Edit opens an unstarted Single agent draft with null role overrides and saves only its fields", async () => {
+  localStorage.clear();
+  localStorage.setItem("agenticjira.page", "board");
+  localStorage.setItem("agenticjira.project", initialized.id);
+  const priorEnvironment = { ...liveEnvironment };
+  const live = liveHarness();
+  liveEnvironment.transport = live.environment.transport;
+  liveEnvironment.scheduler = live.environment.scheduler;
+  const requests: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (!init?.body) return new Response("[]");
+    requests.push(JSON.parse(String(init.body)));
+    return new Response(JSON.stringify({ result: { state: "updated" } }));
+  }) as typeof fetch;
+  // The draft stays pinned to the older C1 while a newer C2 is approved.
+  const [pinnedConfig] = singleAgentExecution.configurations;
+  const execution: ProjectExecution = {
+    ...singleAgentExecution,
+    configurations: [{ ...pinnedConfig, id: "cfg-2", revision: 3, content_hash: "config-hash-2" }, pinnedConfig],
+  };
+  const started = singleAgentTask(singleAgentRun());
+  const draft: Task = {
+    ...started, lifecycle: "backlog", active_attempt: undefined, role_overrides: null,
+    description: "Keep this description", acceptance_criteria: ["first", "second"], priority: 1,
+    workflow: { ...started.workflow!, workspace_mode: "isolated_worktree", check_ids: ["check-1"],
+      admission_state: "draft", run: null },
+  };
+  const snapshot = (revision: string, shown: Task) =>
+    snapshotAt("sa-edit", revision, { projects: [initialized], tasks: [shown], workflow_execution: [execution] });
+  const commands = () => requests.filter((body) => "kind" in body);
+  const openEdit = async (expected: Task) => {
+    act(() => document.querySelector<HTMLButtonElement>(".card-edit")!.click());
+    await settle();
+    check(
+      !document.body.textContent?.includes("The dashboard stopped working") &&
+        findField("Title").value === expected.title &&
+        findField("Description").value === expected.description &&
+        findField("Acceptance criteria").value === "first\nsecond" &&
+        findSelect("Priority").value === "1" &&
+        document.body.textContent?.includes("Workspace: Isolated worktree"),
+      "Board Edit crashed on null role overrides or lost the draft's fields",
+    );
+  };
+  try {
+    mount(<AppErrorBoundary><App /></AppErrorBoundary>);
+    await settle();
+    live.reads[0].resolve(snapshot("1", draft));
+    await settle();
+    await openEdit(draft);
+    field("Title", "Renamed draft");
+    click("Save changes");
+    for (let index = 0; index < 3; index++) await settle();
+    const [sent, ...extra] = commands();
+    const { operation_id, ...update } = sent ?? {};
+    check(
+      !extra.length && typeof operation_id === "string" &&
+        JSON.stringify(update) === JSON.stringify({
+          kind: "update_task",
+          task_id: draft.id,
+          expected_version: draft.version,
+          title: "Renamed draft",
+          description: draft.description,
+          acceptance_criteria: draft.acceptance_criteria,
+          priority: draft.priority,
+          manual_order: draft.manual_order,
+          role_overrides: null,
+        }),
+      `saving sent other than one field-only versioned update: ${JSON.stringify(commands())}`,
+    );
+    check(live.reads.length > 1, "saving did not reload the board");
+    const saved: Task = { ...draft, title: "Renamed draft", version: draft.version + 1 };
+    live.reads.at(-1)!.resolve(snapshot("2", saved));
+    await settle();
+    await openEdit(saved);
+    check(commands().length === 1, "reopening Edit sent a workflow, Make Ready, or launch request");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    liveEnvironment.transport = priorEnvironment.transport;
+    liveEnvironment.scheduler = priorEnvironment.scheduler;
+    localStorage.clear();
+  }
+});
+
 Deno.test("Audit malformed workflow identity storage is preserved without dispatch", async () => {
   const editing: Task = {
     ...singleAgentTask(singleAgentRun()),

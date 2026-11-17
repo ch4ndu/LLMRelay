@@ -1252,7 +1252,7 @@ export function RoleSettings(
             !generationSettled(session);
           const value = editing === role
             ? config
-            : requested?.config || task.role_overrides[role] ||
+            : requested?.config || task.role_overrides?.[role] ||
               projectRoles[role];
           const preparation = value && requested && preparations.find((item) =>
             item.task_id === task.id && item.role === role &&

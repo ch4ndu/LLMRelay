@@ -215,7 +215,7 @@ def smoke(args):
         browser.evaluate("([...document.querySelector('#task-form-title').closest('form').querySelectorAll('details')].find(e => e.querySelector('summary')?.textContent === 'Role overrides').open = true)")
         browser.call("check", browser.label("Override Manager"))
         browser.call("select", "select[aria-label='Manager provider']", "codex")
-        browser.fill("Manager model", "gpt-5.6-sol")
+        browser.fill("Manager model", "gpt-6.2-sol")
         browser.call("select", "select[aria-label='Manager effort']", "medium")
         browser.click("Save draft")
         browser.wait("!document.querySelector('#task-form-title')")

@@ -708,7 +708,8 @@ export interface Task {
     scheduled_for_utc: string | null;
   };
   permission_waiting: boolean;
-  role_overrides: Partial<Record<Role, RoleConfig>>;
+  /** Null for tasks created through a workflow selection. */
+  role_overrides: Partial<Record<Role, RoleConfig>> | null;
   dependencies: Array<Record<string, unknown>>;
   active_attempt?: Attempt;
   /** Absent from older services and for finished tasks. */

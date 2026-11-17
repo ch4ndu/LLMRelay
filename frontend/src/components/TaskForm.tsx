@@ -474,12 +474,12 @@ export function TaskForm(
           workspace_mode: editing.workflow?.workspace_mode ?? "isolated_worktree",
           roles: Object.fromEntries(
             ROLES.flatMap((role) => {
-              const config = normalizeRole(editing.role_overrides[role]);
+              const config = normalizeRole(editing.role_overrides?.[role]);
               return config ? [[role, config]] : [];
             }),
           ) as Partial<Record<Role, TaskRoleDraft>>,
           roleOverrides: Object.fromEntries(
-            ROLES.map((role) => [role, !!editing.role_overrides[role]]),
+            ROLES.map((role) => [role, !!editing.role_overrides?.[role]]),
           ) as Partial<Record<Role, boolean>>,
         },
         restored: false,

@@ -46293,9 +46293,15 @@ fn single_agent_probe_is_refused_while_the_writer_contract_is_unqualified() {
         "../resources/provider-compatibility/single-agent-claude.json"
     ))
     .unwrap();
-    claude_policy["selectors"][0]["contracts"][1]["qualification"] = serde_json::json!({
-        "state":"unqualified","reason":"The synthetic Claude writer is not qualified."
-    });
+    for selector in claude_policy["selectors"].as_array_mut().unwrap() {
+        for contract in selector["contracts"].as_array_mut().unwrap() {
+            if contract["mode"] == "single_agent_writer" {
+                contract["qualification"] = serde_json::json!({
+                    "state":"unqualified","reason":"The synthetic Claude writer is not qualified."
+                });
+            }
+        }
+    }
     let bundles = agenticjira::provider_compatibility::BundleSet::embedded()
         .with_policy_packs_for_tests(
             include_str!("../resources/provider-compatibility/single-agent-codex.json"),
