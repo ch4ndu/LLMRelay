@@ -1,0 +1,6 @@
+interface:
+  display_name: "Workflow Audit"
+  short_description: "Audit one LLMRelay journey or invariant"
+  default_prompt: "Use $workflow-audit to review the named LLMRelay journey or invariant and report findings and coverage gaps."
+policy:
+  allow_implicit_invocation: false

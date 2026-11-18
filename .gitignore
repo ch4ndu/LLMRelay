@@ -2,7 +2,15 @@
 /frontend/dist/
 /frontend/node_modules/
 /.local/
-/.agents/
+/.agents/*
+!/.agents/skills/
+/.agents/skills/*
+!/.agents/skills/workflow-audit/
+/.agents/skills/workflow-audit/*
+!/.agents/skills/workflow-audit/SKILL.md
+!/.agents/skills/workflow-audit/agents/
+/.agents/skills/workflow-audit/agents/*
+!/.agents/skills/workflow-audit/agents/openai.yaml
 /design/llmrelay-a-guided-setup.png
 /design/llmrelay-b-project-control-center.png
 /design/llmrelay-c-split-workspace.png
