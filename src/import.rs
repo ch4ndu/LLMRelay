@@ -1,7 +1,8 @@
+use crate::operations::CheckedOperationRefused;
 use crate::store::Store;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -64,9 +65,15 @@ pub struct LegacyPreview {
 }
 
 pub fn preview(path: &Path) -> Result<LegacyPreview> {
-    let source = path
-        .canonicalize()
-        .with_context(|| format!("resolve import source {}", path.display()))?;
+    preview_source(resolve_source(path)?)
+}
+
+fn resolve_source(path: &Path) -> Result<PathBuf> {
+    path.canonicalize()
+        .with_context(|| format!("resolve import source {}", path.display()))
+}
+
+fn preview_source(source: PathBuf) -> Result<LegacyPreview> {
     if std::fs::metadata(&source)?.len() > 2 * 1024 * 1024 {
         bail!("legacy task source exceeds the 2 MiB preview/import limit")
     }
@@ -183,6 +190,21 @@ pub fn preview(path: &Path) -> Result<LegacyPreview> {
     })
 }
 
+fn import_receipt(connection: &Connection, operation_id: &str) -> Result<Option<(String, String)>> {
+    Ok(connection.query_row(
+        "SELECT request_hash,result_json FROM operation_receipts WHERE operation_id=?1 AND actor_key='human_control' AND operation_kind='legacy_import'",
+        params![operation_id], |row| Ok((row.get(0)?,row.get(1)?)),
+    ).optional()?)
+}
+
+fn import_result(mut result: serde_json::Value, operation_id: &str) -> Result<serde_json::Value> {
+    result
+        .as_object_mut()
+        .context("legacy import result is not an object")?
+        .insert("operation_id".into(), operation_id.into());
+    Ok(result)
+}
+
 pub fn apply(
     store: &Store,
     operation_id: &str,
@@ -191,26 +213,73 @@ pub fn apply(
     path: &Path,
     expected_source_hash: &str,
 ) -> Result<serde_json::Value> {
-    let preview = preview(path)?;
+    let request_hash_for = |source: &str| {
+        crate::store::json_hash(&serde_json::json!({
+            "project_id":project_id,"expected_project_version":expected_project_version,
+            "source":source,"source_hash":expected_source_hash
+        }))
+    };
+    let submitted_hash = path
+        .to_str()
+        .map(request_hash_for)
+        .transpose()
+        .context("hash submitted legacy import path")?;
+    let replay = |(stored, result): (String, String),
+                  resolve_canonical: &dyn Fn() -> Option<PathBuf>|
+     -> Result<serde_json::Value> {
+        // Older receipts only bind the canonical path. A missing alias is
+        // only provable if its exact spelling was recorded at submission.
+        let (canonical, submitted) = stored.split_once(':').unwrap_or((&stored, &stored));
+        let exact = submitted_hash
+            .as_deref()
+            .is_some_and(|hash| hash == submitted || hash == canonical);
+        if !exact {
+            let live_hash = resolve_canonical()
+                .as_deref()
+                .and_then(Path::to_str)
+                .map(request_hash_for)
+                .transpose()?;
+            if live_hash.as_deref() != Some(canonical) {
+                bail!("legacy import operation ID was reused with different input or its original source path cannot be verified")
+            }
+        }
+        import_result(serde_json::from_str(&result)?, operation_id)
+    };
+
+    let receipt = {
+        let connection = store.lock()?;
+        import_receipt(&connection, operation_id)?
+    };
+    if let Some(receipt) = receipt {
+        return replay(receipt, &|| resolve_source(path).ok());
+    }
+
+    let (canonical_path, preview) = match resolve_source(path) {
+        Ok(source) => (Some(source.clone()), preview_source(source)),
+        Err(error) => (None, Err(error)),
+    };
+    let mut connection = store.lock()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Check again under the write transaction even if preview failed: a
+    // concurrent import may have committed while the source was still valid.
+    if let Some(receipt) = import_receipt(&transaction, operation_id)? {
+        return replay(receipt, &|| canonical_path.clone());
+    }
+
+    let preview = preview.map_err(CheckedOperationRefused::new)?;
     if expected_source_hash.trim().is_empty() || preview.source_hash != expected_source_hash {
-        bail!("legacy source changed after preview; preview it again before import")
+        bail!(CheckedOperationRefused::new(anyhow!(
+            "legacy source changed after preview; preview it again before import"
+        )))
     }
     let visible_source = preview.source.to_string_lossy().into_owned();
     let source_identity = format!("{project_id}::{visible_source}");
     let preview_json = serde_json::to_value(&preview)?;
-    let request_hash = crate::store::json_hash(&serde_json::json!({
-        "project_id":project_id,"expected_project_version":expected_project_version,
-        "source":visible_source,"source_hash":expected_source_hash
-    }))?;
-    let mut connection = store.lock()?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if let Some((stored,result)) = transaction.query_row(
-        "SELECT request_hash,result_json FROM operation_receipts WHERE operation_id=?1 AND actor_key='human_control' AND operation_kind='legacy_import'",
-        params![operation_id], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)),
-    ).optional()? {
-        if stored != request_hash { bail!("legacy import operation ID was reused with different input") }
-        return Ok(serde_json::from_str(&result)?)
-    }
+    let canonical_hash = request_hash_for(&visible_source)?;
+    let request_hash = match submitted_hash {
+        Some(submitted) => format!("{canonical_hash}:{submitted}"),
+        None => canonical_hash,
+    };
     let current_version: i64 = transaction
         .query_row(
             "SELECT version FROM projects WHERE id=?1",
@@ -218,9 +287,11 @@ pub fn apply(
             |row| row.get(0),
         )
         .optional()?
-        .ok_or_else(|| anyhow!("unknown project"))?;
+        .ok_or_else(|| CheckedOperationRefused::new(anyhow!("unknown project")))?;
     if current_version != expected_project_version {
-        bail!("project version is stale; preview again against current project state")
+        bail!(CheckedOperationRefused::new(anyhow!(
+            "project version is stale; preview again against current project state"
+        )))
     }
     if let Some((hash, result)) = transaction
         .query_row(
@@ -231,10 +302,13 @@ pub fn apply(
         .optional()?
     {
         if hash != preview.source_hash {
-            bail!("import source changed after its prior import; preview and choose a new source copy")
+            bail!(CheckedOperationRefused::new(anyhow!(
+                "import source changed after its prior import; preview and choose a new source copy"
+            )))
         }
         let result: serde_json::Value = serde_json::from_str(&result)?;
         transaction.execute("INSERT INTO operation_receipts(operation_id,actor_key,operation_kind,request_hash,result_json,created_at) VALUES(?1,'human_control','legacy_import',?2,?3,?4)",params![operation_id,request_hash,result.to_string(),Utc::now().to_rfc3339()])?;
+        let result = import_result(result, operation_id)?;
         transaction.commit()?;
         return Ok(result);
     }
@@ -244,7 +318,9 @@ pub fn apply(
         params![task_id],
         |row| row.get::<_, bool>(0),
     )? {
-        bail!("legacy task id {task_id} already exists")
+        bail!(CheckedOperationRefused::new(anyhow!(
+            "legacy task id {task_id} already exists"
+        )))
     }
     let lifecycle = match preview.frontmatter["status"].as_str() {
         "todo" => "backlog",
@@ -306,7 +382,7 @@ pub fn apply(
     transaction.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,old_version,new_version,detail_json,created_at) VALUES(?1,?2,'human','legacy.imported','project',?3,?4,?5,?6,?7)",params![uuid::Uuid::new_v4().to_string(),operation_id,project_id,expected_project_version,expected_project_version+1,serde_json::json!({"imported_task_id":task_id,"source":visible_source,"source_hash":preview.source_hash,"task_created_version":1}).to_string(),now])?;
     transaction.execute("INSERT INTO operation_receipts(operation_id,actor_key,operation_kind,request_hash,result_json,created_at) VALUES(?1,'human_control','legacy_import',?2,?3,?4)",params![operation_id,request_hash,result.to_string(),now])?;
     transaction.commit()?;
-    Ok(result)
+    import_result(result, operation_id)
 }
 
 fn validate_frontmatter(fields: &BTreeMap<String, String>) -> Result<()> {

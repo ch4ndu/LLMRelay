@@ -43,6 +43,7 @@ for normal distribution verification and receipt reuse; those recovery overrides
 cannot produce a normal package receipt. The archive is
 written beneath `.local/dist`; an older distribution without a matching ownership
 record is retained and must be moved aside explicitly before packaging.
+The publisher builds and hashes a replacement ZIP before replacing the previous one. If publication is interrupted, rerun the same command. It checks the staged files, published files, and ownership receipt before finishing the interrupted publication. If any have been edited, it stops and preserves them for inspection.
 Packaging does not install, sign, notarize, publish, or upload it. See
 [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) before distributing a package
 outside this machine.

@@ -124,6 +124,7 @@ pub fn prepare(
         executable_path,
         read_denials,
         &crate::provider_compatibility::BundleSet::embedded(),
+        None,
     )
 }
 
@@ -143,8 +144,12 @@ pub(crate) fn prepare_with_bundles(
     executable_path: &Path,
     read_denials: &[PathBuf],
     bundles: &crate::provider_compatibility::BundleSet,
+    observed_executable: Option<(&Path, &str)>,
 ) -> Result<PreparedLaunch> {
-    let (executable, version) = super::executable_and_version(Provider::Codex)?;
+    let (executable, version) = match observed_executable {
+        Some((path, version)) => (path.to_path_buf(), version.to_owned()),
+        None => super::executable_and_version(Provider::Codex)?,
+    };
     let contract_binding = bundles.resolve(Provider::Codex, &version, role)?;
     let compatibility = inspect_native_compatibility(
         cwd,

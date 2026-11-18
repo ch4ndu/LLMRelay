@@ -1,6 +1,7 @@
 import type {
   DesktopActivation,
   DesktopTarget,
+  DiagnosticsRuntimeBinding,
   AppState,
   CapabilityRecordFunctionalProofOperation,
   CmuxKeyboardControlAction,
@@ -31,7 +32,10 @@ import type {
   ComparisonEvidenceQuery,
   ComparisonEvidencePage,
   GuidanceReauthorizationPreview,
+  KnowledgeCommand,
+  KnowledgeCommandResult,
 } from "./types";
+import { ROLES } from "./types";
 import type {
   ConversationMutation,
   ConversationMutationResult,
@@ -58,6 +62,9 @@ import {
   taskContentRecordIsCurrent,
   currentInputIsCurrent,
   guidanceComparisonIsCurrent,
+  guidanceApprovalResultMatches,
+  projectSetupResultMatches,
+  projectSetupLaunchMatches,
   conversationProfileIsCurrent,
   conversationMutationIsCurrent,
   conversationReadIsCurrent,
@@ -95,6 +102,7 @@ export class ApiError extends Error {
     readonly status: number,
     readonly operationId?: string,
     readonly ambiguous = false,
+    readonly terminalRefusal = false,
   ) {
     super(message);
   }
@@ -236,6 +244,7 @@ async function json<T>(
   init?: RequestInit,
   timeoutMs = transportTimeouts.read,
   features: readonly string[] = [],
+  checkedOperationId?: string,
 ): Promise<T> {
   const dispatchedMutation = init?.method !== undefined &&
     !["GET", "HEAD"].includes(init.method.toUpperCase());
@@ -262,6 +271,9 @@ async function json<T>(
         }),
       );
     }
+    if (checkedOperationId !== undefined && controller.signal.aborted) {
+      throw new ApiError("The request ended before it was sent. Try again after refreshing.", 0, checkedOperationId);
+    }
     businessDispatched = true;
     const response = await fetch(path, {
       credentials: "same-origin",
@@ -280,6 +292,25 @@ async function json<T>(
       if (response.status === 409) {
         const refusal = protocolRefusal(value);
         if (refusal) throw refusal;
+      }
+      if (checkedOperationId !== undefined) {
+        const operationId = field(value, "operation_id");
+        const outcomeUnknown = field(value, "outcome_unknown");
+        const refused = outcomeUnknown === false &&
+          (operationId === checkedOperationId ||
+            (path === "/api/knowledge/command" && response.status === 409 && operationId === undefined));
+        const rejectedBeforeWork = [400, 401, 403, 413, 415, 422].includes(response.status);
+        const ambiguous = outcomeUnknown === true ||
+          !(refused || (rejectedBeforeWork && operationId === undefined));
+        const error = field(value, "error");
+        throw new ApiError(
+          typeof error === "string" && error ? error : "The service could not confirm the saved request.",
+          response.status,
+          checkedOperationId,
+          ambiguous,
+          (path === "/api/operation" || path === "/api/command") && operationId === checkedOperationId &&
+            outcomeUnknown === false && field(value, "terminal_refusal") === true,
+        );
       }
       const body = value as { error?: string; operation_id?: string; outcome_unknown?: boolean };
       throw new ApiError(
@@ -662,6 +693,22 @@ export const diagnostics = () =>
     undefined,
     transportTimeouts.read,
   );
+export async function diagnosticsRuntimeBindings(signal: AbortSignal): Promise<DiagnosticsRuntimeBinding[]> {
+  const response = await json<unknown>("/api/diagnostics/runtime-bindings", {
+    signal,
+    cache: "no-store",
+  });
+  const bindings = field(response, "bindings");
+  if (!Array.isArray(bindings) || !bindings.every((binding: unknown): binding is DiagnosticsRuntimeBinding =>
+    hasStrings(binding, [
+      "project_id", "setup_operation_id", "profile_hash", "runtime_profile_hash", "project_config_revision_id",
+      "adapter_hash", "capability_id", "capability_key",
+    ]) && ROLES.some((role) => role === field(binding, "role"))
+  )) {
+    throw new Error("The service returned unsupported runtime verification data.");
+  }
+  return bindings;
+}
 const preserveMutationIdentity = <T>(
   request: Promise<T>,
   operationId: string | undefined,
@@ -672,9 +719,10 @@ const preserveMutationIdentity = <T>(
     }
     throw cause;
   });
-export const command = async (body: Command) => {
+export const command = async (body: Command, checked = false) => {
   if (body.kind === "authorize_recipe_schedule_execution") throw new Error("Automatic recipe execution has been retired. Create a draft schedule instead.");
   const scheduleCommand = ["authorize_recipe_schedule_execution", "stop_recipe_schedule_occurrence", "request_recipe_schedule_occurrence_stop"].includes(body.kind);
+  const taskKnowledgeCommand = body.kind === "set_task_knowledge" || body.kind === "prepare_next_run_knowledge";
   const scheduleFeatures = ["schedule_execution_authorization_v1", "project_knowledge_v1", ...(body.kind === "request_recipe_schedule_occurrence_stop" ? ["schedule_occurrence_stop_intent_v1"] : [])];
   if (scheduleCommand && !scheduleExecutionCommandIsCurrent(body)) return Promise.reject(new Error("Refresh the schedule and review its exact authorization or stop target before sending."));
   if (scheduleCommand) {
@@ -694,27 +742,59 @@ export const command = async (body: Command) => {
           String(body.kind),
         )
         ? ["task_interactions_v1"]
-        : scheduleCommand ? scheduleFeatures : ["set_task_knowledge", "prepare_next_run_knowledge"].includes(body.kind) ? ["project_knowledge_v1"] : body.kind === "upsert_single_agent_recipe" ? ["single_agent_presets_v1"] : [],
+        : scheduleCommand ? scheduleFeatures : taskKnowledgeCommand ? ["project_knowledge_v1"] : body.kind === "upsert_single_agent_recipe" ? ["single_agent_presets_v1"] : [],
+      checked || taskKnowledgeCommand || body.kind === "reauthorize_attempt_guidance" ? body.operation_id : undefined,
     ),
     body.operation_id,
   );
   if (scheduleCommand && !scheduleCommandResultMatches(body, field(response, "result"))) throw new ApiError("The schedule response could not be matched to the saved operation. Its outcome is uncertain. Refresh and check the schedule before recovering the exact request.", 0, body.operation_id, true);
+  if (taskKnowledgeCommand && !taskKnowledgeResultMatches(body, field(response, "result"))) {
+    throw new ApiError("The service response did not confirm the saved task knowledge request.", 0, body.operation_id, true);
+  }
+  if (body.kind === "reauthorize_attempt_guidance" &&
+    !guidanceApprovalResultMatches(body, field(response, "result"))) {
+    throw new ApiError("The service response did not confirm the saved instruction approval.", 0, body.operation_id, true);
+  }
   return response;
 };
-export const operation = async <T = Record<string, unknown>>(
+
+export const projectSetupCommand = async (body: Command) => {
+  const response = await command(body, true);
+  if (!projectSetupResultMatches(body, field(response, "result"))) {
+    throw new ApiError("The service response did not confirm the saved setup request.", 0, body.operation_id, true);
+  }
+  return response;
+};
+
+const requestOperation = <T>(
   body: Operation | CapabilityRecordFunctionalProofOperation,
-): Promise<T> => {
+  checked = false,
+) => {
   const identity = body.kind === "capability_record_functional_proof"
     ? field(field(body, "proof"), "operation_id")
     : field(body, "operation_id");
-  const response = await preserveMutationIdentity(
+  return preserveMutationIdentity(
     json<{ result: T }>("/api/operation", {
       method: "POST",
       body: JSON.stringify(body),
-    }, transportTimeouts.mutation),
+    }, transportTimeouts.mutation, [], checked && typeof identity === "string" ? identity : undefined),
     typeof identity === "string" ? identity : undefined,
   );
-  return response.result;
+};
+
+export const operation = async <T = Record<string, unknown>>(
+  body: Operation | CapabilityRecordFunctionalProofOperation,
+): Promise<T> => (await requestOperation<T>(body)).result;
+
+export const legacyImport = async (
+  body: Operation & { kind: "legacy_import"; operation_id: string },
+): Promise<unknown> => field(await requestOperation<unknown>(body, true), "result");
+
+export const projectSetupLaunch = async (body: Operation & { operation_id: string }) => {
+  const response = await requestOperation<unknown>(body, true);
+  if (!projectSetupLaunchMatches(body, field(response, "result"))) {
+    throw new ApiError("The service response did not confirm the saved setup launch.", 0, body.operation_id, true);
+  }
 };
 export const viewCmuxSurface = (
   sessionId: string,
@@ -934,6 +1014,8 @@ export const operationId = () => crypto.randomUUID();
 
 export type StableOperationIdentity = { body: string; id: string };
 
+export const recoveryJournalChanged = "llmrelay:recovery-journal-changed";
+
 export const operationIntent = (request: Record<string, unknown>) =>
   JSON.stringify(
     Object.fromEntries(
@@ -1045,14 +1127,30 @@ async function requireKnowledgeFeature(): Promise<void> {
   const descriptor = negotiated ?? await negotiate();
   if (!descriptor.supported_features.includes("project_knowledge_v1")) throw new ProtocolError(`Reload the dashboard with a service supporting project knowledge. ${PROTOCOL_GUIDANCE}`, "missing_required_feature");
 }
-async function knowledgeRequest<T>(path: string, body: unknown, mutation = false, id?: string, features: readonly string[] = []): Promise<T> {
+async function knowledgeRequest<T>(path: string, body: unknown, id?: string, features: readonly string[] = []): Promise<T> {
   await requireKnowledgeFeature();
   const serialized = JSON.stringify(body);
   if (utf8Bytes(serialized) > 32768) throw new Error("Shorten the input or select fewer entries; knowledge requests allow at most 32 KiB.");
-  return preserveMutationIdentity(json<T>(path, { method: "POST", body: serialized }, mutation ? transportTimeouts.mutation : transportTimeouts.read, ["project_knowledge_v1", ...features]), id);
+  return preserveMutationIdentity(json<T>(path, { method: "POST", body: serialized }, id === undefined ? transportTimeouts.read : transportTimeouts.mutation, ["project_knowledge_v1", ...features], id), id);
 }
-export function knowledgeRead<T extends import("./types").KnowledgeRead>(projectId: string, read: T): Promise<import("./types").KnowledgeReadResults[T["kind"]]> {
-  return knowledgeRequest("/api/knowledge/read", { project_id: projectId, read });
+export async function knowledgeRead<T extends import("./types").KnowledgeRead>(projectId: string, read: T): Promise<import("./types").KnowledgeReadResults[T["kind"]]> {
+  const result = await knowledgeRequest<import("./types").KnowledgeReadResults[T["kind"]]>("/api/knowledge/read", { project_id: projectId, read });
+  const omitted = field(result, "sources_omitted");
+  if (read.kind === "freshness" && omitted !== undefined) {
+    const sources = field(result, "sources");
+    const fingerprint = field(result, "fingerprint");
+    const restore = field(result, "restore_operation_id");
+    if (!nonnegativeInteger(omitted) || omitted === 0 ||
+      !Array.isArray(sources) || sources.length !== 0 ||
+      field(result, "revision_id") !== read.revision_id ||
+      !hasStrings(result, ["check_started_at", "checked_at"]) ||
+      typeof fingerprint !== "string" || !fingerprint.trim() ||
+      (restore !== undefined && typeof restore !== "string") ||
+      !knowledgeFreshnessIsKnown(field(result, "state"))) {
+      throw new Error("The service returned unreadable Knowledge freshness. Refresh Knowledge and try again.");
+    }
+  }
+  return result;
 }
 export async function knowledgePreview(request: import("./types").KnowledgePreviewRequest): Promise<import("./types").KnowledgePreview> {
   if (request.selection.length > 16 || !request.selection.every(knowledgeSelectionIsCurrent)) return Promise.reject(new Error("Select at most 16 exact revisions with bounded identifiers and current observation fingerprints."));
@@ -1060,11 +1158,82 @@ export async function knowledgePreview(request: import("./types").KnowledgePrevi
     const descriptor = negotiated ?? await negotiate();
     if (!descriptor.supported_features.includes("schedule_execution_authorization_v1")) throw new ProtocolError("This service cannot preview schedule Knowledge. Reload with a supporting service.", "missing_required_feature");
   }
-  return knowledgeRequest("/api/knowledge/preview", request, false, undefined, request.consumer.kind === "schedule" ? ["schedule_execution_authorization_v1"] : []);
+  return knowledgeRequest("/api/knowledge/preview", request, undefined, request.consumer.kind === "schedule" ? ["schedule_execution_authorization_v1"] : []);
 }
-export function knowledgeCommand(request: import("./types").KnowledgeCommand): Promise<import("./types").KnowledgeEntry | import("./types").KnowledgeObservation> {
-  if (!knowledgeCommandIsCurrent(request)) return Promise.reject(new Error("Review the exact knowledge request before sending."));
-  return knowledgeRequest("/api/knowledge/command", request, true, request.kind === "mutate" ? request.request.operation_id : request.operation_id);
+export async function knowledgeCommand(request: KnowledgeCommand): Promise<KnowledgeCommandResult> {
+  if (!knowledgeCommandIsCurrent(request)) throw new Error("Review the exact knowledge request before sending.");
+  const id = request.kind === "mutate" ? request.request.operation_id : request.operation_id;
+  const result = await knowledgeRequest<unknown>("/api/knowledge/command", request, id);
+  if (!knowledgeResultMatches(request, id, result)) {
+    throw new ApiError("The service response did not confirm the saved knowledge request.", 0, id, true);
+  }
+  return result;
+}
+
+const knowledgeFreshnessIsKnown = (value: unknown) =>
+  value === "verified" || value === "needs_revalidation" ||
+  value === "source_unavailable" || value === "user_assertion";
+
+function knowledgeResultMatches(request: KnowledgeCommand, operationId: string, result: unknown): result is KnowledgeCommandResult {
+  if (field(result, "operation_id") !== operationId) return false;
+  if (request.kind === "revalidate") {
+    if (field(result, "kind") === "revalidation_confirmed") {
+      const fingerprint = field(result, "fingerprint");
+      return field(result, "project_id") === request.project_id &&
+        field(result, "entry_id") === request.entry_id &&
+        field(result, "revision_id") === request.revision_id &&
+        typeof fingerprint === "string" && fingerprint.trim().length > 0;
+    }
+    const sources = field(result, "sources");
+    const restore = field(result, "restore_operation_id");
+    return field(result, "revision_id") === request.revision_id &&
+      hasStrings(result, ["check_started_at", "checked_at", "fingerprint"]) &&
+      knowledgeFreshnessIsKnown(field(result, "state")) &&
+      (restore === undefined || typeof restore === "string") &&
+      Array.isArray(sources) && sources.every((source: unknown) =>
+        hasStrings(source, ["identity_hash", "original_content_hash", "reason"]) &&
+        hasNullableString(source, "observed_content_hash") && knowledgeFreshnessIsKnown(field(source, "state"))
+      );
+  }
+  const { mutation, project_id } = request.request;
+  const id = field(result, "id");
+  if (typeof id !== "string" || !id ||
+    (mutation.entry_id !== null && id !== mutation.entry_id) ||
+    field(result, "project_id") !== project_id ||
+    field(result, "version") !== (mutation.expected_version ?? 0) + 1 ||
+    !["latest_draft_id", "approved_revision_id", "archived_at"].every((key) => hasNullableString(result, key))) return false;
+  if (mutation.kind === "draft") return !!field(result, "latest_draft_id");
+  if (mutation.kind === "approve") {
+    return field(result, "approved_revision_id") === mutation.revision_id && field(result, "latest_draft_id") === null;
+  }
+  return !!field(result, "archived_at");
+}
+
+function taskKnowledgeResultMatches(body: Command, result: unknown): boolean {
+  if (field(result, "operation_id") !== body.operation_id) return false;
+  const request = body.request;
+  const entity = field(result, "entity_id");
+  if (typeof entity !== "string" || !entity) return false;
+  const version = field(result, "version");
+  const state = field(result, "state");
+  const detail = field(result, "detail");
+  const expected = field(request, body.kind === "set_task_knowledge" ? "expected_consumer_version" : "expected_task_version");
+  if (!nonnegativeInteger(expected)) return false;
+  if (body.kind === "set_task_knowledge") {
+    return state === "knowledge_saved" && field(result, "entity_kind") === "task" &&
+      entity === field(field(request, "consumer"), "task_id") && version === expected + 1;
+  }
+  if (field(request, "action") === "save_only") {
+    return state === "knowledge_prepared" && field(result, "entity_kind") === "task" &&
+      entity === field(request, "task_id") && version === expected &&
+      field(detail, "child_attempt_id") === null && nonnegativeInteger(field(detail, "preparation_version"));
+  }
+  return field(request, "action") === "save_and_continue_rework" &&
+    state === (field(request, "continuation_kind") === "terminal_replan" ? "replan_created_pending_quiescence" : "rework_created") &&
+    field(result, "entity_kind") === "attempt" &&
+    version === expected + 1 && field(detail, "child_attempt_id") === entity &&
+    field(detail, "parent_attempt_id") === field(request, "parent_attempt_id") &&
+    nonnegativeInteger(field(detail, "preparation_version"));
 }
 async function knowledgeConversationMutate(operation: Extract<ConversationMutation, { action: "with_knowledge" }>): Promise<ConversationMutationResult> {
   await requireKnowledgeFeature();

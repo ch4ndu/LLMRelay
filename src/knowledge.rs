@@ -2,7 +2,7 @@ use crate::domain::*;
 use crate::store::{json_hash, Store};
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -204,15 +204,23 @@ fn source_fact(
     })
 }
 
+fn entry_from_row(row: &Row<'_>) -> rusqlite::Result<KnowledgeEntry> {
+    Ok(KnowledgeEntry {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        version: row.get(2)?,
+        latest_draft_id: row.get(3)?,
+        approved_revision_id: row.get(4)?,
+        archived_at: row.get(5)?,
+    })
+}
+
 fn entry_in(connection: &Connection, project: &str, id: &str) -> Result<KnowledgeEntry> {
     bounded(project, 128, "Project ID")?;
     bounded(id, 128, "Entry ID")?;
     connection.query_row(
         "SELECT id,project_id,version,latest_draft_id,approved_revision_id,archived_at FROM knowledge_entries WHERE project_id=?1 AND id=?2",
-        params![project, id], |row| Ok(KnowledgeEntry {
-            id: row.get(0)?, project_id: row.get(1)?, version: row.get(2)?, latest_draft_id: row.get(3)?,
-            approved_revision_id: row.get(4)?, archived_at: row.get(5)?,
-        }),
+        params![project, id], entry_from_row,
     ).context("The exact knowledge entry is unavailable in this project")
 }
 
@@ -628,7 +636,8 @@ impl Store {
         let connection = self.lock()?;
         project_scope_in(&connection, project)?;
         let mut statement = connection.prepare(
-            "SELECT e.id,r.id,json_extract(r.body_json,'$.title') FROM knowledge_entries e
+            "SELECT e.id,e.project_id,e.version,e.latest_draft_id,e.approved_revision_id,e.archived_at,
+                    r.id,json_extract(r.body_json,'$.title') FROM knowledge_entries e
              JOIN knowledge_revisions r ON r.id=CASE WHEN ?2 THEN COALESCE(e.latest_draft_id,e.approved_revision_id) ELSE e.approved_revision_id END
              WHERE e.project_id=?1 AND (?3 OR e.archived_at IS NULL) AND e.id>COALESCE(?4,'')
                AND instr(lower(json_extract(r.body_json,'$.title')||char(10)||json_extract(r.body_json,'$.statement')||char(10)||json_extract(r.body_json,'$.tags')),lower(?5))>0
@@ -643,21 +652,19 @@ impl Store {
                 search.limit as i64
             ],
             |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
+                Ok(KnowledgeSearchHit {
+                    entry: entry_from_row(row)?,
+                    revision_id: row.get(6)?,
+                    title: row.get(7)?,
+                })
             },
         )?;
         let mut hits = Vec::new();
         for row in rows {
-            let (id, revision_id, title) = row?;
-            hits.push(KnowledgeSearchHit {
-                entry: entry_in(&connection, project, &id)?,
-                revision_id,
-                title,
-            });
+            let hit = row?;
+            // Stored IDs must meet the same bound as the entry lookup.
+            bounded(&hit.entry.id, 128, "Entry ID")?;
+            hits.push(hit);
         }
         bounded_json(&hits, REVISION_DETAIL_BYTES)?;
         Ok(hits)
@@ -2597,6 +2604,27 @@ mod tests {
             Some(&approved),
         )?;
         assert_eq!(edited.approved_revision_id.as_ref(), Some(&old_id));
+        let search = KnowledgeSearch {
+            query: "replacement".into(),
+            limit: 1,
+            ..Default::default()
+        };
+        assert!(store.knowledge_search("p", &search)?.is_empty());
+        let draft_hits = store.knowledge_search(
+            "p",
+            &KnowledgeSearch {
+                include_drafts: true,
+                ..search
+            },
+        )?;
+        assert_eq!(
+            serde_json::to_value(&draft_hits)?,
+            serde_json::json!([{
+                "entry": edited,
+                "revision_id": edited.latest_draft_id,
+                "title": "Knowledge"
+            }])
+        );
         assert_eq!(
             store
                 .knowledge_revision("p", &edited.id, &old_id)?
@@ -2670,6 +2698,28 @@ mod tests {
                 &KnowledgeSearch {
                     limit: 50,
                     ..Default::default()
+                }
+            )?
+            .is_empty());
+        let search = KnowledgeSearch {
+            include_archived: true,
+            limit: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(store.knowledge_search("p", &search)?)?,
+            serde_json::json!([{
+                "entry": archived,
+                "revision_id": archived.approved_revision_id,
+                "title": "Knowledge"
+            }])
+        );
+        assert!(store
+            .knowledge_search(
+                "p",
+                &KnowledgeSearch {
+                    after_entry_id: Some(archived.id.clone()),
+                    ..search
                 }
             )?
             .is_empty());

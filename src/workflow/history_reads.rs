@@ -586,26 +586,38 @@ pub fn usage_comparisons(
 pub(crate) fn comparison_observed_usage(
     connection: &Connection,
     executions: &[(String, String)],
+    ownership_checked: &mut bool,
 ) -> Result<crate::domain::ObservedUsage> {
     use crate::domain::{ObservedUsage, ObservedUsageStatus};
-    let selected = serde_json::to_string(executions)?;
-    let unresolved:bool=connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM codex_usage_observations o
-         LEFT JOIN sessions s ON s.id=o.session_id
-         LEFT JOIN role_generations g ON g.id=s.role_generation_id
-         LEFT JOIN attempts a ON a.id=g.attempt_id
-         WHERE a.task_id IS NOT o.task_id OR g.attempt_id IS NOT o.attempt_id
-           OR g.id IS NOT o.role_generation_id OR json_type(o.conflict_owners_json)!='array'
-           OR EXISTS(SELECT 1 FROM json_each(o.conflict_owners_json) owner
-               WHERE NOT EXISTS(SELECT 1 FROM sessions cs JOIN role_generations cg ON cg.id=cs.role_generation_id
-                   JOIN attempts ca ON ca.id=cg.attempt_id
-                   WHERE cs.id=json_extract(owner.value,'$.session_id')
-                     AND ca.task_id=json_extract(owner.value,'$.task_id'))))",
-        [],|row|row.get(0),
-    )?;
-    if unresolved {
-        bail!("Comparison usage is unavailable because saved response ownership cannot be resolved. Inspect the saved ownership records.");
+    // The caller keeps this flag within the same comparison read transaction.
+    if !*ownership_checked {
+        let unresolved: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM codex_usage_observations o
+             LEFT JOIN sessions s ON s.id=o.session_id
+             LEFT JOIN role_generations g ON g.id=s.role_generation_id
+             LEFT JOIN attempts a ON a.id=g.attempt_id
+             WHERE a.task_id IS NOT o.task_id OR g.attempt_id IS NOT o.attempt_id
+               OR g.id IS NOT o.role_generation_id OR json_type(o.conflict_owners_json)!='array'
+               OR EXISTS(SELECT 1 FROM json_each(o.conflict_owners_json) owner
+                   WHERE NOT EXISTS(SELECT 1 FROM sessions cs JOIN role_generations cg ON cg.id=cs.role_generation_id
+                       JOIN attempts ca ON ca.id=cg.attempt_id
+                       WHERE cs.id=json_extract(owner.value,'$.session_id')
+                         AND ca.task_id=json_extract(owner.value,'$.task_id'))))",
+            [],
+            |row| row.get(0),
+        )?;
+        if unresolved {
+            bail!("Comparison usage is unavailable because saved response ownership cannot be resolved. Inspect the saved ownership records.");
+        }
+        *ownership_checked = true;
     }
+    let mut usage = ObservedUsage::unavailable(
+        "No supported response usage was recorded for the matching executions.",
+    );
+    if executions.is_empty() {
+        return Ok(usage);
+    }
+    let selected = serde_json::to_string(executions)?;
     let mut statement = connection.prepare(
         "SELECT input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,
           reasoning_output_tokens,total_tokens,(invalid OR json_array_length(conflict_owners_json)>0),received_at,source_version,contract_revision
@@ -620,9 +632,6 @@ pub(crate) fn comparison_observed_usage(
          ORDER BY o.rowid",
     )?;
     let mut rows = statement.query([selected])?;
-    let mut usage = ObservedUsage::unavailable(
-        "No supported response usage was recorded for the matching executions.",
-    );
     let mut sum = None;
     while let Some(row) = rows.next()? {
         fold_observed_usage(&mut usage, &mut sum, row)?;

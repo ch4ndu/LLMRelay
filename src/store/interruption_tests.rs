@@ -897,7 +897,7 @@ fn schema_49_preserves_research_drafts_and_historical_stop_identity() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        50
+        CURRENT_SCHEMA_VERSION
     );
     let paths = restorepoint_paths();
     connection
@@ -1193,11 +1193,12 @@ fn schema_49_stop_targets_reject_rebinding_duplicates_and_unrelated_attempts() {
 }
 
 pub(super) fn prior_service_schema_sql(version: i64) -> String {
-    if version == 49 {
-        return "PRAGMA user_version=49;".into();
+    let drop_schema_51 = "DROP TABLE trip_integration_dispatch;";
+    if matches!(version, 49 | 50) {
+        return format!("{drop_schema_51} PRAGMA user_version={version};");
     }
 
-    let mut drop_schema_49 = String::from("PRAGMA foreign_keys=OFF;");
+    let mut drop_schema_49 = format!("PRAGMA foreign_keys=OFF; {drop_schema_51}");
     for declaration in MIGRATION_049.split("CREATE TRIGGER ").skip(1) {
         let name = declaration.split_whitespace().next().unwrap();
         drop_schema_49.push_str(&format!("DROP TRIGGER IF EXISTS {name};"));
@@ -1649,8 +1650,18 @@ fn restorepoint_snapshots(paths: &InstancePaths) -> Vec<std::path::PathBuf> {
 
 #[test]
 fn restorepoint_upgrade_restore_and_held_restart_preserve_each_prior_schema() {
+    let dispatch_objects = "SELECT COUNT(*) FROM sqlite_master
+        WHERE tbl_name='trip_integration_dispatch' AND type IN ('table','trigger')";
+    let dispatch_rows = "SELECT COUNT(*) FROM trip_integration_dispatch";
     for version in SERVICE_UPGRADABLE_SCHEMA_VERSIONS {
         let (paths, old) = restorepoint_fixture(version);
+        assert_eq!(
+            old.lock()
+                .unwrap()
+                .query_row(dispatch_objects, [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
         assert_eq!(
                 old.lock().unwrap().query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='recipe_schedule_authorizations'",
@@ -1722,6 +1733,14 @@ fn restorepoint_upgrade_restore_and_held_restart_preserve_each_prior_schema() {
             upgraded
                 .lock()
                 .unwrap()
+                .query_row(dispatch_rows, [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            upgraded
+                .lock()
+                .unwrap()
                 .query_row(SERVICE_FIXTURE_HISTORY, [], |row| row.get::<_, String>(0))
                 .unwrap(),
             history
@@ -1740,6 +1759,12 @@ fn restorepoint_upgrade_restore_and_held_restart_preserve_each_prior_schema() {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
         )
         .unwrap();
+        assert_eq!(
+            snapshot_connection
+                .query_row(dispatch_objects, [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
         assert_eq!(
             snapshot_connection
                 .query_row(SERVICE_FIXTURE_HISTORY, [], |row| row.get::<_, String>(0))
@@ -1797,6 +1822,13 @@ fn restorepoint_upgrade_restore_and_held_restart_preserve_each_prior_schema() {
         assert_eq!(
             require_maintenance_schema(&next.lock().unwrap()).unwrap(),
             CURRENT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            next.lock()
+                .unwrap()
+                .query_row(dispatch_rows, [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
         );
         assert_eq!(std::fs::metadata(&paths.database).unwrap().ino(), inode);
         assert_eq!(

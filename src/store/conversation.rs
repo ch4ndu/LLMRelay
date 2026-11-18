@@ -944,7 +944,8 @@ impl Store {
                  OR (?5 IN ('usage','tool_activity','agent_message')
                      AND EXISTS(SELECT 1 FROM conversation_operations o
                          WHERE o.conversation_id=c.id AND o.generation=c.generation
-                         AND o.native_turn_id=?4 AND o.state='completed'))))",
+                         AND o.native_thread_id=?3 AND o.native_turn_id=?4
+                         AND o.kind IN ('start','probe','submit') AND o.state='completed'))))",
             params![id, generation, thread, turn, kind],
             |r| r.get(0),
         )?;
@@ -970,7 +971,9 @@ impl Store {
                  native_thread_id,native_turn_id,operation_id,kind,payload_json,observed_at)
              VALUES(?1,?2,?3,?4,?5,
                  (SELECT operation_id FROM conversation_operations
-                  WHERE conversation_id=?1 AND native_turn_id=?5
+                  WHERE conversation_id=?1 AND generation=?3
+                  AND native_thread_id=?4 AND native_turn_id=?5
+                  AND state IN ('bound','completed')
                   AND kind IN ('start','probe','submit') ORDER BY created_at LIMIT 1),?6,?7,?8)",
             params![
                 id,
@@ -1053,14 +1056,31 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn conversation_event_waits_for_ack(
+    pub(crate) fn conversation_pending_turn_send(
         &self,
         id: &str,
         generation: &str,
         thread: &str,
         turn: Option<&str>,
-    ) -> Result<bool> {
-        Ok(self.lock()?.query_row("SELECT EXISTS(SELECT 1 FROM conversations c WHERE c.id=?1 AND c.generation=?2 AND c.binding_valid=1 AND c.native_thread_id=?3 AND ?4 IS NOT NULL AND c.active_turn_id IS NULL AND EXISTS(SELECT 1 FROM conversation_operations o WHERE o.conversation_id=c.id AND o.generation=c.generation AND o.state='sending'))",params![id,generation,thread,turn],|r|r.get(0))?)
+    ) -> Result<Option<String>> {
+        let Some(turn) = turn else { return Ok(None) };
+        Ok(self
+            .lock()?
+            .query_row(
+                "SELECT o.operation_id FROM conversations c JOIN conversation_operations o
+               ON o.conversation_id=c.id AND o.generation=c.generation
+                 AND o.native_thread_id=c.native_thread_id
+             WHERE c.id=?1 AND c.generation=?2 AND c.binding_valid=1
+               AND c.native_thread_id=?3 AND c.active_turn_id IS NULL
+               AND o.state='sending' AND o.kind IN ('start','probe','submit')
+               AND NOT EXISTS(SELECT 1 FROM conversation_operations prior
+                 WHERE prior.conversation_id=c.id AND prior.generation=c.generation
+                   AND prior.native_thread_id=?3 AND prior.native_turn_id=?4
+                   AND prior.kind IN ('start','probe','submit') AND prior.state='completed')",
+                params![id, generation, thread, turn],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     pub(crate) fn conversation_restored_usage(
@@ -1188,6 +1208,36 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn conversation_transport_truncated(
+        &self,
+        id: &str,
+        generation: &str,
+    ) -> Result<()> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE conversations SET binding_valid=0
+             WHERE id=?1 AND generation=?2 AND binding_valid=1",
+            params![id, generation],
+        )?;
+        if changed == 1 {
+            let reason = "The native transport ended in the middle of a frame. Refresh and inspect the uncertain outcome.";
+            hold_conversation_in(&tx, id, reason)?;
+            // Exit settlement still owns the batch and admission. A truncated
+            // stream cannot qualify the probe even with an earlier terminal frame.
+            tx.execute(
+                "UPDATE provider_validation_invocations
+                 SET state='delivery_unknown',failure_reason=?1,updated_at=?2
+                 WHERE id=?3 AND state='running'
+                   AND EXISTS(SELECT 1 FROM conversation_admissions
+                     WHERE probe_invocation_id=?3 AND state='probing')",
+                params![reason, Utc::now().to_rfc3339(), id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn reconcile_conversation_restart(&self) -> Result<()> {
         let mut connection = self.lock()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1228,25 +1278,32 @@ impl Store {
         id: &str,
         identity: &crate::providers::codex_app_server::ConversationNativeIdentity,
     ) -> Result<(serde_json::Value, String)> {
-        let prior: Option<String> = {
-            let connection = self.lock()?;
-            connection
-                .query_row(
-                    "SELECT session_id FROM conversation_reservations
-                     WHERE conversation_id=?1 AND state!='released'",
-                    [id],
-                    |r| r.get(0),
-                )
-                .optional()?
+        let ownership = |connection: &Connection| -> Result<(String, Option<String>, bool)> {
+            Ok(connection.query_row(
+                "SELECT c.generation,r.session_id,COALESCE(r.state!='released',0)
+                 FROM conversations c LEFT JOIN conversation_reservations r ON r.conversation_id=c.id
+                 WHERE c.id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?)
         };
-        let quiescence = prior
-            .as_ref()
+        let (generation, prior_session, prior_active) = {
+            let connection = self.lock()?;
+            ownership(&connection)?
+        };
+        let quiescence = prior_session
+            .as_deref()
+            .filter(|_| prior_active)
             .map(|session| crate::recovery::verify_session_quiescent(self, session))
             .transpose()?;
         let mut connection = self.lock()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if conversation_receipt_in(&tx, operation, request)?.is_some() {
             bail!("Resume is already reserved; inspect the conversation instead of resending it")
+        }
+        let (current_generation, current_session, current_active) = ownership(&tx)?;
+        if current_generation != generation || current_session != prior_session {
+            bail!("Conversation ownership changed during quiescence inspection")
         }
         let hash = json_hash(&serde_json::to_value(identity)?)?;
         let thread: String = tx.query_row(
@@ -1259,14 +1316,16 @@ impl Store {
             params![id, hash],
             |r| r.get(0),
         )?;
-        if let Some(session) = prior {
-            if quiescence.is_none() {
+        // Periodic reconciliation may have released this same generation
+        // during inspection. Keep its recorded exit in that case.
+        if current_active {
+            let (Some(session), Some(quiescence)) = (current_session, quiescence) else {
                 bail!("Conversation process quiescence is unavailable")
-            }
+            };
             tx.execute("UPDATE sessions SET status='exited',launch_state='finished',capture_state='complete',exit_json=?1,updated_at=?2 WHERE id=?3 AND conversation_id=?4",params![serde_json::json!({"process_group_quiescent":true,"observation":quiescence}).to_string(),Utc::now().to_rfc3339(),session,id])?;
             tx.execute(
-                "UPDATE conversation_reservations SET state='released' WHERE conversation_id=?1",
-                [id],
+                "UPDATE conversation_reservations SET state='released' WHERE conversation_id=?1 AND session_id=?2",
+                params![id, session],
             )?;
         }
         if !session_capacity_available(&tx, "codex", false, None, None)? {

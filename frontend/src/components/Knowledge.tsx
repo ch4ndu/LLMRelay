@@ -6,6 +6,7 @@ import {
   knowledgeCommandIsCurrent,
   knowledgeRead,
   operationId,
+  recoveryJournalChanged,
   utf8Bytes,
 } from "../api";
 import type {
@@ -20,10 +21,11 @@ import type {
   KnowledgeSourceSelector,
 } from "../types";
 import { withStorageLock } from "../storageCoordination";
-import { ErrorNotice } from "./ErrorNotice";
+import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
 
 const errorText = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause);
+const knowledgeInFlight = new Set<string>();
 export function knowledgeSourceLabel(source: KnowledgeSourceSelector): string {
   switch (source.kind) {
     case "historical":
@@ -51,13 +53,14 @@ export function knowledgeSourceLabel(source: KnowledgeSourceSelector): string {
 
 function useKnowledgeMutation(
   projectId: string,
-  onSaved: (entryId?: string, revisionId?: string) => void,
+  onSaved: (entryId?: string, revisionId?: string, revalidated?: boolean) => void,
 ) {
   const key = `llmrelay.knowledge.pending.${encodeURIComponent(projectId)}`;
   const [pending, setPending] = useState<KnowledgeCommand>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [checked, setChecked] = useState(false);
+  const [checked, setChecked] = useState<string>();
+  const [journalUnreadable, setJournalUnreadable] = useState(false);
   // A new scope gets a distinct lifetime even when an older request is still pending.
   const lifetime = useRef({ key, active: true });
   if (lifetime.current.key !== key) lifetime.current = { key, active: true };
@@ -67,88 +70,111 @@ function useKnowledgeMutation(
     setPending(undefined);
     setBusy(false);
     setError("");
-    setChecked(false);
-    try {
-      const raw = localStorage.getItem(key);
-      if (raw) {
-        const saved: unknown = JSON.parse(raw);
-        if (
+    setChecked(undefined);
+    const sync = () => {
+      try {
+        const raw = localStorage.getItem(key);
+        const saved: unknown = raw === null ? undefined : JSON.parse(raw);
+        if (raw !== null && (
           !knowledgeCommandIsCurrent(saved) ||
-          (saved.kind === "mutate"
-              ? saved.request.project_id
-              : saved.project_id) !== projectId
-        ) {
-          throw new Error(
-            "The saved knowledge request cannot be read. Keep browser storage and report its technical details.",
-          );
-        }
-        setPending(saved);
+          (saved.kind === "mutate" ? saved.request.project_id : saved.project_id) !== projectId ||
+          JSON.stringify(saved) !== raw
+        )) throw new Error("Invalid saved knowledge request");
+        setPending(knowledgeCommandIsCurrent(saved) ? saved : undefined);
+        setJournalUnreadable(false);
+        setChecked((reviewed) => reviewed === raw ? reviewed : undefined);
+      } catch {
+        setPending(undefined);
+        setChecked(undefined);
+        setJournalUnreadable(true);
       }
-    } catch (cause) {
-      setError(errorText(cause));
-    }
+    };
+    const onLocalWrite = (event: Event) => {
+      if (event instanceof window.CustomEvent && event.detail === key) sync();
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === key || event.key === null) sync();
+    };
+    sync();
+    window.addEventListener(recoveryJournalChanged, onLocalWrite);
+    window.addEventListener("storage", onStorage);
     return () => {
       scope.active = false;
+      window.removeEventListener(recoveryJournalChanged, onLocalWrite);
+      window.removeEventListener("storage", onStorage);
     };
-  }, [key]);
+  }, [key, projectId]);
   async function dispatch(
     request: KnowledgeCommand,
     replay = false,
   ): Promise<void> {
-    if (busy || (pending && !replay)) return;
+    const body = JSON.stringify(request);
+    if (busy || journalUnreadable || knowledgeInFlight.has(key) ||
+      (replay ? checked !== body || pending !== request : !!pending)) return;
     const scope = lifetime.current;
     const current = () => scope.active && lifetime.current === scope;
+    let journaled = false;
+    let accepted = false;
+    const removeExact = () => withStorageLock(key, () => {
+      if (localStorage.getItem(key) !== body) return false;
+      localStorage.removeItem(key);
+      return true;
+    });
+    const notify = () => window.dispatchEvent(
+      new window.CustomEvent(recoveryJournalChanged, { detail: key }),
+    );
+    knowledgeInFlight.add(key);
     setBusy(true);
     setError("");
+    setChecked(undefined);
     try {
       await withStorageLock(key, () => {
+        if (!current()) return;
         const existing = localStorage.getItem(key);
-        const body = JSON.stringify(request);
-        if (existing && existing !== body) {
-          throw new Error(
-            "Another saved knowledge operation owns this project. Refresh and check its outcome.",
-          );
+        if (replay ? existing !== body : existing !== null) {
+          throw new Error("The project knowledge journal changed. Refresh Knowledge and check the saved request.");
         }
-        localStorage.setItem(key, body);
+        if (!replay) localStorage.setItem(key, body);
+        journaled = true;
       });
-      if (current()) setPending(request);
+      if (!journaled) return;
+      if (!current()) {
+        if (!replay) await removeExact();
+        return;
+      }
+      notify();
       const result = await knowledgeCommand(request);
-      await withStorageLock(key, () => {
-        if (localStorage.getItem(key) === JSON.stringify(request)) {
-          localStorage.removeItem(key);
-        }
-      });
-      if (!current()) return;
-      setPending(undefined);
-      setChecked(false);
-      if ("id" in result) {
+      accepted = true;
+      const removed = await removeExact();
+      journaled = false;
+      if (!current() || !removed) return;
+      if (request.kind === "mutate" && "id" in result) {
         onSaved(
           result.id,
           result.latest_draft_id || result.approved_revision_id || undefined,
         );
-      } else onSaved();
-    } catch (cause) {
-      if (
-        cause instanceof ApiError && !cause.ambiguous && cause.status >= 400 &&
-        cause.status < 500
-      ) {
-        await withStorageLock(key, () => {
-          if (localStorage.getItem(key) === JSON.stringify(request)) {
-            localStorage.removeItem(key);
-          }
-        });
-        if (current()) {
-          setPending(undefined);
-          setError(errorText(cause));
-        }
-      } else if (current()) {
-        setError(
-          `${
-            errorText(cause)
-          } Refresh and check the outcome before retrying. The original operation identity is retained.`,
-        );
+      } else if (request.kind === "revalidate") {
+        onSaved(request.entry_id, request.revision_id, true);
       }
+    } catch (cause) {
+      let message = errorText(cause);
+      if (journaled && !accepted && !replay &&
+        !(cause instanceof ApiError && cause.ambiguous)) {
+        try {
+          await removeExact();
+          journaled = false;
+        } catch (cleanupError) {
+          message = errorText(cleanupError);
+        }
+      }
+      if (current()) setError(
+        journaled
+          ? `${message} Refresh and check the outcome before retrying. The original operation identity is retained.`
+          : message,
+      );
     } finally {
+      knowledgeInFlight.delete(key);
+      notify();
       if (current()) setBusy(false);
     }
   }
@@ -168,14 +194,15 @@ function useKnowledgeMutation(
           <label>
             <input
               type="checkbox"
-              checked={checked}
+              checked={checked === JSON.stringify(pending)}
+              disabled={busy || knowledgeInFlight.has(key)}
               onChange={(event) =>
-                setChecked(event.target.checked)}
+                setChecked(event.target.checked ? JSON.stringify(pending) : undefined)}
             />I refreshed and checked this operation's outcome.
           </label>
           <button
             type="button"
-            disabled={busy || !checked}
+            disabled={busy || knowledgeInFlight.has(key) || checked !== JSON.stringify(pending)}
             onClick={() =>
               void dispatch(pending, true)}
           >
@@ -183,10 +210,11 @@ function useKnowledgeMutation(
           </button>
         </section>
       )}
+      {journalUnreadable && <ErrorNotice error="The saved knowledge request cannot be read. Refresh Knowledge and keep the saved request available for troubleshooting." />}
       {error && <ErrorNotice error={error} />}
     </>
   );
-  return { dispatch, blocked: busy || !!pending, busy, notice };
+  return { dispatch, blocked: busy || !!pending || journalUnreadable, busy, notice };
 }
 
 interface DraftEditorProps {
@@ -643,6 +671,7 @@ export function Knowledge({ projectId }: { projectId: string }) {
     entryId: string,
     revisionId: string,
     refreshEpoch?: number,
+    restoreOnFailure = true,
   ): Promise<void> {
     const current = refreshEpoch ?? ++epoch.current;
     setBusy(true);
@@ -676,7 +705,13 @@ export function Knowledge({ projectId }: { projectId: string }) {
         setHistoryMore(history.length === 50);
       }
     } catch (cause) {
-      if (current === epoch.current) setError(errorText(cause));
+      if (current === epoch.current) {
+        if (restoreOnFailure && refreshEpoch !== undefined && detail?.entry.id === entryId &&
+          detail.revision.id === revisionId) {
+          setDetail(detail);
+        }
+        setError(errorText(cause));
+      }
     } finally {
       if (refreshEpoch === undefined && current === epoch.current) setBusy(false);
     }
@@ -684,21 +719,28 @@ export function Knowledge({ projectId }: { projectId: string }) {
   async function refresh(
     entryId = detail?.entry.id,
     revisionId = detail?.revision.id,
+    restoreOnFailure = true,
   ): Promise<void> {
     // Both reads share a lifetime; neither may invalidate the other or end busy early.
     const current = ++epoch.current;
     try {
       await Promise.all([
         search(null, current),
-        entryId && revisionId ? open(entryId, revisionId, current) : undefined,
+        entryId && revisionId ? open(entryId, revisionId, current, restoreOnFailure) : undefined,
       ]);
     } finally {
       if (current === epoch.current) setBusy(false);
     }
   }
-  const mutation = useKnowledgeMutation(projectId, (entryId, revisionId) => {
-    if (detail) void refresh();
-    else void refresh(entryId, revisionId);
+  const visibleEpoch = epoch.current;
+  const mutation = useKnowledgeMutation(projectId, (entryId, revisionId, revalidated) => {
+    if (epoch.current !== visibleEpoch) return;
+    if (detail) {
+      const viewedRevisionRevalidated = revalidated && detail.revision.id === revisionId;
+      void refresh(detail.entry.id, detail.revision.id, !viewedRevisionRevalidated);
+    } else {
+      void refresh(entryId, revisionId);
+    }
   });
   async function openSource(index: number): Promise<void> {
     if (!detail) return;
@@ -846,6 +888,12 @@ export function Knowledge({ projectId }: { projectId: string }) {
           {detail.observation.sources.map((item, index) => (
             <p key={index}>{item.state.replaceAll("_", " ")}: {item.reason}</p>
           ))}
+          {detail.observation.sources_omitted !== undefined && (
+            <p>Freshness details omitted for {detail.observation.sources_omitted} sources.</p>
+          )}
+          <TechnicalDetails>
+            <p>Observation fingerprint <code>{detail.observation.fingerprint}</code></p>
+          </TechnicalDetails>
           {detail.observation.restore_operation_id && (
             <p role="alert">
               Restored source observations require new explicit revalidation,

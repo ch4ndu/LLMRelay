@@ -814,6 +814,15 @@ fn scoped_capability_binding(
     if key != expected.capability_key {
         return Ok(None);
     }
+    select_scoped_capability_binding(connection, config, expected)
+}
+
+fn select_scoped_capability_binding(
+    connection: &Connection,
+    config: &LaunchConfig,
+    expected: &RuntimeScopeExpectation<'_>,
+) -> Result<Option<(String, String, String)>> {
+    let key = expected.capability_key;
     let binding:Option<(String,String)>=connection.query_row(
         "SELECT id,proof_json FROM capabilities current_capability WHERE current_capability.rowid=(SELECT latest_capability.rowid FROM capabilities latest_capability WHERE latest_capability.provider=?1 AND latest_capability.executable_version=?2 AND latest_capability.role=?3 AND latest_capability.mode='interactive_pty' ORDER BY latest_capability.checked_at DESC,latest_capability.rowid DESC LIMIT 1) AND current_capability.config_hash=?4 AND current_capability.status='supported' AND current_capability.proof_json!='{}'",
         params![config.provider.to_string(),config.executable_version,config.role.to_string(),key],|row|Ok((row.get(0)?,row.get(1)?))
@@ -844,7 +853,7 @@ fn scoped_capability_binding(
     else {
         return Ok(None);
     };
-    Ok(Some((id, key, json_hash(&scope)?)))
+    Ok(Some((id, key.to_owned(), json_hash(&scope)?)))
 }
 
 fn capability_binding(
@@ -2656,16 +2665,17 @@ pub fn execute_human_with_runtime(
         bail!("operation_id is required")
     }
     let request_hash = json_hash(action)?;
-    if let Some(result) =
-        store.operation_receipt(operation_id, "human_control", "trip_command", &request_hash)?
-    {
-        return Ok(serde_json::from_value(result)?);
-    }
     let receipt = CommandReceipt::new(operation_id, &request_hash);
     {
         let connection = store.lock()?;
+        if let Some(result) = lookup_trip_receipt(&connection, &receipt)
+            .map_err(|error| classify_trip_lookup_error(action, error))?
+        {
+            return Ok(result);
+        }
         receipt.progressed.set(
-            validate_trip_progress(&connection, &receipt)?
+            validate_trip_progress(&connection, &receipt)
+                .map_err(|error| classify_trip_lookup_error(action, error))?
                 || historical_trip_progress(&connection, action)?,
         );
     }
@@ -2923,7 +2933,7 @@ pub fn execute_human_with_runtime(
     })();
     execution.map_err(|error| {
         if receipt.progressed.get() && !error.is::<TripOutcomeUnknown>() {
-            TripOutcomeUnknown { cause: error }.into()
+            outcome_unknown(error)
         } else {
             classify_trip_error(store, operation_id, action, error)
         }
@@ -4190,10 +4200,44 @@ fn current_runtime_probe_plan(
     } else {
         project_runtime_profile(connection, project_id, role)?
     };
-    let prepare = |cwd: &Path| -> Result<crate::providers::PreparedLaunch> {
-        let mut launch = crate::providers::prepare_role_launch_with_bundles(
+    let (config, identity) = prepare_ordinary_runtime_identity(
+        runtime,
+        &plan,
+        &target_cwd,
+        fixture_root,
+        frozen_policy,
+        None,
+    )?;
+    plan.capability_key = crate::providers::capability_identity_key(&identity)?;
+    plan.capability_identity_json = serde_json::to_string(&identity)?;
+    runtime.require_current_policy(&config)?;
+    if crate::providers::capability_key(&config)? != plan.capability_key {
+        return Ok(plan);
+    }
+    plan.capability_id = runtime_probe_plan_binding(
+        connection,
+        project_id,
+        task_id,
+        fixture_root,
+        &plan,
+        &config,
+    )?
+    .map(|binding| binding.0);
+    Ok(plan)
+}
+
+fn prepare_ordinary_runtime_identity(
+    runtime: &CapabilityRuntime,
+    plan: &RuntimeProbePlan,
+    target_cwd: &str,
+    fixture_root: &str,
+    frozen_policy: Option<&serde_json::Value>,
+    observed_executable: Option<(&Path, &str)>,
+) -> Result<(LaunchConfig, CapabilityIdentity)> {
+    let prepare = |cwd: &Path| -> Result<LaunchConfig> {
+        let mut launch = crate::providers::prepare_role_launch_with_policies(
             plan.config.provider,
-            role,
+            plan.role,
             &plan.config.model,
             &plan.config.effort,
             cwd,
@@ -4205,25 +4249,41 @@ fn current_runtime_probe_plan(
             None,
             &runtime.hooks,
             &runtime.executable,
+            &[],
+            None,
             &runtime.compatibility_bundles,
+            observed_executable,
         )?;
         if let Some(policy) = frozen_policy {
             crate::providers::retain_qualification_contract(&mut launch.config, policy)?;
         }
-        Ok(launch)
+        Ok(launch.config)
     };
-    let target = prepare(Path::new(&target_cwd))?;
+    let target = prepare(Path::new(target_cwd))?;
     let fixture = prepare(Path::new(fixture_root))?;
-    runtime.require_current_policy(&target.config)?;
-    runtime.require_current_policy(&fixture.config)?;
-    let target_key = crate::providers::capability_key(&target.config)?;
-    let fixture_key = crate::providers::capability_key(&fixture.config)?;
-    if target_key != fixture_key {
-        bail!("{} runtime policy differs between the target and disposable empty fixture; ordinary proof cannot be relabelled or forged",role)
+    runtime.require_current_policy(&target)?;
+    let fixture_identity = crate::providers::capability_identity(&fixture)?;
+    crate::providers::require_current_capability_identity_with_bundles(
+        &fixture_identity,
+        &fixture.cwd,
+        &runtime.compatibility_bundles,
+    )?;
+    if crate::providers::capability_key(&target)?
+        != crate::providers::capability_identity_key(&fixture_identity)?
+    {
+        bail!("{} runtime policy differs between the target and disposable empty fixture; ordinary proof cannot be relabelled or forged",plan.role)
     }
-    plan.capability_key = fixture_key;
-    plan.capability_identity_json =
-        serde_json::to_string(&crate::providers::capability_identity(&fixture.config)?)?;
+    Ok((fixture, fixture_identity))
+}
+
+fn runtime_probe_plan_binding(
+    connection: &Connection,
+    project_id: &str,
+    task_id: Option<&str>,
+    fixture_root: &str,
+    plan: &RuntimeProbePlan,
+    config: &LaunchConfig,
+) -> Result<Option<(String, String, String)>> {
     let (setup_id, fixture_project, current_fixture_root, fixture_identity, _) =
         runtime_fixture_scope(connection, project_id)?;
     if current_fixture_root != fixture_root {
@@ -4231,9 +4291,9 @@ fn current_runtime_probe_plan(
     }
     let capability_identity =
         serde_json::from_str::<serde_json::Value>(&plan.capability_identity_json)?;
-    plan.capability_id = scoped_capability_binding(
+    select_scoped_capability_binding(
         connection,
-        &fixture.config,
+        config,
         &RuntimeScopeExpectation {
             project_id,
             task_id: if plan.source == "task_override" {
@@ -4241,7 +4301,7 @@ fn current_runtime_probe_plan(
             } else {
                 None
             },
-            role,
+            role: plan.role,
             settings_revision: if plan.source == "task_override" {
                 plan.settings_revision
             } else {
@@ -4260,10 +4320,300 @@ fn current_runtime_probe_plan(
             fixture_repository_identity: &fixture_identity,
             fixture_root_hash: &sha256(fixture_root.as_bytes()),
         },
-        &runtime.compatibility_bundles,
-    )?
-    .map(|binding| binding.0);
-    Ok(plan)
+    )
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DiagnosticsRuntimeBinding {
+    pub project_id: String,
+    pub setup_operation_id: String,
+    pub role: RoleKind,
+    pub profile_hash: String,
+    pub runtime_profile_hash: String,
+    pub project_config_revision_id: String,
+    pub adapter_hash: String,
+    pub capability_id: String,
+    pub capability_key: String,
+}
+
+struct DiagnosticsRuntimeCandidate {
+    project_id: String,
+    setup_id: String,
+    selected_profile_hash: String,
+    target_cwd: String,
+    fixture_project: String,
+    fixture_root: String,
+    fixture_identity: String,
+    plan: RuntimeProbePlan,
+    publications: Vec<DiagnosticsRuntimePublication>,
+}
+
+struct DiagnosticsRuntimePublication {
+    capability_id: String,
+    capability_key: String,
+    identity: CapabilityIdentity,
+}
+
+fn diagnostics_runtime_candidates(
+    connection: &Connection,
+) -> Result<Vec<DiagnosticsRuntimeCandidate>> {
+    let mut statement = connection.prepare(
+        "SELECT p.id,so.id,selection.role,selection.profile_json,selection.profile_hash
+         FROM projects p JOIN trip_project_state s ON s.project_id=p.id
+         JOIN trip_setup_operations so ON so.id=s.setup_operation_id AND so.project_id=p.id
+         JOIN trip_config_revisions revision ON revision.id=s.active_config_revision_id
+           AND revision.project_id=p.id AND revision.state='activated'
+         JOIN trip_setup_profile_selections selection ON selection.setup_operation_id=so.id
+         WHERE p.internal_purpose IS NULL AND s.readiness='ready' AND so.state='activated'
+           AND selection.selection_state='selected'
+           AND selection.profile_json IS NOT NULL AND selection.profile_hash IS NOT NULL
+           AND EXISTS(SELECT 1 FROM trip_runtime_admissions admission
+             JOIN trip_runtime_probes probe ON probe.admission_id=admission.id
+             WHERE admission.project_id=p.id AND admission.task_id IS NULL
+               AND probe.role=selection.role AND probe.state='published'
+               AND probe.project_config_revision_id=s.active_config_revision_id
+               AND probe.fixture_project_id=so.fixture_project_id AND probe.capability_id IS NOT NULL)
+         ORDER BY p.id,selection.role",
+    )?;
+    let selections = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut candidates = Vec::new();
+    for (project_id, setup_id, role, profile_json, selected_profile_hash) in selections {
+        let Ok(role) = role.parse::<RoleKind>() else {
+            continue;
+        };
+        let Ok(selected_profile) = serde_json::from_str::<serde_json::Value>(&profile_json) else {
+            continue;
+        };
+        let Ok(selected) = RoleOverride::deserialize(&selected_profile) else {
+            continue;
+        };
+        let Ok((plan, target_cwd)) = project_runtime_profile(connection, &project_id, role) else {
+            continue;
+        };
+        // Setup stores the manager's RoleOverride. The runtime adds the
+        // service-owned adapter, authority and session fields to that tuple.
+        let profile_matches = if role == RoleKind::Manager {
+            selected_profile == serde_json::to_value(&plan.config)?
+        } else {
+            selected_profile == plan.profile_json
+        };
+        if !profile_matches
+            || selected.provider != plan.config.provider
+            || selected.model != plan.config.model
+            || selected.effort != plan.config.effort
+            || setup_adapter_hash(connection, &setup_id, &role.to_string())
+                .ok()
+                .as_ref()
+                != Some(&plan.adapter_hash)
+        {
+            continue;
+        }
+        let Ok((_, fixture_project, fixture_root, fixture_identity, _)) =
+            runtime_fixture_scope(connection, &project_id)
+        else {
+            continue;
+        };
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT proof.id,probe.capability_key,probe.capability_identity_json
+             FROM trip_runtime_admissions admission
+             JOIN trip_runtime_probes probe ON probe.admission_id=admission.id
+             JOIN capabilities proof ON proof.id=probe.capability_id AND proof.config_hash=probe.capability_key
+             WHERE admission.project_id=?1 AND admission.task_id IS NULL
+               AND probe.role=?2 AND probe.settings_revision IS NULL AND probe.state='published'
+               AND probe.profile_hash=?3 AND probe.project_config_revision_id=?4
+               AND probe.project_configuration_hash=?5 AND probe.adapter_name=?6 AND probe.adapter_hash=?7
+               AND probe.fixture_project_id=?8 AND probe.fixture_repository_identity=?9 AND probe.fixture_root=?10
+               AND proof.provider=?11 AND proof.role=probe.role AND proof.mode='interactive_pty'
+               AND proof.status='supported' AND proof.proof_json!='{}'",
+        )?;
+        let published = statement
+            .query_map(
+                params![
+                    project_id,
+                    role.to_string(),
+                    plan.profile_hash,
+                    plan.project_config_revision_id,
+                    plan.project_configuration_hash,
+                    plan.adapter_name,
+                    plan.adapter_hash,
+                    fixture_project,
+                    fixture_identity,
+                    fixture_root,
+                    plan.config.provider.to_string(),
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let publications = published
+            .into_iter()
+            .filter_map(|(capability_id, capability_key, raw)| {
+                let identity = serde_json::from_str::<CapabilityIdentity>(&raw).ok()?;
+                (identity.provider == plan.config.provider
+                    && identity.role == role
+                    && identity.model == selected.model
+                    && identity.effort == selected.effort
+                    && identity.compatibility.is_some()
+                    && !identity.executable_version.is_empty()
+                    && crate::providers::capability_identity_key(&identity)
+                        .ok()
+                        .as_ref()
+                        == Some(&capability_key))
+                .then_some(DiagnosticsRuntimePublication {
+                    capability_id,
+                    capability_key,
+                    identity,
+                })
+            })
+            .collect::<Vec<_>>();
+        if !publications.is_empty() {
+            candidates.push(DiagnosticsRuntimeCandidate {
+                project_id,
+                setup_id,
+                selected_profile_hash,
+                target_cwd,
+                fixture_project,
+                fixture_root,
+                fixture_identity,
+                plan,
+                publications,
+            });
+        }
+    }
+    Ok(candidates)
+}
+
+pub(crate) fn diagnostics_runtime_bindings(
+    store: &Store,
+    runtime: &CapabilityRuntime,
+) -> Result<Vec<DiagnosticsRuntimeBinding>> {
+    diagnostics_runtime_bindings_with(store, runtime, crate::providers::executable_and_version)
+}
+
+fn diagnostics_runtime_bindings_with(
+    store: &Store,
+    runtime: &CapabilityRuntime,
+    mut observe: impl FnMut(Provider) -> Result<(PathBuf, String)>,
+) -> Result<Vec<DiagnosticsRuntimeBinding>> {
+    // Only SQLite reads run under the mutex. Executable and native policy
+    // inspection belongs on the blocking worker that calls this method.
+    let candidates = diagnostics_runtime_candidates(&*store.lock()?)?;
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut prepared = Vec::new();
+    for provider in [Provider::Codex, Provider::Claude] {
+        let mut profiles = candidates
+            .iter()
+            .filter(|candidate| candidate.plan.config.provider == provider)
+            .peekable();
+        if profiles.peek().is_none() {
+            continue;
+        }
+        // Even an unchanged native launcher can forward to an upgraded CLI.
+        let Ok((path, version)) = observe(provider) else {
+            continue;
+        };
+        for candidate in profiles {
+            if !candidate
+                .publications
+                .iter()
+                .any(|proof| proof.identity.executable_version == version)
+            {
+                continue;
+            }
+            let Ok((config, identity)) = prepare_ordinary_runtime_identity(
+                runtime,
+                &candidate.plan,
+                &candidate.target_cwd,
+                &candidate.fixture_root,
+                None,
+                Some((&path, &version)),
+            ) else {
+                continue;
+            };
+            let mut plan = candidate.plan.clone();
+            plan.capability_key = crate::providers::capability_identity_key(&identity)?;
+            plan.capability_identity_json = serde_json::to_string(&identity)?;
+            prepared.push((candidate, plan, config));
+        }
+    }
+    if prepared.is_empty() {
+        return Ok(Vec::new());
+    }
+    let connection = store.lock()?;
+    let current = diagnostics_runtime_candidates(&connection)?;
+    let mut bindings = Vec::new();
+    for (sampled, plan, config) in prepared {
+        // The active sources and the published identity can change while
+        // provider metadata and native policy are sampled outside the mutex.
+        let matching = current.iter().find(|candidate| {
+            candidate.project_id == sampled.project_id
+                && candidate.setup_id == sampled.setup_id
+                && candidate.plan.role == plan.role
+                && candidate.selected_profile_hash == sampled.selected_profile_hash
+                && candidate.target_cwd == sampled.target_cwd
+                && candidate.fixture_project == sampled.fixture_project
+                && candidate.fixture_root == sampled.fixture_root
+                && candidate.fixture_identity == sampled.fixture_identity
+                && candidate.plan.project_config_revision_id == plan.project_config_revision_id
+                && candidate.plan.project_configuration_hash == plan.project_configuration_hash
+                && candidate.plan.profile_hash == plan.profile_hash
+                && candidate.plan.adapter_name == plan.adapter_name
+                && candidate.plan.adapter_hash == plan.adapter_hash
+                && candidate.plan.config.provider == config.provider
+                && candidate.plan.config.model == config.model
+                && candidate.plan.config.effort == config.effort
+        });
+        let Some(current) = matching else {
+            continue;
+        };
+        let Some((id, key, _)) = runtime_probe_plan_binding(
+            &connection,
+            &current.project_id,
+            None,
+            &current.fixture_root,
+            &plan,
+            &config,
+        )?
+        else {
+            continue;
+        };
+        if !current
+            .publications
+            .iter()
+            .any(|proof| proof.capability_id == id && proof.capability_key == key)
+        {
+            continue;
+        }
+        bindings.push(DiagnosticsRuntimeBinding {
+            project_id: current.project_id.clone(),
+            setup_operation_id: current.setup_id.clone(),
+            role: plan.role,
+            profile_hash: current.selected_profile_hash.clone(),
+            runtime_profile_hash: plan.profile_hash,
+            project_config_revision_id: plan.project_config_revision_id,
+            adapter_hash: plan.adapter_hash,
+            capability_id: id,
+            capability_key: key,
+        });
+    }
+    Ok(bindings)
 }
 
 fn runtime_admission_scope_hash(
@@ -5489,6 +5839,68 @@ fn publish_functional_runtime_proof(
     Ok(result)
 }
 
+fn replay_or_refuse_superseded_probe_authorization(
+    store: &Store,
+    receipt: &CommandReceipt<'_>,
+    setup_id: &str,
+    expected_proposal_hash: &str,
+) -> Result<Option<OperationResult>> {
+    let mut connection = store.lock()?;
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(result) = lookup_trip_receipt(&tx, receipt)? {
+        return Ok(Some(result));
+    }
+    let stale_proposal_can_be_refused: Option<bool> = tx
+        .query_row(
+            "SELECT so.state='draft' AND so.probe_attempt_id IS NULL AND so.probe_authorized_at IS NULL
+             AND so.selected_profiles_hash IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM trip_setup_permits p
+               WHERE p.setup_operation_id=so.id AND p.purpose='profile_probe'
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM audit_events e
+               WHERE e.operation_id=?3 AND e.event_code='trip.command.applied'
+             )
+             AND EXISTS (
+               SELECT 1 FROM audit_events e
+               JOIN operation_receipts r ON r.operation_id=e.operation_id
+                 AND r.actor_key='human_control' AND r.operation_kind='trip_command'
+                 AND r.result_json=e.detail_json
+               WHERE e.entity_kind='trip_setup' AND e.entity_id=so.id
+                 AND e.actor_kind='human' AND e.event_code='trip.command.applied'
+                 AND json_extract(e.detail_json,'$.state') IN ('draft_saved','revision_draft_saved')
+                 AND json_extract(e.detail_json,'$.detail.proposal_hash')=?2
+             )
+             FROM trip_setup_operations so WHERE so.id=?1 AND so.proposal_hash<>?2",
+            params![setup_id, expected_proposal_hash, receipt.operation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(can_refuse) = stale_proposal_can_be_refused else {
+        return Ok(None);
+    };
+    if !can_refuse || receipt.progressed.get() || validate_trip_progress(&tx, receipt)? {
+        return Err(unresolved_probe_authorization(anyhow!(
+            "The current setup proposal differs from the saved request, and the service cannot confirm how far the saved request progressed."
+        )));
+    }
+    // Shares the receipt key and writer lock with authorization. The refusal remains
+    // binding even if the draft later returns to the same proposal hash.
+    tx.execute(
+        "INSERT INTO operation_receipts(operation_id,actor_key,operation_kind,request_hash,result_json,created_at)
+         VALUES(?1,'human_control','trip_command',?2,?3,?4)",
+        params![
+            receipt.operation_id,
+            receipt.request_hash,
+            SUPERSEDED_PROBE_REFUSAL,
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    tx.commit()?;
+    Err(SetupProbeAuthorizationRefused::new(receipt.operation_id).into())
+}
+
 fn authorize_probes(
     store: &Store,
     paths: &InstancePaths,
@@ -5498,6 +5910,16 @@ fn authorize_probes(
     expected_proposal_hash: &str,
 ) -> Result<OperationResult> {
     let operation_id = receipt.operation_id;
+    if let Some(result) = replay_or_refuse_superseded_probe_authorization(
+        store,
+        receipt,
+        setup_id,
+        expected_proposal_hash,
+    )
+    .map_err(probe_authorization_lookup_error)?
+    {
+        return Ok(result);
+    }
     if let Some(recovered) =
         retry_probe_workspace(store, receipt, setup_id, expected_proposal_hash)?
     {
@@ -5524,7 +5946,9 @@ fn authorize_probes(
         )?
     };
     if proposal_hash != expected_proposal_hash {
-        bail!("setup proposal changed before probe authorization")
+        return Err(unresolved_probe_authorization(anyhow!(
+            "setup proposal changed before probe authorization"
+        )));
     }
     let proposal: SetupProposal = serde_json::from_str(&proposal_json)?;
     validate_setup_proposal(&proposal)?;
@@ -5565,7 +5989,9 @@ fn authorize_probes(
         require_setup_proof_bindings(&tx, setup_id, &proof_bindings)?;
         let draft: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM trip_setup_operations WHERE id=?1 AND state='draft' AND proposal_hash=?2)", params![setup_id,expected_proposal_hash], |row| row.get(0))?;
         if !draft {
-            bail!("setup proposal changed before probe authorization")
+            return Err(unresolved_probe_authorization(anyhow!(
+                "setup proposal changed before probe authorization"
+            )));
         }
         tx.execute(
             "UPDATE trip_setup_operations SET state='preflight_complete',selected_profiles_hash=?1,probe_authorized_at=?2,updated_at=?2 WHERE id=?3 AND state='draft'",
@@ -5600,7 +6026,9 @@ fn authorize_probes(
         require_setup_proof_bindings(&tx, setup_id, &proof_bindings)?;
         let draft: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM trip_setup_operations WHERE id=?1 AND state='draft' AND proposal_hash=?2)", params![setup_id,expected_proposal_hash], |row| row.get(0))?;
         if !draft {
-            bail!("setup proposal changed before probe authorization")
+            return Err(unresolved_probe_authorization(anyhow!(
+                "setup proposal changed before probe authorization"
+            )));
         }
         let discovery_active: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id
@@ -5681,6 +6109,9 @@ fn authorize_probes(
     );
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(result) = lookup_trip_receipt(&tx, receipt)? {
+        return Ok(result);
+    }
     require_setup_workspace_reservation(&tx, &attempt_id, &workspace_path, &identity, &head)?;
     require_setup_workspace_authority(&tx, setup_id, &attempt_id, "probing")?;
     publish_setup_workspace(&tx, &attempt_id, &policy)?;
@@ -5830,6 +6261,9 @@ fn retry_probe_workspace(
         String,
     )> = {
         let connection = store.lock()?;
+        if let Some(result) = lookup_trip_receipt(&connection, receipt)? {
+            return Ok(Some(result));
+        }
         connection
             .query_row(
                 "SELECT so.fixture_project_id,so.validation_task_id,so.probe_attempt_id,
@@ -5874,7 +6308,9 @@ fn retry_probe_workspace(
         return Ok(None);
     };
     if proposal_hash != expected_proposal_hash {
-        bail!("setup proposal changed before probe workspace recovery")
+        return Err(unresolved_probe_authorization(anyhow!(
+            "setup proposal changed before probe workspace recovery"
+        )));
     }
     let proposal: SetupProposal = serde_json::from_str(&proposal_json)?;
     validate_setup_proposal(&proposal)?;
@@ -5914,6 +6350,9 @@ fn retry_probe_workspace(
     );
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(result) = lookup_trip_receipt(&tx, receipt)? {
+        return Ok(Some(result));
+    }
     require_setup_workspace_reservation(
         &tx,
         &attempt_id,
@@ -7183,19 +7622,21 @@ fn migrate_attempt(
     drop(connection);
     if let Err(error) = materialize_project_policy(store, attempt_id, Path::new(&workspace)) {
         let failed = Utc::now().to_rfc3339();
-        let connection = store.lock()?;
-        connection.execute(
+        let mut connection = store.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             "UPDATE workspaces SET state='recovery_required',updated_at=?1 WHERE attempt_id=?2",
             params![failed, attempt_id],
         )?;
-        connection.execute(
+        tx.execute(
             "UPDATE attempts SET status='needs_recovery',updated_at=?1 WHERE id=?2",
             params![failed, attempt_id],
         )?;
-        connection.execute(
+        tx.execute(
             "UPDATE tasks SET attention='needs_recovery',updated_at=?1 WHERE id=?2",
             params![failed, task_id],
         )?;
+        tx.commit()?;
         bail!("legacy migration policy materialization requires recovery: {error:#}")
     }
     let published_at = Utc::now().to_rfc3339();
@@ -11812,10 +12253,72 @@ pub fn request_integration(
         .insert("worktree_scope".into(), worktree_scope.clone());
     let id = uuid::Uuid::new_v4().to_string();
     tx.execute("INSERT INTO trip_integration_requests(id,attempt_id,capsule_json,requested_by_generation_id,state,created_at) VALUES(?1,?2,?3,?4,'requested',?5)",params![id,context.attempt_id,stored_capsule.to_string(),context.role_generation_id,now])?;
+    tx.execute(
+        "INSERT INTO trip_integration_dispatch(request_id) VALUES(?1)",
+        params![id],
+    )?;
     tx.commit()?;
     Ok(
         serde_json::json!({"integration_request_id":id,"state":"requested","lane_count":ordered.len(),"manager_directed":true,"worktree_scope":worktree_scope}),
     )
+}
+
+pub(crate) fn reconcile_integration_dispatch(
+    store: &Store,
+    exact: Option<(&str, &str)>,
+) -> Result<Option<serde_json::Value>> {
+    let connection = store.lock()?;
+    let (request_id, session_id) = exact.unzip();
+    // A retained session may have resumed under a different epoch by now.
+    let started: Option<(String, String, String)> = connection
+        .query_row(
+            "SELECT r.id,r.attempt_id,d.session_id
+             FROM trip_integration_requests r
+             JOIN trip_integration_dispatch d ON d.request_id=r.id
+             JOIN sessions s ON s.id=d.session_id AND s.role_generation_id=d.role_generation_id
+             JOIN role_generations g ON g.id=d.role_generation_id AND g.attempt_id=r.attempt_id
+             WHERE g.role='implementer' AND g.lane_id='default' AND s.lane_id='default'
+               AND (r.state='requested' OR (?1 IS NOT NULL AND r.state='dispatched'))
+               AND (?1 IS NULL OR (r.id=?1 AND d.session_id=?2))
+               AND EXISTS(SELECT 1 FROM workflow_execution_boundaries b
+                 WHERE b.session_id=d.session_id AND b.role_generation_id=d.role_generation_id
+                   AND b.transcript_epoch=d.transcript_epoch AND b.kind='started')
+             ORDER BY r.created_at,r.id LIMIT 1",
+            params![request_id, session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((request_id, attempt_id, session_id)) = started else {
+        return Ok(None);
+    };
+    let changed = connection.execute(
+        "UPDATE trip_integration_requests SET state='dispatched',dispatched_at=?2
+         WHERE id=?1 AND state='requested'",
+        params![request_id, Utc::now().to_rfc3339()],
+    )?;
+    if changed == 0 {
+        if exact.is_none() {
+            return Ok(None);
+        }
+        let already_dispatched: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM trip_integration_requests WHERE id=?1 AND state='dispatched')",
+            params![request_id],
+            |row| row.get(0),
+        )?;
+        if !already_dispatched {
+            return Ok(None);
+        }
+    }
+    Ok(Some(serde_json::json!({
+        "action": if exact.is_some() {
+            "integration_implementer_dispatched"
+        } else {
+            "integration_dispatch_reconciled"
+        },
+        "integration_request_id":request_id,
+        "attempt_id":attempt_id,
+        "session_id":session_id,
+    })))
 }
 
 fn verify_lane_worktree_scope(
@@ -15692,6 +16195,7 @@ pub(crate) fn replay_human_command(
         &*store.lock()?,
         &CommandReceipt::new(operation_id, &request_hash),
     )
+    .map_err(|error| classify_trip_lookup_error(action, error))
 }
 
 pub(crate) fn has_human_command_progress(
@@ -15704,7 +16208,9 @@ pub(crate) fn has_human_command_progress(
     Ok(validate_trip_progress(
         &connection,
         &CommandReceipt::new(operation_id, &request_hash),
-    )? || historical_trip_progress(&connection, action)?)
+    )
+    .map_err(|error| classify_trip_lookup_error(action, error))?
+        || historical_trip_progress(&connection, action)?)
 }
 
 fn lookup_trip_receipt(
@@ -15716,8 +16222,15 @@ fn lookup_trip_receipt(
         params![receipt.operation_id], |row| Ok((row.get(0)?, row.get(1)?)),
     ).optional()?;
     match saved {
-        Some((hash, _)) if hash != receipt.request_hash => {
-            bail!("operation_id was already used for another request")
+        Some((hash, result)) if hash != receipt.request_hash => {
+            let error = anyhow!("operation_id was already used for another request");
+            if result == SUPERSEDED_PROBE_REFUSAL {
+                return Err(unresolved_probe_authorization(error));
+            }
+            Err(error)
+        }
+        Some((_, result)) if result == SUPERSEDED_PROBE_REFUSAL => {
+            Err(SetupProbeAuthorizationRefused::new(receipt.operation_id).into())
         }
         Some((_, result)) => Ok(Some(serde_json::from_str(&result)?)),
         None => Ok(None),
@@ -15767,14 +16280,47 @@ fn record_trip_progress(
     Ok(())
 }
 
+const SUPERSEDED_PROBE_REFUSAL: &str = r#"{"refusal":"setup_probe_proposal_superseded"}"#;
+
+#[derive(Debug)]
+pub(crate) struct SetupProbeAuthorizationRefused {
+    operation_id: String,
+}
+
+impl SetupProbeAuthorizationRefused {
+    fn new(operation_id: &str) -> Self {
+        Self {
+            operation_id: operation_id.to_owned(),
+        }
+    }
+
+    pub(crate) fn matches_operation(&self, operation_id: &str) -> bool {
+        self.operation_id == operation_id
+    }
+}
+
+impl std::fmt::Display for SetupProbeAuthorizationRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("The saved request did not authorize probes because its proposal was replaced. Review the current proposal before authorizing probes.")
+    }
+}
+
+impl std::error::Error for SetupProbeAuthorizationRefused {}
+
 #[derive(Debug)]
 pub(crate) struct TripOutcomeUnknown {
     cause: anyhow::Error,
+    durable_progress: bool,
 }
 
 impl std::fmt::Display for TripOutcomeUnknown {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "The request made durable progress, but its final outcome could not be confirmed. Refresh and check its outcome before retrying. Follow the available recovery action if recovery is required. Technical details: {:#}", self.cause)
+        let message = if self.durable_progress {
+            "The request made durable progress, but its final outcome could not be confirmed."
+        } else {
+            "The saved probe authorization outcome could not be confirmed."
+        };
+        write!(formatter, "{message} Refresh and check its outcome before retrying. Follow the available recovery action if recovery is required. Technical details: {:#}", self.cause)
     }
 }
 
@@ -15784,8 +16330,37 @@ pub(crate) fn outcome_unknown(error: anyhow::Error) -> anyhow::Error {
     if error.is::<TripOutcomeUnknown>() {
         error
     } else {
-        TripOutcomeUnknown { cause: error }.into()
+        TripOutcomeUnknown {
+            cause: error,
+            durable_progress: true,
+        }
+        .into()
     }
+}
+
+fn unresolved_probe_authorization(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<TripOutcomeUnknown>() {
+        return error;
+    }
+    TripOutcomeUnknown {
+        cause: error,
+        durable_progress: false,
+    }
+    .into()
+}
+
+fn probe_authorization_lookup_error(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<SetupProbeAuthorizationRefused>() {
+        return error;
+    }
+    unresolved_probe_authorization(error)
+}
+
+fn classify_trip_lookup_error(action: &TripHumanAction, error: anyhow::Error) -> anyhow::Error {
+    if matches!(action, TripHumanAction::AuthorizeSetupProbes { .. }) {
+        return probe_authorization_lookup_error(error);
+    }
+    error
 }
 
 pub(crate) fn classify_trip_error(
@@ -15794,7 +16369,7 @@ pub(crate) fn classify_trip_error(
     action: &TripHumanAction,
     error: anyhow::Error,
 ) -> anyhow::Error {
-    if error.is::<TripOutcomeUnknown>() {
+    if error.is::<TripOutcomeUnknown>() || error.is::<SetupProbeAuthorizationRefused>() {
         return error;
     }
     let progressed = (|| -> Result<bool> {
@@ -15808,12 +16383,13 @@ pub(crate) fn classify_trip_error(
             return Ok(true);
         }
         historical_trip_progress(&connection, action)
-    })()
-    .unwrap_or(false);
-    if progressed {
-        TripOutcomeUnknown { cause: error }.into()
-    } else {
-        error
+    })();
+    match progressed {
+        Ok(true) => outcome_unknown(error),
+        Err(_) if matches!(action, TripHumanAction::AuthorizeSetupProbes { .. }) => {
+            unresolved_probe_authorization(error)
+        }
+        _ => error,
     }
 }
 
@@ -16674,6 +17250,311 @@ mod read_only_profile_boundary_tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn diagnostics_binding_uses_published_current_project_scope_and_latest_capability() -> Result<()>
+    {
+        exercise_diagnostics_runtime_binding(RoleKind::Manager)?;
+        exercise_diagnostics_runtime_binding(RoleKind::CodeReviewer)
+    }
+
+    fn exercise_diagnostics_runtime_binding(role: RoleKind) -> Result<()> {
+        use serde_json::json;
+        use std::os::unix::fs::PermissionsExt;
+
+        let (store, root) = fixture();
+        let version = crate::providers::claude::EXACT_CLAUDE_VERSION;
+        let executable = root.join("claude");
+        let version_file = root.join("claude.version");
+        fs::write(&version_file, version)?;
+        fs::write(
+            &executable,
+            "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 1\ncat \"$0.version\"\n",
+        )?;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))?;
+        let paths = InstancePaths::resolve(Some(root.join("app")))?;
+        fs::create_dir_all(&paths.hooks)?;
+        let helper = std::env::current_exe()?;
+        let hooks = crate::providers::install_hook_assets(&paths, &helper)?;
+        let runtime = CapabilityRuntime::from_store(&store, hooks, root.join("role.sock"), helper);
+        let fixture_path = root.join("empty-fixture");
+        fs::create_dir(&fixture_path)?;
+        let fixture_root = fixture_path.canonicalize()?.to_string_lossy().into_owned();
+        let target = root.join("target");
+        fs::create_dir(&target)?;
+        let target = target.canonicalize()?;
+        let target_cwd = target.to_str().context("test path is not UTF-8")?;
+        let manager = RoleOverride {
+            provider: Provider::Claude,
+            model: "claude-opus-4-1".into(),
+            effort: "high".into(),
+        };
+        let role_name = role.to_string();
+        {
+            let connection = store.lock()?;
+            connection.execute(
+                "INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,internal_purpose,created_at,updated_at)
+                 VALUES('runtime-fixture','Runtime fixture',?1,'fixture-identity','base','trip_setup_fixture',?2,?2)",
+                params![fixture_root, NOW],
+            )?;
+            connection.execute(
+                "INSERT INTO trip_setup_operations(id,project_id,fixture_project_id,state,target_inventory_json,proposal_json,created_at,updated_at)
+                 VALUES('setup','p','runtime-fixture','discovery','{}','{}',?1,?1)",
+                params![NOW],
+            )?;
+            connection.execute(
+                "UPDATE trip_project_state SET setup_operation_id='setup' WHERE project_id='p'",
+                [],
+            )?;
+            connection.execute(
+                "INSERT INTO trip_setup_profile_selections(setup_operation_id,role,selection_state,profile_json,profile_hash,selected_at)
+                 VALUES('setup','manager','selected',?1,?2,?3)",
+                params![serde_json::to_string(&manager)?, json_hash(&manager)?, NOW],
+            )?;
+            connection.execute(
+                "UPDATE projects SET repository_path=?1,settings_json=json_set(settings_json,'$.roles.manager',json(?2),?3,json(?2)) WHERE id='p'",
+                params![target_cwd, serde_json::to_string(&manager)?, format!("$.roles.{role_name}")],
+            )?;
+            for delegated in DELEGATED_ROLES {
+                connection.execute(
+                    "INSERT INTO trip_setup_profile_selections(setup_operation_id,role,selection_state)
+                     VALUES('setup',?1,'unselected')",
+                    params![delegated.to_string()],
+                )?;
+            }
+        }
+        command(&target, &["init", "--quiet"])?;
+        command(
+            &target,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "--quiet",
+                "-m",
+                "Initialize diagnostics fixture",
+            ],
+        )?;
+        let profile = json!({
+            "adapter":"claude","provider":manager.provider,"model":manager.model,"effort":manager.effort,
+            "authority":"read-only","session":"retained","service_tier":null
+        });
+        let mut writer = profile.clone();
+        writer["authority"] = json!("workspace-write");
+        let mut final_profile = profile.clone();
+        final_profile["session"] = json!("fresh");
+        let proposal = json!({
+            "project_name":"Diagnostics fixture","host_manager":manager,"guidance":["AGENTS.md"],
+            "documentation":{"no_change_text":"No documentation change"},
+            "verification":{"focused":[],"broad":[],"cleanup":[]},
+            "testing":{"coverage":"minimal"},"observability":{"cmux":"off"},
+            "roles":{"explorer":{"profile":"reader"},"plan_reviewer":{"profile":"reader"},
+                "code_reviewer":{"profile":"reader"},"implementer":{"profile":"writer"},
+                "final_verifier":{"profile":"final"}},
+            "profiles":{"reader":profile,"writer":writer,"final":final_profile},
+            "adapters":{"adapters":{"claude":{"provider":"claude","kind":"native-agent",
+                "capabilities":{"read_only":true,"workspace_write":true,"resume":true,"fresh_session":true}}}},
+            "agents_file":{"relative_path":"AGENTS.md","approved_content":"# Diagnostics fixture\n"},
+            "local_exclude":{"pattern":"/.local/trip-explorer/","approved":true}
+        });
+        let project_version =
+            store
+                .lock()?
+                .query_row("SELECT version FROM projects WHERE id='p'", [], |row| {
+                    row.get(0)
+                })?;
+        save_setup_draft(
+            &store,
+            &CommandReceipt::new("diagnostics-setup-draft", "diagnostics-setup-draft"),
+            "setup",
+            project_version,
+            &proposal,
+        )?;
+        let (plan, selection_json, selection_hash): (_, String, String) = {
+            let connection = store.lock()?;
+            let saved_proposal: String = connection.query_row(
+                "SELECT proposal_json FROM trip_setup_operations WHERE id='setup'",
+                [],
+                |row| row.get(0),
+            )?;
+            let active_revision = insert_config_revision(
+                &connection,
+                "p",
+                &serde_json::from_str(&saved_proposal)?,
+                "activated",
+                NOW,
+                "[]",
+            )?;
+            connection.execute(
+                "UPDATE trip_project_state SET active_config_revision_id=?1 WHERE project_id='p'",
+                params![active_revision],
+            )?;
+            connection.execute(
+                "UPDATE trip_setup_operations SET state='activated' WHERE id='setup'",
+                [],
+            )?;
+            let (selected, selected_hash) = connection.query_row(
+                "SELECT profile_json,profile_hash FROM trip_setup_profile_selections WHERE setup_operation_id='setup' AND role=?1",
+                params![role_name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            (
+                project_runtime_profile(&connection, "p", role)?.0,
+                selected,
+                selected_hash,
+            )
+        };
+        assert_ne!(selection_hash, plan.profile_hash);
+        assert!(diagnostics_runtime_bindings_with(&store, &runtime, |_| {
+            panic!("projects with no runtime publication must skip local inspection")
+        })?
+        .is_empty());
+        let (config, identity) = prepare_ordinary_runtime_identity(
+            &runtime,
+            &plan,
+            target_cwd,
+            &fixture_root,
+            None,
+            Some((&executable, version)),
+        )?;
+        let key = crate::providers::capability_identity_key(&identity)?;
+        let scope = json!({
+            "project_id":"p","task_id":null,"setup_operation_id":"setup",
+            "fixture_project_id":"runtime-fixture","fixture_repository_identity":"fixture-identity",
+            "fixture_root_hash":sha256(fixture_root.as_bytes()),
+            "profiles":[{"role":role,"settings_revision":null,"source":"project_default",
+                "profile_hash":plan.profile_hash,"project_config_revision_id":plan.project_config_revision_id,
+                "project_configuration_hash":plan.project_configuration_hash,"adapter":plan.adapter_name,
+                "adapter_hash":plan.adapter_hash,"capability_key":key,"capability_identity":identity}]
+        });
+        let proof = json!({
+            "qualification_contract":"functional-v2","config_hash":key,
+            "session_id":"proof-session-1","runtime_scope":scope
+        });
+        {
+            let connection = store.lock()?;
+            connection.execute(
+                "INSERT INTO trip_runtime_admissions(id,project_id,scope_hash,state,fresh_call_count,created_at,updated_at)
+                 VALUES('ordinary','p','scope','ready',1,?1,?1)",
+                params![NOW],
+            )?;
+            connection.execute(
+                "INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,checked_at,proof_json)
+                 VALUES('ordinary-proof','claude',?1,?2,'interactive_pty',?3,'supported',?4,?5)",
+                params![version, role_name, key, NOW, proof.to_string()],
+            )?;
+            connection.execute(
+                "INSERT INTO trip_runtime_probes(admission_id,role,launch_config_json,profile_json,profile_hash,project_config_revision_id,
+                     project_configuration_hash,adapter_name,adapter_hash,capability_key,capability_identity_json,fixture_project_id,
+                     fixture_repository_identity,fixture_root,nonce,state,session_id,capability_id,published_at,created_at,updated_at)
+                 VALUES('ordinary',?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'runtime-fixture',
+                     'fixture-identity',?11,'nonce','published','proof-session-1','ordinary-proof',?12,?12,?12)",
+                params![role_name, serde_json::to_string(&config)?, plan.profile_json.to_string(), plan.profile_hash,
+                    plan.project_config_revision_id, plan.project_configuration_hash, plan.adapter_name, plan.adapter_hash, key, serde_json::to_string(&identity)?,
+                    fixture_root, NOW],
+            )?;
+        }
+        let read = || {
+            let mut observed = false;
+            diagnostics_runtime_bindings_with(&store, &runtime, |provider| {
+                assert_eq!(provider, Provider::Claude);
+                assert!(!observed, "only one version read per provider");
+                observed = true;
+                let version = crate::providers::provider_executable_version(provider, &executable)?;
+                Ok((executable.clone(), version))
+            })
+        };
+        let current = read()?;
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].capability_id, "ordinary-proof");
+        assert_eq!(current[0].capability_key, key);
+        assert_eq!(current[0].profile_hash, selection_hash);
+        assert_eq!(current[0].runtime_profile_hash, plan.profile_hash);
+        assert_eq!(
+            current[0].project_config_revision_id,
+            plan.project_config_revision_id
+        );
+        fs::write(&version_file, "unknown-version")?;
+        assert!(read()?.is_empty());
+        fs::write(&version_file, version)?;
+        assert_eq!(read()?.len(), 1);
+        if role != RoleKind::Manager {
+            let mut changed: SetupProfile = serde_json::from_str(&selection_json)?;
+            changed.session = "fresh".into();
+            store.lock()?.execute(
+                "UPDATE trip_setup_profile_selections SET profile_json=?1,profile_hash=?2 WHERE setup_operation_id='setup' AND role=?3",
+                params![serde_json::to_string(&changed)?, json_hash(&changed)?, role_name],
+            )?;
+            assert!(read()?.is_empty());
+            store.lock()?.execute(
+                "UPDATE trip_setup_profile_selections SET profile_json=?1,profile_hash=?2 WHERE setup_operation_id='setup' AND role=?3",
+                params![selection_json, selection_hash, role_name],
+            )?;
+            assert_eq!(read()?.len(), 1);
+        }
+        let replacement = root.join("different-claude");
+        fs::write(&replacement, "a different executable")?;
+        assert!(diagnostics_runtime_bindings_with(&store, &runtime, |_| {
+            Ok((replacement.clone(), version.into()))
+        })?
+        .is_empty());
+
+        for checked_at in ["2026-01-02T00:00:00Z", NOW] {
+            store.lock()?.execute(
+                "INSERT INTO capabilities(id,provider,executable_version,role,mode,config_hash,status,checked_at,proof_json)
+                 VALUES('superseding','claude',?1,?2,'interactive_pty','different-key','unsupported',?3,'{}')",
+                params![version, role_name, checked_at],
+            )?;
+            assert!(read()?.is_empty());
+            store
+                .lock()?
+                .execute("DELETE FROM capabilities WHERE id='superseding'", [])?;
+        }
+        for (path, replacement) in [
+            ("$.runtime_scope.project_id", "foreign"),
+            ("$.runtime_scope.task_id", "t"),
+            ("$.runtime_scope.setup_operation_id", "old-setup"),
+            ("$.runtime_scope.fixture_root_hash", "old-fixture"),
+            ("$.runtime_scope.profiles[0].profile_hash", "old-profile"),
+            ("$.runtime_scope.profiles[0].adapter_hash", "old-adapter"),
+        ] {
+            store.lock()?.execute(
+                "UPDATE capabilities SET proof_json=json_set(?1,?2,?3) WHERE id='ordinary-proof'",
+                params![proof.to_string(), path, replacement],
+            )?;
+            assert!(read()?.is_empty(), "{path} unexpectedly matched");
+        }
+        store.lock()?.execute(
+            "UPDATE capabilities SET proof_json=?1 WHERE id='ordinary-proof'",
+            params![proof.to_string()],
+        )?;
+        assert_eq!(read()?.len(), 1);
+        let drifted = diagnostics_runtime_bindings_with(&store, &runtime, |_| {
+            let connection = store.lock()?;
+            connection.execute(
+                "INSERT INTO trip_config_revisions(id,project_id,revision,state,config_json,adapters_json,preflight_json,verification_json,source_hash,overlay_hash,configuration_hash,created_at)
+                 SELECT 'new-config',project_id,revision+1,'activated',config_json,adapters_json,preflight_json,verification_json,source_hash,overlay_hash,'changed-configuration',created_at
+                 FROM trip_config_revisions WHERE id=?1",
+                params![plan.project_config_revision_id],
+            )?;
+            connection.execute(
+                "UPDATE trip_project_state SET active_config_revision_id='new-config' WHERE project_id='p'",
+                [],
+            )?;
+            Ok((executable.clone(), version.into()))
+        })?;
+        assert!(drifted.is_empty());
+        assert!(diagnostics_runtime_bindings_with(&store, &runtime, |_| {
+            panic!("a publication for a different active configuration must skip inspection")
+        })?
+        .is_empty());
+        drop(store);
+        fs::remove_dir_all(&root)?;
+        Ok(())
     }
 
     /// A previous reviewer generation and its session. An `exited` reviewer

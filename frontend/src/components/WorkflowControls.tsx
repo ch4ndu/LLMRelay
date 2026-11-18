@@ -31,6 +31,8 @@ import {
 import { withStorageLock } from "../storageCoordination";
 
 type StoredIdentity = { body: string; id: string };
+// Native storage events reach other windows. This also updates controls in this window.
+const workflowJournalChanged = "llmrelay:workflow-journal-changed";
 
 const storedIdentity = (value: unknown): StoredIdentity | undefined => {
   if (
@@ -141,6 +143,7 @@ export function useWorkflowCommands(
   // Review consent covers only the earlier request that was shown, so another
   // window replacing it needs a fresh review.
   const reviewedIdentities = useRef(new Map<string, StoredIdentity>());
+  const uncertainError = useRef<{ key: string; identity: StoredIdentity } | undefined>(undefined);
   const inFlight = useRef(false);
   // Aborted when the panel closes or its storage key changes: a queued
   // request is then neither published nor sent, and a request already sent
@@ -149,15 +152,52 @@ export function useWorkflowCommands(
   useEffect(() => {
     const current = new AbortController();
     lifecycle.current = current;
-    return () => current.abort();
+    inFlight.current = false;
+    setBusy(false);
+    setError("");
+    uncertainError.current = undefined;
+    reviewedIdentities.current.clear();
+    setReviewed(new Set());
+    setUncertain(new Set(readIdentities(storageKey).keys()));
+    const onLocalWrite = (event: Event) => {
+      if (event instanceof window.CustomEvent && event.detail === storageKey) syncJournalStatus();
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === storageKey || event.key === null) syncJournalStatus();
+    };
+    window.addEventListener(workflowJournalChanged, onLocalWrite);
+    window.addEventListener("storage", onStorage);
+    return () => {
+      current.abort();
+      window.removeEventListener(workflowJournalChanged, onLocalWrite);
+      window.removeEventListener("storage", onStorage);
+    };
   }, [storageKey]);
-  const mark = (key: string, unknown: boolean) =>
-    setUncertain((current) => {
-      const next = new Set(current);
-      if (unknown) next.add(key);
-      else next.delete(key);
-      return next;
-    });
+  const syncJournalStatus = () => {
+    let identities: Map<string, StoredIdentity>;
+    try {
+      identities = readIdentities(storageKey, true);
+    } catch {
+      return;
+    }
+    for (const [key, prior] of reviewedIdentities.current) {
+      const saved = identities.get(key);
+      if (saved?.id !== prior.id || saved.body !== prior.body) reviewedIdentities.current.delete(key);
+    }
+    const failed = uncertainError.current;
+    if (failed) {
+      const saved = identities.get(failed.key);
+      if (saved?.id !== failed.identity.id || saved.body !== failed.identity.body) {
+        uncertainError.current = undefined;
+        setError("");
+      }
+    }
+    setReviewed(new Set(reviewedIdentities.current.keys()));
+    setUncertain(new Set(identities.keys()));
+  };
+  const notifyJournalChange = () => window.dispatchEvent(
+    new window.CustomEvent(workflowJournalChanged, { detail: storageKey }),
+  );
   const markReviewed = (key: string, prior: StoredIdentity | undefined) => {
     if (prior) reviewedIdentities.current.set(key, prior);
     else reviewedIdentities.current.delete(key);
@@ -222,6 +262,7 @@ export function useWorkflowCommands(
       () => publish(key, body, keepUnresolved),
       signal,
     ).catch((): JournalPublication => ({ kind: "uncoordinated" }));
+    if (publication?.kind === "send") notifyJournalChange();
     // An identity published just before the panel closed stays retained;
     // replaying it later is safe because it was never sent.
     if (!publication || signal.aborted) return undefined;
@@ -236,33 +277,34 @@ export function useWorkflowCommands(
         setError("This request could not be saved for recovery. Restore browser storage and try again; nothing new was sent.");
         return undefined;
       case "held":
-        mark(key, true);
+        syncJournalStatus();
         return undefined;
       case "review":
+        syncJournalStatus();
         markReviewed(key, publication.prior);
-        mark(key, true);
         return undefined;
       case "send":
         break;
     }
     const { identity, replayingUnresolved } = publication;
     markReviewed(key, undefined);
-    setError("");
     try {
       const result = await submitWorkflowCommand(build(identity.id));
       await settle(key, identity);
+      notifyJournalChange();
       if (signal.aborted) return undefined;
-      mark(key, false);
       onChanged();
       return result;
     } catch (cause) {
       const unknown = replayingUnresolved ||
         (cause instanceof ApiError && cause.ambiguous);
       if (!unknown) await settle(key, identity);
-      if (signal.aborted) return undefined;
-      mark(key, unknown);
-      setError(cause instanceof Error ? cause.message : String(cause));
-      onChanged();
+      if (!signal.aborted) {
+        if (unknown) uncertainError.current = { key, identity };
+        setError(cause instanceof Error ? cause.message : String(cause));
+      }
+      notifyJournalChange();
+      if (!signal.aborted) onChanged();
       return undefined;
     }
   };
@@ -272,18 +314,23 @@ export function useWorkflowCommands(
     options: { keepUnresolved?: boolean } = {},
   ) => {
     if (inFlight.current) return undefined;
+    const signal = lifecycle.current.signal;
     inFlight.current = true;
     setBusy(true);
+    uncertainError.current = undefined;
+    setError("");
     try {
       return await publishAndSend(
         key,
         build,
         options.keepUnresolved === true,
-        lifecycle.current.signal,
+        signal,
       );
     } finally {
-      inFlight.current = false;
-      setBusy(false);
+      if (!signal.aborted) {
+        inFlight.current = false;
+        setBusy(false);
+      }
     }
   };
   const unresolved = (key: string) => readIdentities(storageKey).get(key);
@@ -491,6 +538,7 @@ export function WorkflowControls(
     mutationInFlight.current = true;
     setBusy(key);
     setError("");
+    setRequestNotice("");
     try {
       await command({
         ...request,
@@ -542,6 +590,7 @@ export function WorkflowControls(
     mutationInFlight.current = true;
     setBusy(key);
     setError("");
+    setRequestNotice("");
     try {
       const result = await operation({ ...stableRequest, operation_id: id } as never);
       const outcomes: unknown[] = Array.isArray(result.outcomes) ? result.outcomes : [];
@@ -652,6 +701,7 @@ export function WorkflowControls(
     },
   }));
   const verifyCheckout = async () => {
+    setVerificationNotice("");
     const result = await checkoutCommands.submit("verification", (operation_id) => ({
       kind: "verify_main_checkout", operation_id, task_id: task.id,
       expected_version: task.version,
@@ -1026,7 +1076,10 @@ export function WorkflowControls(
             <select value={verificationRole} disabled={!!busy || checkoutCommands.busy || !!pendingVerification}
               onChange={(event) => {
                 const role = ROLES.find((role) => role === event.target.value);
-                if (role) setVerificationRole(role);
+                if (role) {
+                  setVerificationRole(role);
+                  setVerificationNotice("");
+                }
               }}>
               {ROLES.map((role) => <option key={role} value={role}>{roleLabel(role)}</option>)}
             </select>

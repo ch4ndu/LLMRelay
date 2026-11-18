@@ -1083,9 +1083,10 @@ impl Scheduler {
                     )?;
                 }
                 SchedulerMutation::QueuedCapacity => {
+                    // Rewriting updated_at alone would invalidate History cursors.
                     transaction.execute(
-                        "UPDATE tasks SET attention=CASE WHEN attention='run_next_requested'
-                           THEN attention ELSE 'queued_capacity' END,updated_at=?1 WHERE id=?2",
+                        "UPDATE tasks SET attention='queued_capacity',updated_at=?1
+                         WHERE id=?2 AND attention NOT IN ('queued_capacity','run_next_requested')",
                         params![now, task_id],
                     )?;
                 }
@@ -1576,21 +1577,27 @@ impl Scheduler {
     }
 
     fn release_claim(&self, plan: &DispatchPlan, reason: &str) -> Result<Option<DispatchPlan>> {
-        let connection = self.store.lock()?;
+        let mut connection = self.store.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = Utc::now().to_rfc3339();
-        connection.execute(
+        transaction.execute(
             "UPDATE claims SET state='failed',updated_at=?1 WHERE attempt_id=?2",
             params![now, plan.attempt_id],
         )?;
-        connection.execute(
+        transaction.execute(
             "UPDATE workspaces SET state='failed',updated_at=?1 WHERE attempt_id=?2",
             params![now, plan.attempt_id],
         )?;
-        connection.execute(
+        transaction.execute(
             "UPDATE attempts SET status='failed',updated_at=?1 WHERE id=?2",
             params![now, plan.attempt_id],
         )?;
-        connection.execute("UPDATE tasks SET lifecycle='ready',attention='blocked',version=version+1,updated_at=?1 WHERE id=?2", params![now,plan.task_id])?;
+        transaction.execute(
+            "UPDATE tasks SET lifecycle='ready',attention='blocked',version=version+1,updated_at=?1
+             WHERE id=?2",
+            params![now, plan.task_id],
+        )?;
+        transaction.commit()?;
         bail!("{reason}")
     }
 

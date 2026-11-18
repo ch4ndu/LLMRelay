@@ -5,11 +5,16 @@ import {
   ApiError,
   command,
   discardUnknownCmuxSurface,
-  operation,
   operationId,
+  projectSetupCommand,
+  projectSetupLaunch,
+  recoveryJournalChanged,
   reuseOperationIdentity,
   setCmuxKeyboardControl,
 } from "../api";
+import type { StableOperationIdentity } from "../api";
+import { field, hasStrings, nonnegativeInteger } from "../apiValidation";
+import { withStorageLock } from "../storageCoordination";
 import {
   cmuxNewestSurface,
   cmuxOutcomeWithDurableSurface,
@@ -20,7 +25,7 @@ import {
 } from "../cmuxRouting";
 import { ModelSelector } from "./ModelSelector";
 import { CompatibilityDetails } from "./RoleSettings";
-import { qualificationContractLabel } from "../types";
+import { qualificationContractLabel, ROLES } from "../types";
 import type {
   CmuxKeyboardControlAction,
   CmuxSessionSurface,
@@ -175,8 +180,193 @@ const stageForProject = (
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
+const setupRequestsInFlight = new Map<string, string>();
+type SetupIdentity = StableOperationIdentity & { replayClaimed?: true };
+
+function readSetupIdentities(storageKey: string) {
+  try {
+    const entries: unknown = JSON.parse(localStorage.getItem(storageKey) ?? "[]");
+    if (Array.isArray(entries)) {
+      const identities = new Map<string, SetupIdentity>();
+      for (const entry of entries) {
+        if (!Array.isArray(entry) || entry.length !== 2 ||
+          typeof entry[0] !== "string" || identities.has(entry[0]) || !isRecord(entry[1]) ||
+          typeof entry[1].id !== "string" || !entry[1].id.trim() ||
+          typeof entry[1].body !== "string" || !isRecord(JSON.parse(entry[1].body)) ||
+          (entry[1].replayClaimed !== undefined && entry[1].replayClaimed !== true)) {
+          throw new Error("Invalid saved setup entry");
+        }
+        const { id, body, replayClaimed } = entry[1];
+        identities.set(entry[0], replayClaimed === true ? { id, body, replayClaimed } : { id, body });
+      }
+      return identities;
+    }
+  } catch {
+    // An unreadable journal may still contain an unresolved action.
+  }
+  throw new Error("Saved setup requests could not be read safely.");
+}
+
 const hasOnlyKeys = (value: Record<string, unknown>, allowed: string[]) =>
   Object.keys(value).every((key) => allowed.includes(key));
+const nonemptyString = (value: unknown): value is string =>
+  typeof value === "string" && value.trim().length > 0;
+const isSetupRole = (value: unknown): value is Role => ROLES.some((role) => value === role);
+const isRoleConfig = (value: unknown) =>
+  ["codex", "claude"].some((provider) => provider === field(value, "provider")) &&
+  ["model", "effort"].every((key) => nonemptyString(field(value, key)));
+
+function isSetupProposal(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  const { guidance, roles, profiles, adapters, verification, host_manager } = value;
+  const definitions = field(adapters, "adapters");
+  const agentsPath = field(value.agents_file, "relative_path");
+  return nonemptyString(value.project_name) &&
+    isRoleConfig(host_manager) &&
+    Array.isArray(guidance) && guidance.every((item) => typeof item === "string") &&
+    typeof field(value.documentation, "no_change_text") === "string" &&
+    isRecord(verification) &&
+    ["focused", "broad", "cleanup"].every((key) => {
+      const commands = verification[key];
+      return Array.isArray(commands) && commands.every((item) => typeof item === "string");
+    }) &&
+    ["minimal", "moderate", "extensive"].some((item) => item === field(value.testing, "coverage")) &&
+    ["auto", "on", "off"].some((item) => item === field(value.observability, "cmux")) &&
+    (agentsPath === undefined || agentsPath === "AGENTS.md") &&
+    typeof field(value.agents_file, "approved_content") === "string" &&
+    field(value.local_exclude, "pattern") === "/.local/trip-explorer/" &&
+    typeof field(value.local_exclude, "approved") === "boolean" &&
+    isRecord(roles) && isRecord(profiles) && isRecord(definitions) &&
+    Object.keys(roles).length === delegatedRoles.length &&
+    Object.values(profiles).every((profile) =>
+      hasStrings(profile, ["provider", "model", "effort", "adapter", "authority", "session"])
+    ) &&
+    delegatedRoles.every((role) => {
+      const profileId = field(roles[role], "profile");
+      const profile = typeof profileId === "string" ? profiles[profileId] : undefined;
+      const adapter = field(profile, "adapter");
+      return isRoleConfig(profile) && typeof adapter === "string" && isRecord(definitions[adapter]);
+    });
+}
+
+type SetupAction = { key: string; label: string } & (
+  | { endpoint: "command"; request: Record<string, unknown> }
+  | { endpoint: "operation"; request: Record<string, unknown> & { kind: string } }
+);
+
+// Match the journal slot and exact target together, including for drafts and
+// proposals that are no longer the visible selection.
+function describeSetupAction(request: unknown, projectId: string): SetupAction | undefined {
+  if (!isRecord(request)) return;
+  const command = (key: string, label: string, fields: string[], valid: boolean): SetupAction | undefined =>
+    valid && hasOnlyKeys(request, ["action", ...fields])
+      ? { key, label, endpoint: "command", request }
+      : undefined;
+  const setup = nonemptyString(request.setup_operation_id);
+  const project = request.project_id === projectId;
+  const version = nonnegativeInteger(request.expected_project_version);
+  const proposal = nonemptyString(request.proposal_hash);
+  const admission = nonemptyString(request.admission_id) ? request.admission_id : undefined;
+  const role = isSetupRole(request.role) ? request.role : undefined;
+  switch (request.action) {
+    case "inspect_project":
+      return command("inspect", "project inspection", ["project_id"], project);
+    case "begin_setup":
+      return command("begin", "setup start", ["project_id", "expected_project_version", "host_manager"],
+        project && version && isRoleConfig(request.host_manager));
+    case "stop_setup_manager":
+      return command("stop-setup-manager", "setup manager stop", ["setup_operation_id", "expected_project_version"],
+        setup && version);
+    case "change_setup_manager":
+      return command("change-setup-manager", "setup manager change", ["setup_operation_id", "expected_project_version", "host_manager"],
+        setup && version && isRoleConfig(request.host_manager));
+    case "save_setup_draft":
+    case "revise_setup_draft":
+      return command("save-draft", "setup proposal", ["setup_operation_id", "expected_project_version", "proposal"],
+        setup && version && isSetupProposal(request.proposal));
+    case "authorize_setup_probes":
+      return command("authorize-probes", "setup probe authorization", ["setup_operation_id", "proposal_hash"], setup && proposal);
+    case "finalize_installation":
+      return command("finalize-install", "installation finalization", ["setup_operation_id", "proposal_hash"], setup && proposal);
+    case "authorize_installation":
+      return command("authorize-install", "installation authorization",
+        ["setup_operation_id", "proposal_hash", "approved_preimages_hash", "final_source_set_hash"],
+        setup && proposal && nonemptyString(request.approved_preimages_hash) && nonemptyString(request.final_source_set_hash));
+    case "apply_installation":
+      return command("apply-install", "installation apply", ["setup_operation_id", "proposal_hash"], setup && proposal);
+    case "recover_installation":
+      return command("recover-install", "installation recovery", ["setup_operation_id"], setup);
+    case "adopt_installation":
+      return command("adopt", "installation adoption", ["project_id", "expected_project_version", "configuration"],
+        project && version && isSetupProposal(request.configuration));
+    case "prepare_runtime_admission":
+      return command(role ? `prepare-runtime:${role}` : "prepare-runtime", "runtime verification preparation",
+        ["project_id", "expected_version", "role"],
+        project && nonnegativeInteger(request.expected_version) && (request.role === undefined || role !== undefined));
+    case "authorize_runtime_admission":
+      if (!admission) return;
+      return command(`authorize-runtime:${admission}`, "runtime verification authorization",
+        ["admission_id", "scope_hash"], nonemptyString(request.scope_hash));
+    case "publish_runtime_proof":
+      if (!admission || !role) return;
+      return command(`publish-runtime:${admission}:${role}`, "runtime proof publication",
+        ["admission_id", "role"], true);
+  }
+
+  const kind = request.kind;
+  if (typeof kind !== "string") return;
+  const operation = (key: string, label: string, fields: string[], valid: boolean): SetupAction | undefined =>
+    valid && hasOnlyKeys(request, ["kind", ...fields])
+      ? { key, label, endpoint: "operation", request: { ...request, kind } }
+      : undefined;
+  switch (kind) {
+    case "trip_setup_dispatch": {
+      const attempt = request.attempt_id;
+      if (!nonemptyString(attempt) || !role) return;
+      const rejection = request.fresh_resume_rejection;
+      if (rejection === undefined) {
+        return operation(`setup-dispatch:${attempt}:${role}`, "setup launch", ["attempt_id", "role"], true);
+      }
+      const eventId = field(rejection, "rejection_event_id");
+      if (!nonemptyString(eventId)) return;
+      return operation(`setup-fresh-resume:${eventId}`, "setup launch",
+        ["attempt_id", "role", "fresh_resume_rejection"],
+        field(rejection, "attempt_id") === attempt && field(rejection, "role") === role &&
+        ["session_id", "role_generation_id", "transcript_epoch"]
+          .every((key) => nonemptyString(field(rejection, key))) &&
+        nonnegativeInteger(field(rejection, "resume_count")));
+    }
+    case "role_resume":
+      if (!nonemptyString(request.session_id)) return;
+      return operation(`role-resume:${request.session_id}`, "setup resume", ["session_id", "prompt"],
+        request.prompt === "");
+    case "runtime_probe_launch":
+    case "runtime_probe_resume": {
+      if (!admission || !role) return;
+      const action = kind === "runtime_probe_resume" ? "resume" : "launch";
+      return operation(`runtime:${admission}:${role}:${action}`, `runtime probe ${action}`, ["admission_id", "role"], true);
+    }
+  }
+}
+
+function recoverableSetupRequests(storageKey: string, projectId: string) {
+  const requests = [];
+  let unreadable = false;
+  try {
+    for (const [key, identity] of readSetupIdentities(storageKey)) {
+      const action = describeSetupAction(JSON.parse(identity.body), projectId);
+      if (action?.key === key && JSON.stringify(action.request) === identity.body) {
+        requests.push({ action, identity });
+      } else {
+        unreadable = true;
+      }
+    }
+  } catch {
+    unreadable = true;
+  }
+  return { requests, unreadable };
+}
+
 const lines = (value: unknown) =>
   Array.isArray(value)
     ? value.filter((item): item is string => typeof item === "string")
@@ -515,6 +705,7 @@ export function ProjectSetup({
   cmuxSurfaces = {},
   onChanged,
   onViewSession,
+  inFlightRequests = setupRequestsInFlight,
 }: {
   project: Project;
   setup?: TripSetupState;
@@ -523,6 +714,8 @@ export function ProjectSetup({
   onViewSession: (
     sessionId: string,
   ) => Promise<CmuxViewOutcome>;
+  // Models distinct window-local guards in tests that share one journal.
+  inFlightRequests?: Map<string, string>;
 }) {
   const selectedManager = setup?.selected_profiles.find((item) =>
     item.role === "manager"
@@ -560,7 +753,8 @@ export function ProjectSetup({
   const [draft, setDraft] = useState<SetupDraft>(() =>
     persistedSetupDraft?.draft || hydratedDraft(project, setup)
   );
-  const [busy, setBusy] = useState("");
+  const currentDraft = useRef(draft);
+  currentDraft.current = draft;
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [editingRevision, setEditingRevision] = useState(
@@ -576,22 +770,35 @@ export function ProjectSetup({
   const setupDraftKeyRef = useRef(setupDraftKey);
   const skipDraftPersistence = useRef(false);
   const operationStorageKey = `llmrelay.trip.operations.${project.id}`;
-  const commandIdentities = useRef(
-    new Map<string, { body: string; id: string }>(
-      (() => {
-        try {
-          const value = JSON.parse(
-            localStorage.getItem(operationStorageKey) || "[]",
-          );
-          return Array.isArray(value) ? value : [];
-        } catch {
-          return [];
-        }
-      })(),
-    ),
+  const busy = inFlightRequests.get(operationStorageKey) ?? "";
+  const [journalVersion, setJournalVersion] = useState(0);
+  const journal = useMemo(
+    () => recoverableSetupRequests(operationStorageKey, project.id),
+    [operationStorageKey, project.id, journalVersion],
   );
-  const commandGuard = useRef(false);
-  const dispatchGuard = useRef(false);
+  const setupScope = useRef(new AbortController());
+  useEffect(() => {
+    const scope = new AbortController();
+    setupScope.current = scope;
+    const onLocalWrite = (event: Event) => {
+      if (event instanceof window.CustomEvent && event.detail === operationStorageKey) {
+        setJournalVersion((version) => version + 1);
+      }
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === operationStorageKey || event.key === null) {
+        setJournalVersion((version) => version + 1);
+      }
+    };
+    window.addEventListener(recoveryJournalChanged, onLocalWrite);
+    window.addEventListener("storage", onStorage);
+    setJournalVersion((version) => version + 1);
+    return () => {
+      scope.abort();
+      window.removeEventListener(recoveryJournalChanged, onLocalWrite);
+      window.removeEventListener("storage", onStorage);
+    };
+  }, [operationStorageKey]);
   useEffect(() => {
     retireOtherSetupDrafts(project.id, setupDraftKey);
     if (setupDraftKeyRef.current === setupDraftKey) return;
@@ -670,121 +877,132 @@ export function ProjectSetup({
       .adapters || {};
   const adapterOptions = { ...builtInAdapters, ...existingAdapters };
 
-  const runTrip = async (key: string, action: Record<string, unknown>) => {
-    if (commandGuard.current) return;
-    commandGuard.current = true;
-    setBusy(key);
-    setError("");
-    setNotice("");
-    try {
-      const { id, request } = reuseOperationIdentity(
-        commandIdentities.current.get(key),
-        action,
-      );
-      commandIdentities.current.set(key, {
-        body: JSON.stringify(request),
-        id,
-      });
-      try {
-        localStorage.setItem(
-          operationStorageKey,
-          JSON.stringify([...commandIdentities.current]),
-        );
-      } catch (cause) {
-        throw new Error(
-          `Browser storage could not retain the setup request, so it was not sent: ${
-            cause instanceof Error ? cause.message : String(cause)
-          }`,
-        );
+  const notifySetupJournal = () => window.dispatchEvent(
+    new window.CustomEvent(recoveryJournalChanged, { detail: operationStorageKey }),
+  );
+  const saveSetupIdentity = (action: SetupAction, reviewed?: StableOperationIdentity) =>
+    withStorageLock(operationStorageKey, () => {
+      const identities = readSetupIdentities(operationStorageKey);
+      const previous = identities.get(action.key);
+      if (reviewed && (previous?.id !== reviewed.id || previous.body !== reviewed.body)) {
+        throw new Error("The saved setup request changed. Refresh Project setup and check the saved request again.");
       }
-      const response = await command({
-        kind: "trip",
-        operation_id: id,
-        ...request,
-      });
-      commandIdentities.current.delete(key);
-      try {
-        localStorage.setItem(
-          operationStorageKey,
-          JSON.stringify([...commandIdentities.current]),
-        );
-      } catch (cause) {
-        throw new Error(
-          `The setup action completed, but browser storage cleanup failed: ${
-            cause instanceof Error ? cause.message : String(cause)
-          }`,
-        );
+      const { id, request } = reuseOperationIdentity(previous, action.request);
+      if (previous && previous.id !== id) {
+        throw new Error(action.key === "save-draft"
+          ? "A different setup proposal is still pending. Refresh Project setup, check its outcome, and recover the saved proposal before saving your edits."
+          : "A different setup request is still pending. Refresh Project setup and check its outcome before trying again.");
       }
-      setNotice(String(response.result.state || "Saved"));
-      await onChanged();
-      return response.result;
-    } catch (cause) {
-      const ambiguous = cause instanceof ApiError && cause.ambiguous;
-      let storageFailure = "";
-      if (!ambiguous) {
-        commandIdentities.current.delete(key);
-        try {
-          localStorage.setItem(
-            operationStorageKey,
-            JSON.stringify([...commandIdentities.current]),
-          );
-        } catch (storageCause) {
-          storageFailure =
-            ` Browser storage also failed while clearing the rejected request: ${
-              storageCause instanceof Error
-                ? storageCause.message
-                : String(storageCause)
-            }`;
-        }
+      const savedAction = describeSetupAction(request, project.id);
+      const identity = { body: JSON.stringify(request), id };
+      if (!savedAction || savedAction.key !== action.key || (previous && previous.body !== identity.body)) {
+        throw new Error("The original setup request could not be checked safely.");
       }
-      const message = cause instanceof Error ? cause.message : String(cause);
-      setError(
-        `${message}${
-          ambiguous ? " Refresh and reconcile before retrying." : ""
-        }${storageFailure}`,
-      );
-      await onChanged();
-    } finally {
-      commandGuard.current = false;
-      setBusy("");
-    }
-  };
-  const runBrowserOperation = async (
-    key: string,
-    request: Record<string, unknown> & { kind: string },
-  ) => {
-    const stable = reuseOperationIdentity(
-      commandIdentities.current.get(key),
-      request,
-    );
-    const { id, request: stableRequest } = stable;
-    commandIdentities.current.set(key, {
-      body: JSON.stringify(stableRequest),
-      id,
+      if (!previous?.replayClaimed) {
+        // A replay claim survives a lost response or window close. Only a
+        // conclusive outcome can settle the entry after this point.
+        identities.set(action.key, previous ? { ...identity, replayClaimed: true } : identity);
+        localStorage.setItem(operationStorageKey, JSON.stringify([...identities]));
+      }
+      return { identity, action: savedAction, replay: !!previous };
     });
-    localStorage.setItem(
-      operationStorageKey,
-      JSON.stringify([...commandIdentities.current]),
-    );
+
+  const clearSetupIdentity = (
+    key: string,
+    identity: StableOperationIdentity,
+    conclusive = true,
+  ) =>
+    withStorageLock(operationStorageKey, () => {
+      const identities = readSetupIdentities(operationStorageKey);
+      const saved = identities.get(key);
+      if (saved?.id !== identity.id || saved.body !== identity.body) return "changed";
+      if (!conclusive && saved.replayClaimed) return "retained";
+      identities.delete(key);
+      localStorage.setItem(operationStorageKey, JSON.stringify([...identities]));
+      return "cleared";
+    });
+
+  const runSetupAction = async (request: unknown, reviewed?: StableOperationIdentity) => {
+    if (inFlightRequests.has(operationStorageKey)) return;
+    const action = describeSetupAction(request, project.id);
+    if (!action || (reviewed && JSON.stringify(action.request) !== reviewed.body)) {
+      setError("The setup request could not be checked safely. Refresh Project setup and check the saved request.");
+      return;
+    }
+    const signal = setupScope.current.signal;
+    inFlightRequests.set(operationStorageKey, action.key);
+    notifySetupJournal();
+    setError("");
+    if (action.endpoint === "command") setNotice("");
     try {
-      const result = await operation(
-        { ...stableRequest, operation_id: id } as never,
-      );
-      commandIdentities.current.delete(key);
-      localStorage.setItem(
-        operationStorageKey,
-        JSON.stringify([...commandIdentities.current]),
-      );
-      return result;
-    } catch (cause) {
-      if (!(cause instanceof ApiError && cause.ambiguous)) {
-        commandIdentities.current.delete(key);
-        localStorage.setItem(
-          operationStorageKey,
-          JSON.stringify([...commandIdentities.current]),
+      let saved;
+      try {
+        saved = await saveSetupIdentity(action, reviewed);
+      } catch (cause) {
+        if (signal.aborted) return;
+        setError(
+          `The setup request was not sent. ${
+            cause instanceof Error ? cause.message : String(cause)
+          }`,
         );
+        await onChanged();
+        return;
       }
-      throw cause;
+      if (!saved) return;
+      notifySetupJournal();
+      const { identity, action: original, replay } = saved;
+      let response;
+      try {
+        if (original.endpoint === "operation") {
+          await projectSetupLaunch({ ...original.request, operation_id: identity.id });
+        } else {
+          response = await projectSetupCommand({ kind: "trip", operation_id: identity.id, ...original.request });
+        }
+      } catch (cause) {
+        const terminalRefusal = cause instanceof ApiError && cause.terminalRefusal &&
+          cause.operationId === identity.id && !cause.ambiguous;
+        let ambiguous = (replay && !terminalRefusal) || (cause instanceof ApiError && cause.ambiguous);
+        let storageFailure = "";
+        if (!ambiguous) {
+          try {
+            const settlement = await clearSetupIdentity(action.key, identity, terminalRefusal);
+            if (settlement === "changed") return;
+            ambiguous = settlement === "retained";
+          } catch (storageCause) {
+            storageFailure =
+              ` Browser storage also failed while clearing the rejected request: ${
+                storageCause instanceof Error ? storageCause.message : String(storageCause)
+              }`;
+          }
+        }
+        if (signal.aborted) return;
+        const message = cause instanceof Error ? cause.message : String(cause);
+        setError(
+          `${message}${
+            ambiguous ? " The setup outcome is uncertain. Refresh and check Project setup before recovering the exact saved request." : ""
+          }${storageFailure}`,
+        );
+        await onChanged();
+        return;
+      }
+      let cleanupError = "";
+      try {
+        if (await clearSetupIdentity(action.key, identity) === "changed") return;
+      } catch (cause) {
+        cleanupError = `The setup action completed, but browser storage cleanup failed: ${
+          cause instanceof Error ? cause.message : String(cause)
+        }`;
+      }
+      if (signal.aborted) return;
+      if (cleanupError) setError(cleanupError);
+      if (response) setNotice(String(response.result.state || "Saved"));
+      await onChanged();
+      if (!signal.aborted) return response?.result;
+    } catch (cause) {
+      if (!signal.aborted) setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      inFlightRequests.delete(operationStorageKey);
+      notifySetupJournal();
     }
   };
   const clearPersistedSetupDraft = (suppressNextWrite = false) => {
@@ -792,22 +1010,22 @@ export function ProjectSetup({
     if (suppressNextWrite) skipDraftPersistence.current = true;
   };
   const inspect = () =>
-    runTrip("inspect", { action: "inspect_project", project_id: project.id });
+    runSetupAction({ action: "inspect_project", project_id: project.id });
   const begin = () =>
-    runTrip("begin", {
+    runSetupAction({
       action: "begin_setup",
       project_id: project.id,
       expected_project_version: project.version,
       host_manager: manager,
     });
   const stopSetupManager = () =>
-    setup && runTrip("stop-setup-manager", {
+    setup && runSetupAction({
       action: "stop_setup_manager",
       setup_operation_id: setup.setup_operation_id,
       expected_project_version: project.version,
     });
   const changeSetupManager = () =>
-    setup && runTrip("change-setup-manager", {
+    setup && runSetupAction({
       action: "change_setup_manager",
       setup_operation_id: setup.setup_operation_id,
       expected_project_version: project.version,
@@ -953,16 +1171,18 @@ export function ProjectSetup({
   })();
   const saveDraft = async () => {
     if (!setup || !proposalValue) return;
-    const result = await runTrip("save-draft", {
+    const result = await runSetupAction({
       action: editingRevision ? "revise_setup_draft" : "save_setup_draft",
       setup_operation_id: setup.setup_operation_id,
       expected_project_version: project.version,
       proposal: proposalValue,
     });
-    if (result) clearPersistedSetupDraft();
+    if (result && currentDraft.current === draft && setupDraftKeyRef.current === setupDraftKey) {
+      clearPersistedSetupDraft();
+    }
   };
   const authorizeProbes = () =>
-    setup?.proposal_hash && runTrip("authorize-probes", {
+    setup?.proposal_hash && runSetupAction({
       action: "authorize_setup_probes",
       setup_operation_id: setup.setup_operation_id,
       proposal_hash: setup.proposal_hash,
@@ -970,7 +1190,7 @@ export function ProjectSetup({
   const authorizeInstall = () =>
     setup?.proposal_hash && setup.approved_preimages_hash &&
     setup.final_source_set_hash &&
-    runTrip("authorize-install", {
+    runSetupAction({
       action: "authorize_installation",
       setup_operation_id: setup.setup_operation_id,
       proposal_hash: setup.proposal_hash,
@@ -978,172 +1198,76 @@ export function ProjectSetup({
       final_source_set_hash: setup.final_source_set_hash,
     });
   const finalizeInstall = () =>
-    setup?.proposal_hash && runTrip("finalize-install", {
+    setup?.proposal_hash && runSetupAction({
       action: "finalize_installation",
       setup_operation_id: setup.setup_operation_id,
       proposal_hash: setup.proposal_hash,
     });
   const applyInstall = () =>
-    setup?.proposal_hash && runTrip("apply-install", {
+    setup?.proposal_hash && runSetupAction({
       action: "apply_installation",
       setup_operation_id: setup.setup_operation_id,
       proposal_hash: setup.proposal_hash,
     });
   const recoverInstall = () =>
-    setup && runTrip("recover-install", {
+    setup && runSetupAction({
       action: "recover_installation",
       setup_operation_id: setup.setup_operation_id,
     });
   const adopt = () =>
-    setup?.proposal && runTrip("adopt", {
+    setup?.proposal && runSetupAction({
       action: "adopt_installation",
       project_id: project.id,
       expected_project_version: project.version,
       configuration: setup.proposal,
     });
   const prepareRuntime = async (role?: Role) => {
-    const result = await runTrip(
-      role ? `prepare-runtime:${role}` : "prepare-runtime",
-      {
-        action: "prepare_runtime_admission",
-        project_id: project.id,
-        expected_version: project.version,
-        ...(role ? { role } : {}),
-      },
-    );
+    const result = await runSetupAction({
+      action: "prepare_runtime_admission",
+      project_id: project.id,
+      expected_version: project.version,
+      ...(role ? { role } : {}),
+    });
     if (typeof result?.entity_id === "string" && result.entity_id.trim()) {
       setRuntimeAdmissionId(result.entity_id);
     }
   };
   const authorizeRuntime = (admissionId: string, scopeHash: string) =>
-    runTrip(`authorize-runtime:${admissionId}`, {
+    runSetupAction({
       action: "authorize_runtime_admission",
       admission_id: admissionId,
       scope_hash: scopeHash,
     });
   const publishRuntime = (admissionId: string, role: Role) =>
-    runTrip(`publish-runtime:${admissionId}:${role}`, {
+    runSetupAction({
       action: "publish_runtime_proof",
       admission_id: admissionId,
       role,
     });
-  const runtimeDispatch = async (
-    admissionId: string,
-    role: Role,
-    resume = false,
-  ) => {
-    if (dispatchGuard.current) return;
-    dispatchGuard.current = true;
-    setBusy(`runtime:${admissionId}:${role}`);
-    setError("");
-    try {
-      await runBrowserOperation(
-        `runtime:${admissionId}:${role}:${resume ? "resume" : "launch"}`,
-        resume
-          ? {
-            kind: "runtime_probe_resume",
-            admission_id: admissionId,
-            role,
-          }
-          : {
-            kind: "runtime_probe_launch",
-            admission_id: admissionId,
-            role,
-          },
-      );
-      await onChanged();
-    } catch (cause) {
-      setError(
-        cause instanceof ApiError && cause.ambiguous
-          ? `${cause.message} Refresh and reconcile before retrying.`
-          : cause instanceof Error
-          ? cause.message
-          : String(cause),
-      );
-      await onChanged();
-    } finally {
-      dispatchGuard.current = false;
-      setBusy("");
-    }
-  };
-  const dispatch = async (
-    attemptId: string,
-    role: Role,
-    sessionId?: string,
-  ) => {
-    if (dispatchGuard.current) return;
-    dispatchGuard.current = true;
-    setBusy(`${attemptId}:${role}`);
-    setError("");
-    try {
-      if (sessionId) {
-        await runBrowserOperation(`role-resume:${sessionId}`, {
-          kind: "role_resume",
-          session_id: sessionId,
-          prompt: "",
-        });
-      } else {
-        await runBrowserOperation(`setup-dispatch:${attemptId}:${role}`, {
-          kind: "trip_setup_dispatch",
-          attempt_id: attemptId,
-          role,
-        });
-      }
-      await onChanged();
-    } catch (cause) {
-      setError(
-        cause instanceof ApiError && cause.ambiguous
-          ? `${cause.message} Refresh and reconcile before retrying.`
-          : cause instanceof Error
-          ? cause.message
-          : String(cause),
-      );
-      await onChanged();
-    } finally {
-      dispatchGuard.current = false;
-      setBusy("");
-    }
-  };
+  const runtimeDispatch = (admissionId: string, role: Role, resume = false) =>
+    runSetupAction({ kind: resume ? "runtime_probe_resume" : "runtime_probe_launch", admission_id: admissionId, role });
+  const dispatch = (attemptId: string, role: Role, sessionId?: string) =>
+    sessionId
+      ? runSetupAction({ kind: "role_resume", session_id: sessionId, prompt: "" })
+      : runSetupAction({ kind: "trip_setup_dispatch", attempt_id: attemptId, role });
   const dispatchFreshSetup = async (action: ContinuationAction) => {
     const attemptId = action.binding.attempt_id;
     const role = action.binding.role;
     const rejectionEventId = action.binding.rejection_event_id;
     if (
-      typeof attemptId !== "string" ||
-      (role !== "manager" &&
-        !delegatedRoles.includes(role as Exclude<Role, "manager">)) ||
-      typeof rejectionEventId !== "string"
+      !nonemptyString(attemptId) || !isSetupRole(role) || !nonemptyString(rejectionEventId)
     ) {
       setError(
         "The fresh setup action is missing its immutable authority binding. Refresh and reconcile before retrying.",
       );
       return;
     }
-    if (dispatchGuard.current) return;
-    dispatchGuard.current = true;
-    setBusy(`fresh-setup:${attemptId}:${role}`);
-    setError("");
-    try {
-      await runBrowserOperation(`setup-fresh-resume:${rejectionEventId}`, {
-        kind: "trip_setup_dispatch",
-        attempt_id: attemptId,
-        role: role as Role,
-        fresh_resume_rejection: action.binding,
-      });
-      await onChanged();
-    } catch (cause) {
-      setError(
-        cause instanceof ApiError && cause.ambiguous
-          ? `${cause.message} Refresh and reconcile before retrying.`
-          : cause instanceof Error
-          ? cause.message
-          : String(cause),
-      );
-      await onChanged();
-    } finally {
-      dispatchGuard.current = false;
-      setBusy("");
-    }
+    await runSetupAction({
+      kind: "trip_setup_dispatch",
+      attempt_id: attemptId,
+      role,
+      fresh_resume_rejection: action.binding,
+    });
   };
 
   const managerValid = !!manager.provider && !!manager.model.trim() &&
@@ -1438,6 +1562,25 @@ export function ProjectSetup({
             : trip.readiness.replaceAll("_", " ")}
         </span>
       </header>
+      {journal.unreadable && (
+        <ErrorNotice error="One or more saved setup requests could not be checked. Refresh Project setup and review its current state." />
+      )}
+      {journal.requests.map(({ action: { key, request, label }, identity }) => (
+        <section key={key} className="warning" aria-label={`Saved ${label}`}>
+          <p>Refresh Project setup and check the outcome before recovering this saved {label}.</p>
+          <details>
+            <summary>Original request</summary>
+            <pre>{JSON.stringify({ operation_id: identity.id, ...request }, null, 2)}</pre>
+          </details>
+          <button
+            type="button"
+            disabled={!!busy}
+            onClick={() => void runSetupAction(request, identity)}
+          >
+            Recover saved {label}
+          </button>
+        </section>
+      ))}
       {unverifiedSetupProfiles.length > 0 && (
         <p
           className={trip.readiness === "ready" ? "hint" : "warning"}

@@ -48,6 +48,9 @@ fn tick_steps(app: &Application) -> Result<serde_json::Value> {
     if !app.dispatch_enabled() {
         return Ok(serde_json::json!({"action":"draining","status":app.drain_status()?}));
     }
+    if let Some(value) = crate::trip::reconcile_integration_dispatch(&app.store, None)? {
+        return Ok(value);
+    }
     if let crate::supervisor::ProcessInventory::Unavailable(cause) = inventory {
         return process_independent_control(app, cause);
     }
@@ -513,8 +516,13 @@ struct LaneDispatch {
 struct ImplementationLaneState {
     configured: i64,
     unyielded: i64,
-    request_id: Option<String>,
-    capsule: Option<String>,
+    integration: Option<IntegrationRequest>,
+}
+
+enum IntegrationRequest {
+    Dispatchable { request_id: String, capsule: String },
+    Uncertain { request_id: String },
+    Dispatched,
 }
 
 const INTEGRATION_READY_NOTICE: &str = "All required implementation lanes have accepted persisted yield receipts and their exact current writers are positively quiescent. The exact ordered integration request can now proceed through request-integration; do not fabricate a request, report, or approval.";
@@ -728,6 +736,9 @@ enum ImplementationSelection {
     },
     WaitForIntegrationRequest {
         configured: i64,
+    },
+    HoldUncertainIntegrationDispatch {
+        request_id: String,
     },
     DispatchIntegration {
         request_id: String,
@@ -2120,25 +2131,37 @@ fn classify_implementation(
             if manager_notice_pending_on(connection, attempt, INTEGRATION_READY_NOTICE, true)? {
                 return Ok(ImplementationSelection::NotifyIntegrationReady);
             }
-            let Some(request_id) = lane_state.request_id else {
-                return Ok(ImplementationSelection::WaitForIntegrationRequest { configured });
-            };
-            if !has_result_on(connection, &attempt.id, "implementer", "candidate_ready")?
-                && !active_role_on(connection, &attempt.id, "implementer")?
-            {
-                let capsule = lane_state
-                    .capsule
-                    .ok_or_else(|| anyhow!("integration request is missing its capsule"))?;
-                return unless_provider_held(
-                    connection,
-                    attempt,
-                    RoleKind::Implementer,
-                    ImplementationSelection::DispatchIntegration {
+            match lane_state.integration {
+                None => {
+                    return Ok(ImplementationSelection::WaitForIntegrationRequest { configured });
+                }
+                Some(IntegrationRequest::Uncertain { request_id }) => {
+                    return Ok(ImplementationSelection::HoldUncertainIntegrationDispatch {
                         request_id,
-                        capsule,
-                    },
-                    ImplementationSelection::ProviderHeld,
-                );
+                    });
+                }
+                Some(IntegrationRequest::Dispatchable {
+                    request_id,
+                    capsule,
+                }) if !has_result_on(
+                    connection,
+                    &attempt.id,
+                    "implementer",
+                    "candidate_ready",
+                )? && !active_role_on(connection, &attempt.id, "implementer")? =>
+                {
+                    return unless_provider_held(
+                        connection,
+                        attempt,
+                        RoleKind::Implementer,
+                        ImplementationSelection::DispatchIntegration {
+                            request_id,
+                            capsule,
+                        },
+                        ImplementationSelection::ProviderHeld,
+                    );
+                }
+                Some(IntegrationRequest::Dispatchable { .. } | IntegrationRequest::Dispatched) => {}
             }
         }
         if has_result_on(connection, &attempt.id, "implementer", "candidate_ready")? {
@@ -2347,6 +2370,22 @@ fn evaluate_implementation(
                 "configured_lanes":configured,
             }),
         ),
+        ImplementationSelection::HoldUncertainIntegrationDispatch { request_id } => {
+            blocked_attempt_decision(
+                attempt,
+                "workflow.integration_dispatch_uncertain",
+                DecisionDisposition::Held,
+                DecisionEvidenceState::Uncertain,
+                DecisionOwner::Human,
+                serde_json::json!({"integration_request_id":request_id}),
+                Some("The integration launch could not be confirmed. Refresh and check the task's session history. Automatic dispatch is paused.".into()),
+                prerequisites,
+                waiting(attempt, "integration_dispatch_uncertain"),
+                AttemptDecisionFlow::Observe,
+                None,
+                Vec::new(),
+            )
+        }
         ImplementationSelection::DispatchIntegration { .. } => role_dispatch_decision(
             connection,
             attempt,
@@ -3302,6 +3341,7 @@ fn legacy_wait_is_visible(value: &serde_json::Value) -> bool {
                 | "yielded_lane_quiescence"
                 | "accepted_lane_yield_receipts"
                 | "manager_integration_request"
+                | "integration_dispatch_uncertain"
                 | "manager_service_stop_quiescence"
                 | "current_manager_completion_boundary"
                 | "manager_quiescence_or_recovery"
@@ -3594,6 +3634,9 @@ fn advance_implementation(
                 "configured_lanes":configured,
             }))
         }
+        ImplementationSelection::HoldUncertainIntegrationDispatch { .. } => {
+            Ok(waiting(attempt, "integration_dispatch_uncertain"))
+        }
         ImplementationSelection::DispatchIntegration {
             request_id,
             capsule,
@@ -3624,22 +3667,38 @@ fn advance_implementation(
                     "integration_only":true,
                 }),
             )?;
-            let launch = app.dispatch_attempt_role(&attempt.id, RoleKind::Implementer, &prompt)?;
-            let connection = app.store.lock()?;
-            let changed = connection.execute(
-                "UPDATE trip_integration_requests SET state='dispatched',dispatched_at=?1
-                 WHERE id=?2 AND attempt_id=?3 AND state='requested'",
-                params![Utc::now().to_rfc3339(), request_id, attempt.id],
-            )?;
-            if changed != 1 {
-                bail!("manager integration request changed during dispatch")
-            }
-            Ok(serde_json::json!({
-                "action":"integration_implementer_dispatched",
-                "attempt_id":attempt.id,
-                "session_id":launch.session_id,
-                "integration_request_id":request_id,
-            }))
+            let launch = match app.dispatch_attempt_role(
+                &attempt.id,
+                RoleKind::Implementer,
+                &prompt,
+            ) {
+                Ok(launch) => launch,
+                Err(error) => {
+                    let connection = app.store.lock()?;
+                    let unreserved: bool = connection.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM trip_integration_dispatch
+                         WHERE request_id=?1 AND session_id IS NULL)",
+                        params![request_id],
+                        |row| row.get(0),
+                    )?;
+                    return Err(subject_failure(
+                        error,
+                        &attempt.id,
+                        SubjectStep::AttemptAdvance,
+                        if unreserved {
+                            StepEffect::None
+                        } else {
+                            StepEffect::Possible
+                        },
+                        serde_json::json!({"phase":attempt.phase,"integration_request_id":request_id}),
+                    ));
+                }
+            };
+            crate::trip::reconcile_integration_dispatch(
+                &app.store,
+                Some((&request_id, &launch.session_id)),
+            )?
+            .ok_or_else(|| anyhow!("integration launch returned without its exact confirmed start"))
         }
         ImplementationSelection::QuiesceCompletedImplementer { session_id } => {
             // The application seam records the request durably under synthetic
@@ -3733,19 +3792,33 @@ fn implementation_lane_state_on(
         params![attempt.id],
         |row| row.get(0),
     )?;
-    let request = connection
+    let integration = connection
         .query_row(
-            "SELECT id,capsule_json FROM trip_integration_requests
-             WHERE attempt_id=?1 AND state IN ('requested','dispatched')",
+            "SELECT r.id,r.capsule_json,r.state='dispatched',d.request_id IS NOT NULL AND d.session_id IS NULL
+             FROM trip_integration_requests r
+             LEFT JOIN trip_integration_dispatch d ON d.request_id=r.id
+             WHERE r.attempt_id=?1 AND r.state IN ('requested','dispatched')",
             params![attempt.id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok(if row.get::<_, bool>(2)? {
+                    IntegrationRequest::Dispatched
+                } else if row.get::<_, bool>(3)? {
+                    IntegrationRequest::Dispatchable {
+                        request_id: row.get(0)?,
+                        capsule: row.get(1)?,
+                    }
+                } else {
+                    IntegrationRequest::Uncertain {
+                        request_id: row.get(0)?,
+                    }
+                })
+            },
         )
         .optional()?;
     Ok(Some(ImplementationLaneState {
         configured,
         unyielded,
-        request_id: request.as_ref().map(|value| value.0.clone()),
-        capsule: request.map(|value| value.1),
+        integration,
     }))
 }
 
@@ -6440,23 +6513,26 @@ fn process_one_control(
                 if !reason.starts_with("restart hold release") {
                     return Err(error);
                 }
-                let connection = app.store.lock()?;
-                connection.execute(
+                let mut connection = app.store.lock()?;
+                let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let now = Utc::now().to_rfc3339();
+                tx.execute(
                     "UPDATE controls SET state='rejected',payload_json=?1,updated_at=?2 WHERE id=?3",
                     params![
                         serde_json::json!({"reason":reason.clone(),"restart_hold_retained":true}).to_string(),
-                        Utc::now().to_rfc3339(),
+                        now,
                         id
                     ],
                 )?;
-                connection.execute(
+                tx.execute(
                     "UPDATE attempts SET status='restart_parked',updated_at=?1 WHERE id=?2",
-                    params![Utc::now().to_rfc3339(), attempt],
+                    params![now, attempt],
                 )?;
-                connection.execute(
+                tx.execute(
                     "UPDATE tasks SET attention='restart_parked',updated_at=?1 WHERE id=?2",
-                    params![Utc::now().to_rfc3339(), task],
+                    params![now, task],
                 )?;
+                tx.commit()?;
                 return Ok(Some(serde_json::json!({
                     "action":"continue_rejected",
                     "control_id":id,

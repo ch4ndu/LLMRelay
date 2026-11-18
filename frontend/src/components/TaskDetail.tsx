@@ -402,7 +402,7 @@ export function TaskDetail(
     setRecoveryFocus({ tab: "roles", target: `role_settings:${task.id}:${role}` });
   };
   const [dependency, setDependency] = useState("");
-  const [integrationRef, setIntegrationRef] = useState("");
+  const [integrationRefs, setIntegrationRefs] = useState<Record<string, string>>({});
   const [answer, setAnswer] = useState("");
   const [error, setError] = useState("");
   const [deleteVersion, setDeleteVersion] = useState<number | null>(null);
@@ -574,7 +574,7 @@ export function TaskDetail(
       setActivityError("");
     } catch (cause) {
       if (epoch === activityEpoch.current && activityTask.current === taskId) {
-        setActivityError(String(cause));
+        setActivityError(cause instanceof Error ? cause.message : String(cause));
       }
     } finally {
       if (epoch === activityEpoch.current && activityTask.current === taskId) {
@@ -613,7 +613,7 @@ export function TaskDetail(
       setActivityError("");
     } catch (cause) {
       if (epoch === activityEpoch.current && activityTask.current === taskId) {
-        setActivityError(String(cause));
+        setActivityError(cause instanceof Error ? cause.message : String(cause));
       }
     } finally {
       if (epoch === activityEpoch.current && activityTask.current === taskId) {
@@ -1265,14 +1265,11 @@ export function TaskDetail(
           selectedRecordId={selectedRecoveryId}
           onChanged={onChanged}
         />
-        {guidanceConflict &&
-          (
-            <GuidanceRecovery
-              key={attempt?.id}
-              task={task}
-              onChanged={onChanged}
-            />
-          )}
+        <GuidanceRecovery
+          task={task}
+          allowFreshApproval={guidanceConflict}
+          onChanged={onChanged}
+        />
         {singleAgent
           ? (
             <section className="panel verification-summary">
@@ -1314,10 +1311,12 @@ export function TaskDetail(
             ? "Add or remove dependencies before this task starts. Removing one lets this task proceed without waiting for those changes."
             : "Dependencies are fixed once a task starts. Restore an archived draft before editing its dependencies."}
         </p>
-        {task.dependencies.map((item, index) => {
+        {task.dependencies.map((item) => {
           const other = state.tasks.find((value) => value.id === item.task_id);
+          const dependencyId = String(item.task_id);
+          const integrationRef = integrationRefs[dependencyId] ?? "";
           return (
-            <div className="review-row" key={index}>
+            <div className="review-row" key={dependencyId}>
               <strong>{other?.title || String(item.task_id)}</strong>
               <span>
                 {item.verified_at
@@ -1329,11 +1328,13 @@ export function TaskDetail(
                   <label>
                     Integrated commit or branch
                     <input
-                      aria-label={`Integration ref for ${String(item.task_id)}`}
+                      aria-label={`Integration ref for ${dependencyId}`}
                       value={integrationRef}
                       disabled={queueBusy}
-                      onChange={(event) =>
-                        setIntegrationRef(event.target.value)}
+                      onChange={(event) => {
+                        const value = event.target.value;
+                        setIntegrationRefs((refs) => ({ ...refs, [dependencyId]: value }));
+                      }}
                       placeholder="Exact integrated git ref"
                     />
                   </label>

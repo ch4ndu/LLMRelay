@@ -247,6 +247,19 @@ export interface RuntimeAdmissionState {
   hook_trust?: string | null;
   has_native_session?: boolean;
 }
+export interface DiagnosticsRuntimeBinding {
+  project_id: string;
+  setup_operation_id: string;
+  role: Role;
+  /** Hash of the selected setup row. */
+  profile_hash: string;
+  /** Hash of the profile representation recorded by the published runtime probe. */
+  runtime_profile_hash: string;
+  project_config_revision_id: string;
+  adapter_hash: string;
+  capability_id: string;
+  capability_key: string;
+}
 export interface TripSetupState {
   setup_operation_id: string;
   project_id: string;
@@ -296,7 +309,9 @@ export interface TripSetupState {
   }>;
   installation_source_binding_complete: boolean;
   installation_source_binding_reason: string;
-  selected_profiles: TripSetupSelection[];
+  selected_profiles: (TripSetupSelection & {
+    current_runtime_binding?: { capability_id: string; capability_key: string } | null;
+  })[];
   probe_receipts: TripSetupProbeReceipt[];
   sessions: TripSetupSession[];
   recoveries?: TripSetupRecovery[];
@@ -1548,6 +1563,8 @@ export interface ProductionRoleRestriction {
   reason: string;
 }
 export interface CapabilityEvidence {
+  id?: string;
+  rowid?: number;
   provider: Provider;
   version?: string;
   role: Role;
@@ -2836,6 +2853,7 @@ export interface KnowledgeRevision extends Omit<KnowledgeDraftBody, "sources"> {
 export type KnowledgeFreshness = "verified" | "needs_revalidation" | "source_unavailable" | "user_assertion";
 export interface KnowledgeObservation {
   revision_id: string; check_started_at: string; checked_at: string; state: KnowledgeFreshness; fingerprint: string; restore_operation_id?: string;
+  sources_omitted?: number;
   sources: Array<{ identity_hash: string; original_content_hash: string; observed_content_hash: string | null; state: KnowledgeFreshness; reason: string }>;
 }
 export interface KnowledgeSelection { entry_id: string; revision_id: string; expected_entry_version: number; observation_fingerprint: string; acknowledged_warning: boolean }
@@ -2865,6 +2883,10 @@ export type KnowledgeMutation =
 export type KnowledgeCommand =
   | { kind: "mutate"; request: { operation_id: string; project_id: string; mutation: KnowledgeMutation } }
   | { kind: "revalidate"; project_id: string; operation_id: string; entry_id: string; revision_id: string; expected_version: number; expected_observation: string };
+export type KnowledgeCommandResult =
+  | (KnowledgeEntry & { operation_id: string })
+  | (KnowledgeObservation & { operation_id: string })
+  | { kind: "revalidation_confirmed"; operation_id: string; project_id: string; entry_id: string; revision_id: string; fingerprint: string };
 export interface KnowledgeReadResults {
   search: KnowledgeSearchHit[]; entry: KnowledgeEntry; revision: KnowledgeRevision;
   source: { source: KnowledgeSource; text: string; checked_at: string };

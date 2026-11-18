@@ -280,6 +280,8 @@ impl Application {
         // delivery. Intake remains held through refusal recording, and the
         // store rechecks absence in an immediate transaction. An existing
         // reservation (including an unknown outcome) can never become refused.
+        // Both conversation spawn paths also hold intake through handle registration,
+        // so no new stdout reader can appear between a recovery check and its write.
         let result = (|| -> Result<serde_json::Value> {
             match operation {
             Op::CreateProfile { input } => self.store.conversation_create_profile(&input),
@@ -461,11 +463,17 @@ impl Application {
             Op::Reconcile {
                 operation_id,
                 conversation_id,
-            } => self.store.conversation_reconcile_quiescence(
-                &operation_id,
-                &request,
-                &conversation_id,
-            ),
+            } => {
+                if let Some(receipt) = self.store.conversation_receipt(&operation_id, &request)? {
+                    return Ok(receipt);
+                }
+                self.supervisor.require_conversation_reader_settled(&conversation_id)?;
+                self.store.conversation_reconcile_quiescence(
+                    &operation_id,
+                    &request,
+                    &conversation_id,
+                )
+            }
             Op::Resume {
                 operation_id,
                 conversation_id,
@@ -473,6 +481,7 @@ impl Application {
                 if let Some(receipt) = self.store.conversation_receipt(&operation_id, &request)? {
                     return Ok(receipt);
                 }
+                self.supervisor.require_conversation_reader_settled(&conversation_id)?;
                 self.require_conversation_execution()?;
                 let identity = self.store.conversation_identity(&conversation_id)?;
                 let prepared = self.prepare_conversation(identity.profile.clone(), provisional)?;

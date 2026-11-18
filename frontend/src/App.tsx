@@ -1319,6 +1319,8 @@ export function App() {
         )} {page === "diagnostics" && (
           <div data-attention-target="diagnostics" tabIndex={-1}>
             <DiagnosticsPanel
+              incarnation={state.incarnation}
+              projects={state.projects}
               capabilities={state.capabilities}
               setups={state.trip_setups || []}
               attention={state.attention}

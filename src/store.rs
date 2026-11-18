@@ -2448,6 +2448,7 @@ pub struct RoleLaunchContext {
     pub token: String,
     pub permit_id: String,
     pub lane_id: String,
+    integration_request_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2588,6 +2589,7 @@ const MIGRATION_047: &str = include_str!("../migrations/047_project_knowledge.sq
 const MIGRATION_048: &str = include_str!("../migrations/048_recipe_schedule_execution.sql");
 const MIGRATION_049: &str = include_str!("../migrations/049_recipe_writer_schedules.sql");
 const MIGRATION_050: &str = include_str!("../migrations/050_retire_unqualified_execution.sql");
+const MIGRATION_051: &str = include_str!("../migrations/051_trip_integration_dispatch.sql");
 
 #[derive(Clone, Copy)]
 enum ExecutionBoundaryKind {
@@ -5717,8 +5719,9 @@ impl Store {
 
     pub fn update_session_launch_failed(&self, session_id: &str, reason: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        let connection = self.lock()?;
-        connection.execute(
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
             "UPDATE sessions SET status='launch_failed',launch_state='failed',launch_error=?1,
                     exit_json=?2,updated_at=?3 WHERE id=?4",
             params![
@@ -5728,14 +5731,18 @@ impl Store {
                 session_id
             ],
         )?;
-        connection.execute(
+        transaction.execute(
             "UPDATE resume_invocations SET state='proven_nondelivery',error=?1,updated_at=?2
              WHERE session_id=?3 AND transcript_epoch=(SELECT transcript_epoch FROM sessions WHERE id=?3)
                AND state IN ('reserved','spawning')",
             params![reason, now, session_id],
         )?;
-        connection.execute("UPDATE role_generations SET status='launch_failed',updated_at=?1 WHERE id=(SELECT role_generation_id FROM sessions WHERE id=?2)",params![now,session_id])?;
-        connection.execute(
+        transaction.execute(
+            "UPDATE role_generations SET status='launch_failed',updated_at=?1
+             WHERE id=(SELECT role_generation_id FROM sessions WHERE id=?2)",
+            params![now, session_id],
+        )?;
+        transaction.execute(
             "UPDATE provider_validation_invocations
              SET state=CASE WHEN state='cancel_requested' THEN 'cancelled' ELSE 'failed' END,
                  failure_reason=?1,updated_at=?2,finished_at=?2
@@ -5743,6 +5750,7 @@ impl Store {
                AND state IN ('reserved','cancel_requested')",
             params![reason, now, session_id],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -7824,13 +7832,17 @@ impl Store {
             } else {
                 None
             };
+        let mut integration_request_id = None;
         if role == RoleKind::Implementer {
             let freeze_active: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM freeze_intents WHERE attempt_id=?1 AND state IN ('reserved','capturing','recovery_required'))",params![attempt_id],|row|row.get(0))?;
             if freeze_active {
                 bail!("writer launch is fenced by an active or unresolved snapshot freeze")
             }
             if !validation_dispatch && lane_key == "default" && reviewed_parallel_lanes.is_some() {
-                require_default_integration_launch(&transaction, attempt_id)?;
+                integration_request_id = Some(require_default_integration_launch(
+                    &transaction,
+                    attempt_id,
+                )?);
             }
         }
         if role != RoleKind::Implementer && lane_key != "default" {
@@ -7930,6 +7942,7 @@ impl Store {
             token: auth::issue_secret(),
             permit_id,
             lane_id,
+            integration_request_id,
         })
     }
 
@@ -8076,26 +8089,52 @@ impl Store {
             token: auth::issue_secret(),
             permit_id,
             lane_id: old_lane,
+            integration_request_id: None,
         })
     }
 
     pub fn mark_switch_dispatched(&self, intent_id: &str, generation_id: &str) -> Result<()> {
-        let connection = self.lock()?;
-        let changed=connection.execute("UPDATE switch_intents SET state='dispatched',new_generation_id=?1,updated_at=?2 WHERE id=?3 AND state IN ('ready_for_dispatch','validation_reserved') AND new_generation_id IS NULL AND EXISTS(SELECT 1 FROM launch_permits WHERE switch_intent_id=?3 AND state='consumed')",params![generation_id,Utc::now().to_rfc3339(),intent_id])?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = Utc::now().to_rfc3339();
+        let changed = transaction.execute(
+            "UPDATE switch_intents SET state='dispatched',new_generation_id=?1,updated_at=?2
+             WHERE id=?3 AND state IN ('ready_for_dispatch','validation_reserved')
+               AND new_generation_id IS NULL
+               AND EXISTS(SELECT 1 FROM launch_permits WHERE switch_intent_id=?3 AND state='consumed')",
+            params![generation_id, now, intent_id],
+        )?;
         if changed != 1 {
             bail!("switch intent was not ready for its captured dispatch")
         }
-        let (role, lane_id): (String, String) = connection.query_row(
+        let (role, lane_id): (String, String) = transaction.query_row(
             "SELECT role,lane_id FROM role_generations WHERE id=?1",
             params![generation_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         if role == "implementer" && lane_id != "default" {
-            connection.execute("UPDATE lane_generations SET effective_generation_id=?1,pending_settings_revision=NULL,updated_at=?2 WHERE lane_id=?3",params![generation_id,Utc::now().to_rfc3339(),lane_id])?;
+            transaction.execute(
+                "UPDATE lane_generations SET effective_generation_id=?1,pending_settings_revision=NULL,updated_at=?2
+                 WHERE lane_id=?3",
+                params![generation_id, now, lane_id],
+            )?;
         } else {
-            connection.execute("UPDATE role_settings SET effective_generation_id=?1 WHERE task_id=(SELECT task_id FROM attempts WHERE id=(SELECT attempt_id FROM switch_intents WHERE id=?2)) AND role=(SELECT role FROM switch_intents WHERE id=?2) AND revision=(SELECT requested_settings_revision FROM switch_intents WHERE id=?2)",params![generation_id,intent_id])?;
+            transaction.execute(
+                "UPDATE role_settings SET effective_generation_id=?1
+                 WHERE task_id=(SELECT task_id FROM attempts WHERE id=(SELECT attempt_id FROM switch_intents WHERE id=?2))
+                   AND role=(SELECT role FROM switch_intents WHERE id=?2)
+                   AND revision=(SELECT requested_settings_revision FROM switch_intents WHERE id=?2)",
+                params![generation_id, intent_id],
+            )?;
         }
-        connection.execute("UPDATE guidance_messages SET role_generation_id=?1 WHERE attempt_id=(SELECT attempt_id FROM switch_intents WHERE id=?2) AND role_generation_id=(SELECT old_generation_id FROM switch_intents WHERE id=?2) AND state='queued'",params![generation_id,intent_id])?;
+        transaction.execute(
+            "UPDATE guidance_messages SET role_generation_id=?1
+             WHERE attempt_id=(SELECT attempt_id FROM switch_intents WHERE id=?2)
+               AND role_generation_id=(SELECT old_generation_id FROM switch_intents WHERE id=?2)
+               AND state='queued'",
+            params![generation_id, intent_id],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -8540,6 +8579,7 @@ impl Store {
         {
             bail!("Explorer reservation no longer matches a current activated decision")
         }
+        let mut integration_request_id = None;
         if config.role == RoleKind::Implementer {
             let freeze_active: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM freeze_intents WHERE attempt_id=?1 AND state IN ('reserved','capturing','recovery_required'))",params![attempt_id],|row|row.get(0))?;
             if freeze_active {
@@ -8554,7 +8594,10 @@ impl Store {
                 if switch_intent.is_none() {
                     if context.lane_id == "default" {
                         if reviewed.is_some() {
-                            require_default_integration_launch(&transaction, &attempt_id)?;
+                            integration_request_id = Some(require_default_integration_launch(
+                                &transaction,
+                                &attempt_id,
+                            )?);
                         }
                     } else {
                         require_initial_lane_launch(
@@ -8567,6 +8610,9 @@ impl Store {
                     }
                 }
             }
+        }
+        if integration_request_id != context.integration_request_id {
+            bail!("integration request changed after launch permit issuance")
         }
         let held:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM tasks t WHERE t.id=?1 AND (t.attention IN ('pause_requested','needs_recovery') OR (t.attention='paused' AND NOT ?3) OR EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=?2 AND c.kind IN ('pause_now','pause_after_role','cancel') AND c.state IN ('requested','draining')) OR (?4='manager' AND EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=?2 AND c.kind='setup_manager_change' AND c.state='held')) OR EXISTS(SELECT 1 FROM controls c WHERE c.attempt_id=?2 AND c.kind IN ('manager_stop','manager_change') AND c.state NOT IN ('finished','cancelled','superseded','rejected') AND (json_extract(c.payload_json,'$.switch_intent_id') IS NULL OR json_extract(c.payload_json,'$.switch_intent_id') IS NOT ?5))))",params![task_id,attempt_id,held_validation,config.role.to_string(),switch_intent],|row|row.get(0))?;
         if held {
@@ -8632,6 +8678,22 @@ impl Store {
         transaction.execute("INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at,lane_id) VALUES(?1,?2,?3,?4,?5,?6,'launch_reserved',?7,?8,?8,?9)",params![context.role_generation_id,attempt_id,config.role.to_string(),config.provider.to_string(),generation,context.settings_revision,uuid::Uuid::new_v4().to_string(),now,context.lane_id])?;
         transaction.execute("INSERT INTO role_credentials(id,role_generation_id,token_hash,permissions_json,created_at) VALUES(?1,?2,?3,?4,?5)",params![context.credential_id,context.role_generation_id,auth::hash_secret(&context.token),serde_json::to_string(&role_permissions(config.role))?,now])?;
         transaction.execute("INSERT INTO sessions(id,role_generation_id,provider,status,launch_config_json,executable_version,transcript_epoch,hook_trust_state,created_at,updated_at,workflow_version,workflow_hash,prompt_hash,capability_key,capability_identity_json,setup_permit_id,lane_id,validation_cell) VALUES(?1,?2,?3,'launch_reserved',?4,?5,?6,'pending_observation',?7,?7,?8,?9,?10,?11,?12,?13,?14,?15)",params![context.session_id,context.role_generation_id,config.provider.to_string(),serde_json::to_string(config)?,config.executable_version,context.transcript_epoch,now,crate::workflow_resources::WORKFLOW_VERSION,crate::workflow_resources::workflow_hash(),crate::workflow_resources::prompt_hash(config.role),capability_key,capability_identity_json,setup_permit_id,context.lane_id,setup_validation_cell])?;
+        if let Some(request_id) = integration_request_id {
+            let bound = transaction.execute(
+                "UPDATE trip_integration_dispatch
+                 SET session_id=?2,role_generation_id=?3,transcript_epoch=?4
+                 WHERE request_id=?1 AND session_id IS NULL",
+                params![
+                    request_id,
+                    context.session_id,
+                    context.role_generation_id,
+                    context.transcript_epoch
+                ],
+            )?;
+            if bound != 1 {
+                bail!("integration launch lost its pre-spawn request binding")
+            }
+        }
         if setup_validation_cell.as_deref() == Some("trip_runtime_probe") {
             // The first context can arrive before dispatch returns from native launch.
             let bound = transaction.execute(
@@ -15287,7 +15349,7 @@ fn existing_schedule_reservation_in(
     Ok(true)
 }
 
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 50;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 51;
 
 /// Reads the durable state cursor. It is committed state only when the
 /// connection is in autocommit mode.
@@ -15299,14 +15361,14 @@ pub(crate) fn read_state_revision(connection: &Connection) -> rusqlite::Result<i
 
 /// The prior schemas an existing database may be migrated from at service
 /// start. Every other non-current version is left unchanged and refused.
-pub(crate) const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 19] = [
-    31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
+pub(crate) const SERVICE_UPGRADABLE_SCHEMA_VERSIONS: [i64; 20] = [
+    31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
 ];
 
 pub(crate) fn require_maintenance_schema(connection: &Connection) -> Result<i64> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version != CURRENT_SCHEMA_VERSION && !SERVICE_UPGRADABLE_SCHEMA_VERSIONS.contains(&version) {
-        bail!("unsupported database schema version {version}; maintenance supports only schemas 31–50")
+        bail!("unsupported database schema version {version}; maintenance supports only schemas 31–{CURRENT_SCHEMA_VERSION}")
     }
     Ok(version)
 }
@@ -15968,6 +16030,14 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction
             .commit()
             .context("commit execution retirement migration")?;
+    }
+    if version <= 50 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(MIGRATION_051)?;
+        transaction.pragma_update(None, "user_version", 51)?;
+        transaction
+            .commit()
+            .context("commit integration dispatch binding migration")?;
     }
     Ok(())
 }
@@ -21051,7 +21121,7 @@ fn require_initial_lane_launch(
     crate::trip::require_lane_sources_current(connection, attempt_id, lane_id, workspace)
 }
 
-fn require_default_integration_launch(connection: &Connection, attempt_id: &str) -> Result<()> {
+fn require_default_integration_launch(connection: &Connection, attempt_id: &str) -> Result<String> {
     crate::trip::require_configured_lanes_match_reviewed(connection, attempt_id)?;
     let lanes = {
         let mut statement = connection.prepare(
@@ -21078,9 +21148,10 @@ fn require_default_integration_launch(connection: &Connection, attempt_id: &str)
     if writers_active {
         bail!("default integration authority waits for every lane writer to become quiescent")
     }
-    let capsule: String = connection
+    let (request_id, capsule): (String, String) = connection
         .query_row(
-            "SELECT r.capsule_json FROM trip_integration_requests r
+            "SELECT r.id,r.capsule_json FROM trip_integration_requests r
+             JOIN trip_integration_dispatch d ON d.request_id=r.id AND d.session_id IS NULL
              JOIN role_generations manager ON manager.id=r.requested_by_generation_id
              JOIN attempts a ON a.id=r.attempt_id
              JOIN role_settings current_manager ON current_manager.task_id=a.task_id
@@ -21092,7 +21163,7 @@ fn require_default_integration_launch(connection: &Connection, attempt_id: &str)
                  WHERE newer.attempt_id=r.attempt_id AND newer.role='manager'
                    AND newer.generation>manager.generation)",
             params![attempt_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?
         .ok_or_else(|| {
@@ -21115,7 +21186,7 @@ fn require_default_integration_launch(connection: &Connection, attempt_id: &str)
     if ordered.len() != ordered_set.len() || ordered_set != required_set {
         bail!("current integration request does not bind the complete reviewed lane set")
     }
-    Ok(())
+    Ok(request_id)
 }
 
 pub(crate) fn role_capacity_available(

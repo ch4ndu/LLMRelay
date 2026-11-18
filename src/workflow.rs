@@ -5395,8 +5395,25 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
     let connection = store.lock()?;
     // Read before any projected row: without a read transaction, an external
     // writer can only make the rows newer than this cursor, never older.
-    let revision = crate::store::read_state_revision(&connection)
-        .context("read state revision for the dashboard projection")?;
+    let read_revision = |connection: &Connection| {
+        crate::store::read_state_revision(connection)
+            .context("read state revision for the dashboard projection")
+    };
+    let revision = read_revision(&connection)?;
+    let recorded_before_sample = recorded_resource_processes(&connection)?;
+    let (connection, revision, process_sample) = if recorded_before_sample.is_empty() {
+        (connection, revision, None)
+    } else {
+        drop(connection);
+        let sampled_keys = recorded_before_sample
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        let sample = sample_process_resources();
+        let connection = store.lock()?;
+        let revision = read_revision(&connection)?;
+        (connection, revision, Some((sampled_keys, sample)))
+    };
     let projects = {
         let mut statement = connection.prepare("SELECT p.id,p.display_name,p.repository_path,p.repository_identity,p.base_revision,p.queue_paused,p.version,p.settings_json,
             COALESCE((SELECT json_object('readiness',s.readiness,'reason',s.reason,'detected_installation',s.detected_installation,'detected',json(s.detected_json),'setup_operation_id',s.setup_operation_id,'active_config_revision_id',s.active_config_revision_id,'workflow_id',s.workflow_id,'package_version',s.package_version,'upstream_source_hash',s.upstream_source_hash,'overlay_hash',s.overlay_hash,'manifest_hash',s.manifest_hash,'activated_at',s.activated_at,'updated_at',s.updated_at,
@@ -5523,7 +5540,7 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
                 }
             }
         }
-        task.role_settings = json_rows(&connection, "SELECT json_object('id',rs.id,'role',rs.role,'revision',rs.revision,'config',json(rs.config_json),'effective_generation_id',rs.effective_generation_id,'activation',(SELECT json_object('id',a.id,'source',CASE WHEN a.profile_json=json(rs.config_json) THEN 'task_override' ELSE 'task_override' END,'profile_hash',a.profile_hash,'project_config_revision_id',a.project_config_revision_id,'project_configuration_hash',a.project_configuration_hash,'adapter',a.adapter_name,'adapter_hash',a.adapter_hash,'capability_id',a.capability_id,'capability_key',a.capability_key,'capability_proof_hash',a.capability_proof_hash,'activated_at',a.activated_at) FROM trip_task_profile_activations a WHERE a.settings_id=rs.id ORDER BY a.activated_at DESC LIMIT 1)) FROM role_settings rs WHERE rs.task_id=?1 ORDER BY rs.role,rs.revision", &id)?;
+        task.role_settings = json_rows(&connection, "SELECT json_object('id',rs.id,'role',rs.role,'revision',rs.revision,'config',json(rs.config_json),'effective_generation_id',rs.effective_generation_id,'activation',(SELECT json_object('id',a.id,'source','task_override','profile_hash',a.profile_hash,'project_config_revision_id',a.project_config_revision_id,'project_configuration_hash',a.project_configuration_hash,'adapter',a.adapter_name,'adapter_hash',a.adapter_hash,'capability_id',a.capability_id,'capability_key',a.capability_key,'capability_proof_hash',a.capability_proof_hash,'activated_at',a.activated_at) FROM trip_task_profile_activations a WHERE a.settings_id=rs.id ORDER BY a.activated_at DESC LIMIT 1)) FROM role_settings rs WHERE rs.task_id=?1 ORDER BY rs.role,rs.revision", &id)?;
         task.reviews = json_rows(&connection, "SELECT json_object('id',r.id,'kind',r.review_kind,'candidate_hash',r.candidate_hash,'delivery_state',r.delivery_state,'verdict',r.verdict,'feedback',r.feedback,'session_id',r.session_id,'role_generation_id',r.role_generation_id,'settings_revision',r.settings_revision,'ambiguity_state',r.ambiguity_state) FROM review_requests r JOIN attempts a ON a.id=r.attempt_id WHERE a.task_id=?1 ORDER BY r.created_at", &id)?;
         task.snapshots = json_rows(&connection, "SELECT json_object('id',s.id,'attempt_id',s.attempt_id,'kind',s.kind,'manifest_hash',s.manifest_hash,'manifest',json(s.manifest_json),'complete',s.complete,'created_at',s.created_at,'original_base',s.original_base,'candidate_head',s.candidate_head,'source_role_generation_id',s.source_role_generation_id,'source_settings_revision',s.source_settings_revision,'workspace_id',s.workspace_id,'workspace_hash',s.workspace_hash) FROM snapshots s JOIN attempts a ON a.id=s.attempt_id WHERE a.task_id=?1 ORDER BY s.created_at", &id)?;
         for snapshot in &mut task.snapshots {
@@ -5941,7 +5958,10 @@ pub fn state(store: &Store) -> Result<AppStateDto> {
         }
     }
     let history=json_rows_no_param(&connection,"SELECT json_object('id',id,'operation_id',operation_id,'actor_kind',actor_kind,'actor_id',actor_id,'event_code',event_code,'entity_kind',entity_kind,'entity_id',entity_id,'old_version',old_version,'new_version',new_version,'detail',json(detail_json),'created_at',created_at) FROM audit_events WHERE event_code IN ('session.resume.rejected','session.resume.fresh_route.reserved') OR rowid IN (SELECT rowid FROM audit_events ORDER BY created_at DESC LIMIT 500) ORDER BY created_at DESC")?;
-    let process_observations = resource_observations(&connection)?;
+    let process_observations = match process_sample {
+        Some((recorded, sample)) => resource_observations(&connection, recorded, sample)?,
+        None => Vec::new(),
+    };
     let capacity = capacity_status(&connection)?;
     let instance_settings: (i64, bool, String) = connection.query_row(
         "SELECT version,auto_resume_eligible,updated_at FROM instance_settings WHERE singleton=1",
@@ -11262,33 +11282,53 @@ fn capacity_status(connection: &rusqlite::Connection) -> Result<serde_json::Valu
     }))
 }
 
-fn resource_observations(connection: &rusqlite::Connection) -> Result<Vec<serde_json::Value>> {
-    let recorded = {
-        let mut statement=connection.prepare("SELECT sp.session_id,sp.pid,sp.native_start_marker,sp.last_seen_at FROM session_processes sp JOIN sessions s ON s.id=sp.session_id WHERE s.status NOT IN ('exited','launch_failed') ORDER BY sp.session_id,sp.last_seen_at DESC")?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)? as u32,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows
-    };
-    if recorded.is_empty() {
-        return Ok(Vec::new());
-    }
+#[derive(PartialEq, Eq, Hash)]
+struct ResourceProcessKey {
+    session_id: String,
+    pid: u32,
+    start: String,
+    transcript_epoch: String,
+}
+
+fn recorded_resource_processes(
+    connection: &Connection,
+) -> Result<Vec<(ResourceProcessKey, String)>> {
+    let mut statement = connection.prepare(
+        "SELECT sp.session_id,sp.pid,sp.native_start_marker,s.transcript_epoch,sp.last_seen_at
+         FROM session_processes sp JOIN sessions s ON s.id=sp.session_id
+         WHERE s.status NOT IN ('exited','launch_failed')
+         ORDER BY sp.session_id,sp.last_seen_at DESC",
+    )?;
+    let recorded = statement
+        .query_map([], |row| {
+            Ok((
+                ResourceProcessKey {
+                    session_id: row.get(0)?,
+                    pid: row.get::<_, i64>(1)? as u32,
+                    start: row.get(2)?,
+                    transcript_epoch: row.get(3)?,
+                },
+                row.get(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(recorded)
+}
+
+struct ResourceProcessSample {
+    live: std::collections::HashMap<u32, (u64, f64, String)>,
+    observed_at: String,
+}
+
+fn sample_process_resources() -> Option<ResourceProcessSample> {
     let output = std::process::Command::new("/bin/ps")
         .args(["-axo", "pid=,rss=,%cpu=,lstart="])
-        .output();
-    let Ok(output) = output else {
-        return Ok(recorded.into_iter().map(|(session,pid,_,last)|serde_json::json!({"session_id":session,"pid":pid,"state":"unavailable","last_identity_observed_at":last})).collect());
-    };
+        .output()
+        .ok()?;
     if !output.status.success() {
-        return Ok(recorded.into_iter().map(|(session,pid,_,last)|serde_json::json!({"session_id":session,"pid":pid,"state":"unavailable","last_identity_observed_at":last})).collect());
+        return None;
     }
+    let observed_at = Utc::now().to_rfc3339();
     let mut live = std::collections::HashMap::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let fields = line.split_whitespace().collect::<Vec<_>>();
@@ -11303,7 +11343,90 @@ fn resource_observations(connection: &rusqlite::Connection) -> Result<Vec<serde_
             live.insert(pid, (rss, cpu, fields[3..8].join(" ")));
         }
     }
-    Ok(recorded.into_iter().map(|(session,pid,start,last)|match live.get(&pid){Some((rss,cpu,observed))if crate::domain::same_process_start(observed,&start)=>serde_json::json!({"session_id":session,"pid":pid,"native_start_marker":start,"state":"observed","rss_bytes":rss*1024,"cpu_percent":cpu,"observed_at":Utc::now().to_rfc3339()}),Some(_)=>serde_json::json!({"session_id":session,"pid":pid,"native_start_marker":start,"state":"stale_pid_reused","last_identity_observed_at":last}),None=>serde_json::json!({"session_id":session,"pid":pid,"native_start_marker":start,"state":"stale_absent","last_identity_observed_at":last})}).collect())
+    Some(ResourceProcessSample { live, observed_at })
+}
+
+fn resource_observations(
+    connection: &Connection,
+    sampled_keys: HashSet<ResourceProcessKey>,
+    sample: Option<ResourceProcessSample>,
+) -> Result<Vec<serde_json::Value>> {
+    Ok(recorded_resource_processes(connection)?
+        .into_iter()
+        // A PID alone cannot transfer the sample to a new recording or invocation.
+        .filter(|(key, _)| sampled_keys.contains(key))
+        .map(|(key, last)| {
+            let ResourceProcessKey { session_id, pid, start, .. } = key;
+            let Some(sample) = &sample else {
+                return serde_json::json!({
+                    "session_id":session_id,"pid":pid,"state":"unavailable","last_identity_observed_at":last
+                });
+            };
+            let state = match sample.live.get(&pid) {
+                Some((rss, cpu, observed)) if crate::domain::same_process_start(observed, &start) => {
+                    return serde_json::json!({
+                        "session_id":session_id,"pid":pid,"native_start_marker":start,
+                        "state":"observed","rss_bytes":rss*1024,"cpu_percent":cpu,"observed_at":sample.observed_at
+                    });
+                }
+                Some(_) => "stale_pid_reused",
+                None => "stale_absent",
+            };
+            serde_json::json!({
+                "session_id":session_id,"pid":pid,"native_start_marker":start,
+                "state":state,"last_identity_observed_at":last
+            })
+        })
+        .collect())
+}
+
+#[cfg(test)]
+#[test]
+fn resource_observations_only_attribute_to_current_sampled_process_keys() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, status TEXT, transcript_epoch TEXT);
+             CREATE TABLE session_processes (
+                session_id TEXT, pid INTEGER, native_start_marker TEXT, last_seen_at TEXT,
+                PRIMARY KEY (session_id,pid,native_start_marker)
+             );
+             INSERT INTO sessions VALUES
+                ('current','running','first'),('resumed','running','first'),('ended','running','first');
+             INSERT INTO session_processes VALUES
+                ('current',1,'start','before'),('resumed',2,'start','before'),('ended',3,'start','before');",
+        )
+        .unwrap();
+    let sampled_keys = recorded_resource_processes(&connection)
+        .unwrap()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    let sample = ResourceProcessSample {
+        live: [
+            (1, (8, 1.5, "start".into())),
+            (2, (8, 1.5, "start".into())),
+            (3, (8, 1.5, "start".into())),
+            (4, (8, 1.5, "new".into())),
+        ]
+        .into(),
+        observed_at: "sampled".into(),
+    };
+    connection
+        .execute_batch(
+            "UPDATE sessions SET transcript_epoch='second' WHERE id='resumed';
+             UPDATE sessions SET status='exited' WHERE id='ended';
+             INSERT INTO session_processes VALUES ('current',4,'new','after');
+             UPDATE session_processes SET last_seen_at='after' WHERE pid=1;",
+        )
+        .unwrap();
+    assert_eq!(
+        resource_observations(&connection, sampled_keys, Some(sample)).unwrap(),
+        vec![serde_json::json!({
+            "session_id":"current","pid":1,"native_start_marker":"start","state":"observed",
+            "rss_bytes":8192,"cpu_percent":1.5,"observed_at":"sampled"
+        })],
+    );
 }
 
 pub(crate) fn insert_task_rows(

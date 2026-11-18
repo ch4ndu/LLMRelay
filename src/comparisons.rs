@@ -35,6 +35,14 @@ struct Boundary {
     conflicted: bool,
 }
 
+struct TaskTimingSummary {
+    state: ComparisonTimingState,
+    first_covered: bool,
+    first_start: Option<DateTime<FixedOffset>>,
+    elapsed: Option<i64>,
+    reason: Option<&'static str>,
+}
+
 pub fn task_timing(store: &Store, task_id: &str) -> Result<ComparisonTaskTiming> {
     crate::providers::codex_app_server::bounded(task_id, 128, "task ID")?;
     let mut connection = store.lock()?;
@@ -71,32 +79,52 @@ fn task_timing_in(connection: &Connection, task_id: &str) -> Result<ComparisonTa
         .iter()
         .map(|(id, _)| run_timing_in(connection, id))
         .collect::<Result<Vec<_>>>()?;
-    let acceptances: Vec<_> = attempts
-        .iter()
-        .filter_map(|(_, accepted)| accepted.as_deref())
-        .collect();
-    let acceptance = if acceptances.len() == 1 {
-        Some(acceptances[0])
+    let acceptance = exact_acceptance(attempts.iter().filter_map(|(_, at)| at.as_deref()));
+    let summary = summarize_task_timing(lifecycle, acceptance, runs.iter());
+    Ok(ComparisonTaskTiming {
+        task_id: task_id.into(),
+        state_revision: revision,
+        state: summary.state,
+        first_start_coverage_complete: summary.first_covered,
+        earliest_known_observed_start: summary.first_start.map(|stamp| stamp.to_rfc3339()),
+        human_acceptance_at: acceptance.map(str::to_owned),
+        elapsed_to_acceptance_millis: summary.elapsed,
+        unavailable_reason: summary.reason.map(str::to_owned),
+        runs,
+    })
+}
+
+fn exact_acceptance<'a>(mut accepted: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let first = accepted.next();
+    if accepted.next().is_none() {
+        first
     } else {
         None
-    };
+    }
+}
+
+fn summarize_task_timing<'a>(
+    lifecycle: TaskLifecycle,
+    acceptance: Option<&str>,
+    runs: impl ExactSizeIterator<Item = &'a ComparisonRunTiming> + Clone,
+) -> TaskTimingSummary {
     let first_start = runs
-        .iter()
+        .clone()
         .flat_map(|run| &run.invocations)
         .filter_map(|invocation| invocation.observed_start.as_deref().and_then(timestamp))
         .min();
-    let first_covered =
-        !runs.is_empty() && runs.iter().all(|run| run.first_start_coverage_complete);
+    let has_runs = runs.len() != 0;
+    let first_covered = has_runs && runs.clone().all(|run| run.first_start_coverage_complete);
     let lifecycle_timing = match lifecycle {
         TaskLifecycle::Backlog
         | TaskLifecycle::Ready
         | TaskLifecycle::InProgress
         | TaskLifecycle::Validation
         | TaskLifecycle::AwaitingReview => Some((
-            if runs.is_empty() {
-                ComparisonTimingState::NeverExecuted
-            } else {
+            if has_runs {
                 ComparisonTimingState::Ongoing
+            } else {
+                ComparisonTimingState::NeverExecuted
             },
             None,
             Some("no_human_acceptance"),
@@ -116,7 +144,7 @@ fn task_timing_in(connection: &Connection, task_id: &str) -> Result<ComparisonTa
             None,
             Some("incomplete_first_execution_coverage"),
         )
-    } else if acceptances.len() != 1 {
+    } else if acceptance.is_none() {
         (
             ComparisonTimingState::Unavailable,
             None,
@@ -127,7 +155,6 @@ fn task_timing_in(connection: &Connection, task_id: &str) -> Result<ComparisonTa
             Some((start, end))
                 if end >= start
                     && runs
-                        .iter()
                         .flat_map(|run| &run.invocations)
                         .filter_map(|invocation| {
                             invocation.observed_start.as_deref().and_then(timestamp)
@@ -147,17 +174,13 @@ fn task_timing_in(connection: &Connection, task_id: &str) -> Result<ComparisonTa
             ),
         }
     };
-    Ok(ComparisonTaskTiming {
-        task_id: task_id.into(),
-        state_revision: revision,
+    TaskTimingSummary {
         state,
-        first_start_coverage_complete: first_covered,
-        earliest_known_observed_start: first_start.map(|stamp| stamp.to_rfc3339()),
-        human_acceptance_at: acceptance.map(str::to_owned),
-        elapsed_to_acceptance_millis: elapsed,
-        unavailable_reason: reason.map(str::to_owned),
-        runs,
-    })
+        first_covered,
+        first_start,
+        elapsed,
+        reason,
+    }
 }
 
 fn run_timing_in(connection: &Connection, attempt: &str) -> Result<ComparisonRunTiming> {
@@ -455,6 +478,38 @@ struct ComparisonUnit<'a> {
     group: String,
 }
 
+struct ComparisonReads<'a> {
+    connection: &'a Connection,
+    timings: BTreeMap<String, ComparisonRunTiming>,
+    usage_ownership_checked: bool,
+}
+
+impl<'a> ComparisonReads<'a> {
+    fn new(transaction: &'a rusqlite::Transaction<'_>) -> Self {
+        Self {
+            connection: transaction,
+            timings: BTreeMap::new(),
+            usage_ownership_checked: false,
+        }
+    }
+
+    fn timing(&mut self, attempt: &str) -> Result<&ComparisonRunTiming> {
+        use std::collections::btree_map::Entry;
+        Ok(match self.timings.entry(attempt.to_owned()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(run_timing_in(self.connection, attempt)?),
+        })
+    }
+
+    fn usage(&mut self, scopes: &[(String, String)]) -> Result<crate::domain::ObservedUsage> {
+        crate::workflow::comparison_observed_usage(
+            self.connection,
+            scopes,
+            &mut self.usage_ownership_checked,
+        )
+    }
+}
+
 fn normalize_query(query: &mut WorkflowComparisonQuery) -> Result<()> {
     for value in [
         &mut query.project_id,
@@ -527,13 +582,15 @@ fn read_position(
 
 fn read_tasks(connection: &Connection) -> Result<Vec<ComparisonTask>> {
     let mut statement = connection.prepare(
-        "SELECT t.id,t.project_id,t.created_at,t.lifecycle,t.archived_at IS NOT NULL
+        "SELECT t.id,t.project_id,t.created_at,t.lifecycle,t.archived_at IS NOT NULL,
+                t.id IN (SELECT task_id FROM attempts),
+                EXISTS(SELECT 1 FROM task_recipe_bindings b WHERE b.task_id=t.id)
          FROM tasks t JOIN projects p ON p.id=t.project_id
          WHERE p.internal_purpose IS NULL ORDER BY t.id",
     )?;
-    let mut tasks = statement
+    let rows = statement
         .query_map([], |row| {
-            Ok(ComparisonTask {
+            let task = ComparisonTask {
                 id: row.get(0)?,
                 project: row.get(1)?,
                 created_at: row.get(2)?,
@@ -541,18 +598,26 @@ fn read_tasks(connection: &Connection) -> Result<Vec<ComparisonTask>> {
                 archived: row.get(4)?,
                 runs: Vec::new(),
                 recipe_attribution: None,
-            })
+            };
+            Ok((task, row.get::<_, bool>(5)?, row.get::<_, bool>(6)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for task in &mut tasks {
-        task.recipe_attribution = read_recipe_attribution(connection, &task.id, None)?;
-        let mut statement = connection.prepare(
-            "SELECT a.id,a.created_at,a.status,a.human_acceptance_at,b.family,b.definition_id,
-                    a.candidate_hash,a.selected_checks_revision,a.workflow_version
-             FROM attempts a LEFT JOIN workflow_run_bindings b ON b.attempt_id=a.id
-             WHERE a.task_id=?1 ORDER BY a.created_at,a.id",
-        )?;
-        task.runs = statement
+    let mut tasks = Vec::with_capacity(rows.len());
+    let mut attempts = connection.prepare(
+        "SELECT a.id,a.created_at,a.status,a.human_acceptance_at,b.family,b.definition_id,
+                a.candidate_hash,a.selected_checks_revision,a.workflow_version
+         FROM attempts a LEFT JOIN workflow_run_bindings b ON b.attempt_id=a.id
+         WHERE a.task_id=?1 ORDER BY a.created_at,a.id",
+    )?;
+    for (mut task, has_attempts, has_recipe) in rows {
+        if has_recipe {
+            task.recipe_attribution = read_recipe_attribution(connection, &task.id, None)?;
+        }
+        if !has_attempts {
+            tasks.push(task);
+            continue;
+        }
+        task.runs = attempts
             .query_map([&task.id], |row| {
                 Ok(ComparisonRun {
                     id: row.get(0)?,
@@ -575,7 +640,10 @@ fn read_tasks(connection: &Connection) -> Result<Vec<ComparisonTask>> {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for run in &mut task.runs {
-            run.recipe_attribution = read_recipe_attribution(connection, &task.id, Some(&run.id))?;
+            if has_recipe {
+                run.recipe_attribution =
+                    read_recipe_attribution(connection, &task.id, Some(&run.id))?;
+            }
             if run.workflow.as_deref() == Some("single_agent") {
                 run.preset = crate::workflow::run_preset(connection, &run.id)
                     .ok()
@@ -586,6 +654,7 @@ fn read_tasks(connection: &Connection) -> Result<Vec<ComparisonTask>> {
             run.executions =
                 read_executions(connection, &run.id, run.workflow.as_deref() == Some("trip"))?;
         }
+        tasks.push(task);
     }
     Ok(tasks)
 }
@@ -1051,10 +1120,11 @@ fn unit_outcome(unit: &ComparisonUnit<'_>, cohort: ComparisonCohort) -> &'static
 }
 
 fn unit_facts(
-    connection: &Connection,
+    reads: &mut ComparisonReads<'_>,
     unit: &ComparisonUnit<'_>,
     query: &WorkflowComparisonQuery,
 ) -> Result<Vec<ComparisonEvidenceRow>> {
+    let connection = reads.connection;
     let mut facts = vec![evidence_row(
         unit,
         None,
@@ -1070,7 +1140,28 @@ fn unit_facts(
         },
     )];
     if query.cohort == ComparisonCohort::Task {
-        let timing = task_timing_in(connection, &unit.task.id)?;
+        let lifecycle =
+            serde_json::from_value(serde_json::Value::String(unit.task.lifecycle.clone()))
+                .context("parse comparison task lifecycle")?;
+        let acceptance = exact_acceptance(
+            unit.runs
+                .iter()
+                .filter_map(|run| run.accepted_at.as_deref()),
+        );
+        for run in &unit.runs {
+            reads.timing(&run.id)?;
+        }
+        let runs = unit
+            .runs
+            .iter()
+            .map(|run| {
+                reads
+                    .timings
+                    .get(&run.id)
+                    .context("comparison timing was not loaded")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let timing = summarize_task_timing(lifecycle, acceptance, runs.into_iter());
         facts.push(evidence_row(
             unit,
             None,
@@ -1078,9 +1169,9 @@ fn unit_facts(
             None,
             ComparisonEvidenceFact::TaskTiming {
                 state: timing.state,
-                elapsed_millis: timing.elapsed_to_acceptance_millis,
-                first_start_coverage_complete: timing.first_start_coverage_complete,
-                reason: timing.unavailable_reason,
+                elapsed_millis: timing.elapsed,
+                first_start_coverage_complete: timing.first_covered,
+                reason: timing.reason.map(str::to_owned),
             },
         ));
     }
@@ -1114,10 +1205,7 @@ fn unit_facts(
         ));
         boundary_facts(connection, unit, run, &mut facts)?;
         for execution in &run.executions {
-            let usage = crate::workflow::comparison_observed_usage(
-                connection,
-                &[(execution.session.clone(), execution.epoch.clone())],
-            )?;
+            let usage = reads.usage(&[(execution.session.clone(), execution.epoch.clone())])?;
             facts.push(evidence_row(
                 unit,
                 Some(run),
@@ -1134,20 +1222,8 @@ fn unit_facts(
                 },
             ));
         }
-        for invocation in run_timing_in(connection, &run.id)?.invocations {
-            facts.push(evidence_row(
-                unit,
-                Some(run),
-                format!(
-                    "timing:{}:{}",
-                    invocation.session_id,
-                    invocation.transcript_epoch.as_deref().unwrap_or("unknown")
-                ),
-                None,
-                ComparisonEvidenceFact::Timing { invocation },
-            ));
-        }
-        decision_facts(connection, unit, run, &mut facts)?;
+        reads.timing(&run.id)?;
+        decision_facts(reads, unit, run, &mut facts)?;
         recovery_facts(connection, unit, run, &mut facts)?;
         check_facts(connection, unit, run, &mut facts)?;
     }
@@ -1157,11 +1233,12 @@ fn unit_facts(
 }
 
 fn decision_facts(
-    connection: &Connection,
+    reads: &mut ComparisonReads<'_>,
     unit: &ComparisonUnit<'_>,
     run: &ComparisonRun,
     facts: &mut Vec<ComparisonEvidenceRow>,
 ) -> Result<()> {
+    let connection = reads.connection;
     let mut statement = connection.prepare(
         "SELECT ac.id,ac.child_attempt_id,ac.id FROM workflow_result_acceptances ac
          JOIN workflow_result_bindings b ON b.id=ac.result_binding_id
@@ -1272,7 +1349,7 @@ fn decision_facts(
                 params![run.id, id], |row| row.get(0),
             ).optional()?;
             if let Some(authorized_at) = applied.or(final_receipt).or(consumed_at) {
-                let started = repair_start(connection, &run.id, &authorized_at, Some(&id))?;
+                let started = repair_start(reads, &run.id, &authorized_at, Some(&id))?;
                 facts.push(evidence_row(unit, Some(run), format!("repair:{id}"), None,
                     ComparisonEvidenceFact::Repair {
                         authorization_id: id.clone(), originating_decision_id: id,
@@ -1308,7 +1385,7 @@ fn decision_facts(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (decision, child, created) in repairs {
-        let started = repair_start(connection, &child, &created, None)?;
+        let started = repair_start(reads, &child, &created, None)?;
         facts.push(evidence_row(
             unit,
             Some(run),
@@ -1328,7 +1405,7 @@ fn decision_facts(
 }
 
 fn repair_start(
-    connection: &Connection,
+    reads: &mut ComparisonReads<'_>,
     attempt: &str,
     authorized_at: &str,
     decision: Option<&str>,
@@ -1336,7 +1413,9 @@ fn repair_start(
     let Some(authorized) = timestamp(authorized_at) else {
         return Ok(None);
     };
-    let mut invocations = run_timing_in(connection, attempt)?.invocations;
+    let connection = reads.connection;
+    let timing = reads.timing(attempt)?;
+    let mut invocations: Vec<_> = timing.invocations.iter().collect();
     invocations.sort_by(|a, b| a.observed_start.cmp(&b.observed_start));
     for invocation in invocations {
         let Some(start) = invocation.observed_start.as_deref().and_then(timestamp) else {
@@ -1360,7 +1439,7 @@ fn repair_start(
             params![invocation.session_id,attempt,decision,invocation.observed_start,authorized_at],|row|row.get(0),
         )?;
         if linked {
-            return Ok(Some(invocation.session_id));
+            return Ok(Some(invocation.session_id.clone()));
         }
     }
     Ok(None)
@@ -1717,7 +1796,7 @@ fn add_duration(
 }
 
 fn group_projection(
-    connection: &Connection,
+    reads: &mut ComparisonReads<'_>,
     units: &[&ComparisonUnit<'_>],
     query: &WorkflowComparisonQuery,
 ) -> Result<WorkflowComparisonGroup> {
@@ -1752,7 +1831,7 @@ fn group_projection(
             _ => group.counts.incomplete += 1,
         }
         for run in &unit.runs {
-            let timing = run_timing_in(connection, &run.id)?;
+            let timing = reads.timing(&run.id)?;
             add_duration(
                 &mut group.observed_execution_intervals,
                 timing.complete_observed_interval_millis,
@@ -1768,7 +1847,7 @@ fn group_projection(
             group.counts.ongoing_execution_epochs += timing.ongoing_epochs;
             group.counts.never_executed_epochs += timing.never_executed_epochs;
         }
-        for row in unit_facts(connection, unit, query)? {
+        for row in unit_facts(reads, unit, query)? {
             match row.fact {
                 ComparisonEvidenceFact::TaskTiming {
                     state,
@@ -1873,14 +1952,14 @@ fn group_projection(
             .filter(|(id, _)| id == session)
             .cloned()
             .collect();
-        let usage = crate::workflow::comparison_observed_usage(connection, &scopes)?;
+        let usage = reads.usage(&scopes)?;
         if usage.observed_responses.is_some_and(|count| count > 0) {
             group.counts.sessions_with_usage += 1;
         } else {
             group.counts.sessions_without_usage += 1;
         }
     }
-    group.usage = crate::workflow::comparison_observed_usage(connection, &sessions)?;
+    group.usage = reads.usage(&sessions)?;
     if group.usage.status == ObservedUsageStatus::Observed
         && group.counts.sessions_without_usage > 0
     {
@@ -1924,6 +2003,7 @@ pub fn workflow_comparisons(
         wait_scope:"Recorded recovery intervals only; this does not account for all human, queue or other wait time.".into(),
         snapshot,next_cursor:None,
     };
+    let mut reads = ComparisonReads::new(&transaction);
     for (key, bucket) in buckets {
         if last.first().is_some_and(|last| &key <= last) {
             continue;
@@ -1931,7 +2011,7 @@ pub fn workflow_comparisons(
         if page.groups.len() == COMPARISON_PAGE_ROWS {
             break;
         }
-        let group = group_projection(&transaction, &bucket, &query)?;
+        let group = group_projection(&mut reads, &bucket, &query)?;
         let count = group.counts.units;
         let previous = page.next_cursor.clone();
         page.next_cursor = Some(bounded_cursor(incarnation, revision, &filters, vec![key])?);
@@ -2052,15 +2132,18 @@ pub fn comparison_evidence(
     }
     let tasks = read_tasks(&transaction)?;
     let units = select_units(&tasks, &query)?;
+    let mut selected = units
+        .iter()
+        .filter(|unit| unit.group == request.group)
+        .peekable();
+    if selected.peek().is_none() {
+        bail!("This group is no longer part of the applied comparison. Apply again.");
+    }
+    let mut reads = ComparisonReads::new(&transaction);
     let mut rows = Vec::new();
-    let mut group_exists = false;
-    for unit in &units {
-        if unit.group != request.group {
-            continue;
-        }
-        group_exists = true;
+    for unit in selected.clone() {
         rows.extend(
-            unit_facts(&transaction, unit, &query)?
+            unit_facts(&mut reads, unit, &query)?
                 .into_iter()
                 .filter(|row| {
                     request.metric == ComparisonEvidenceMetric::All
@@ -2068,9 +2151,39 @@ pub fn comparison_evidence(
                 }),
         );
     }
-    if !group_exists {
-        bail!("This group is no longer part of the applied comparison. Apply again.");
+    // Repair facts can use another run's timing, so move invocations into
+    // response rows only after projecting repairs for every selected unit.
+    if matches!(
+        request.metric,
+        ComparisonEvidenceMetric::All | ComparisonEvidenceMetric::Timing
+    ) {
+        for unit in selected {
+            let mut invocation_rows = Vec::new();
+            for run in &unit.runs {
+                let timing = reads
+                    .timings
+                    .remove(&run.id)
+                    .context("comparison timing was not loaded")?;
+                for invocation in timing.invocations {
+                    invocation_rows.push(evidence_row(
+                        unit,
+                        Some(run),
+                        format!(
+                            "timing:{}:{}",
+                            invocation.session_id,
+                            invocation.transcript_epoch.as_deref().unwrap_or("unknown")
+                        ),
+                        None,
+                        ComparisonEvidenceFact::Timing { invocation },
+                    ));
+                }
+            }
+            invocation_rows.sort_by(|a, b| a.key.cmp(&b.key));
+            invocation_rows.dedup_by(|a, b| a.key == b.key);
+            rows.extend(invocation_rows);
+        }
     }
+    drop(reads);
     rows.sort_by(|a, b| a.key.cmp(&b.key));
     let total_rows = rows.len();
     let mut page = ComparisonEvidencePage {
@@ -2750,9 +2863,40 @@ mod comparison_query_tests {
             comparison_evidence(&store, request(page.snapshot, &query)?, "instance").unwrap_err();
         assert!(error.to_string().contains("Apply again"));
         let fresh = workflow_comparisons(&store, query.clone(), "instance")?;
-        let evidence = comparison_evidence(&store, request(fresh.snapshot, &query)?, "instance")?;
+        let fresh_request = request(fresh.snapshot, &query)?;
+        let evidence = comparison_evidence(&store, fresh_request.clone(), "instance")?;
         assert!(evidence.rows.iter().any(|row|matches!(&row.fact,ComparisonEvidenceFact::Boundary {boundary_id,..} if boundary_id=="start")));
+        assert!(evidence.rows.iter().any(|row| matches!(
+            &row.fact,
+            ComparisonEvidenceFact::Repair { started_session_id, .. }
+                if started_session_id.as_deref() == Some("s1")
+        )));
         assert_eq!(fresh.groups[0].counts.repairs_started, 1);
+        for metric in [
+            ComparisonEvidenceMetric::Outcome,
+            ComparisonEvidenceMetric::Repair,
+            ComparisonEvidenceMetric::Timing,
+        ] {
+            let filtered = comparison_evidence(
+                &store,
+                ComparisonEvidenceQuery {
+                    metric,
+                    ..fresh_request.clone()
+                },
+                "instance",
+            )?;
+            let expected: Vec<_> = evidence
+                .rows
+                .iter()
+                .filter(|row| fact_metric(&row.fact) == metric)
+                .collect();
+            assert!(!expected.is_empty());
+            assert_eq!(filtered.total_rows, expected.len());
+            assert_eq!(
+                serde_json::to_value(&filtered.rows)?,
+                serde_json::to_value(expected)?
+            );
+        }
         let cursor = bounded_cursor(
             "instance",
             read_state_revision(&*store.lock()?)?,

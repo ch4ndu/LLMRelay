@@ -407,6 +407,7 @@ pub fn prepare_role_launch_with_bundles(
         &[],
         None,
         bundles,
+        None,
     )
 }
 
@@ -444,6 +445,7 @@ pub fn prepare_role_launch_with_read_denials(
         read_denials,
         None,
         &crate::provider_compatibility::BundleSet::embedded(),
+        None,
     )
 }
 
@@ -483,6 +485,7 @@ pub fn prepare_role_launch_with_read_denials_and_bundles(
         read_denials,
         None,
         bundles,
+        None,
     )
 }
 
@@ -520,6 +523,7 @@ pub fn prepare_runtime_probe_role_launch(
         &[],
         Some(policy),
         &crate::provider_compatibility::BundleSet::embedded(),
+        None,
     )
 }
 
@@ -559,6 +563,7 @@ pub fn prepare_runtime_probe_role_launch_with_bundles(
         &[],
         Some(policy),
         bundles,
+        None,
     )
 }
 
@@ -1371,7 +1376,7 @@ fn single_agent_channel_instructions(executable: &Path, socket: &Path) -> String
     )
 }
 
-fn prepare_role_launch_with_policies(
+pub(crate) fn prepare_role_launch_with_policies(
     provider: Provider,
     role: RoleKind,
     model: &str,
@@ -1388,6 +1393,7 @@ fn prepare_role_launch_with_policies(
     read_denials: &[PathBuf],
     runtime_probe_policy: Option<&RuntimeProbeCommandPolicy>,
     bundles: &crate::provider_compatibility::BundleSet,
+    observed_executable: Option<(&Path, &str)>,
 ) -> Result<PreparedLaunch> {
     if !read_denials.is_empty() {
         let role_executable = executable_path
@@ -1419,6 +1425,7 @@ fn prepare_role_launch_with_policies(
             executable_path,
             read_denials,
             bundles,
+            observed_executable,
         ),
         Provider::Claude => claude::prepare_with_bundles(
             role,
@@ -1436,6 +1443,7 @@ fn prepare_role_launch_with_policies(
             read_denials,
             runtime_probe_policy,
             bundles,
+            observed_executable,
         ),
     }
 }
@@ -1769,6 +1777,12 @@ fn normalize_path_ending(value: &mut String, suffix: &str, replacement: &str) {
 }
 
 pub fn executable_and_version(provider: Provider) -> Result<(PathBuf, String)> {
+    let path = locate_provider_executable(provider)?;
+    let version = provider_executable_version(provider, &path)?;
+    Ok((path, version))
+}
+
+fn locate_provider_executable(provider: Provider) -> Result<PathBuf> {
     let name = match provider {
         Provider::Codex => "codex",
         Provider::Claude => "claude",
@@ -1781,8 +1795,11 @@ pub fn executable_and_version(provider: Provider) -> Result<(PathBuf, String)> {
     if !located.success() {
         bail!("{name} executable was not found on PATH")
     }
-    let path = PathBuf::from(String::from_utf8(path_output)?.trim());
-    let mut version_command = Command::new(&path);
+    Ok(PathBuf::from(String::from_utf8(path_output)?.trim()))
+}
+
+pub(crate) fn provider_executable_version(provider: Provider, path: &Path) -> Result<String> {
+    let mut version_command = Command::new(path);
     version_command.arg("--version");
     if provider == Provider::Claude {
         version_command
@@ -1801,7 +1818,7 @@ pub fn executable_and_version(provider: Provider) -> Result<(PathBuf, String)> {
     if version.is_empty() {
         bail!("{} returned an empty version", path.display())
     }
-    Ok((path, version))
+    Ok(version)
 }
 
 const INSPECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);

@@ -1,5 +1,5 @@
 import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type RefObject, useEffect, useMemo, useRef, useState } from "react";
 import {
   ApiError,
   command,
@@ -7,6 +7,7 @@ import {
   reuseOperationIdentity,
 } from "../api";
 import { withStorageLock } from "../storageCoordination";
+import { useDialogFocus } from "../useDialogFocus";
 import {
   type AppState,
   type PermissionNativeResolution,
@@ -236,6 +237,7 @@ export function ApprovalInbox(
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const inbox = useRef<HTMLElement>(null);
   const mountLifetime = useRef(new AbortController());
   useEffect(() => {
     const controller = new AbortController();
@@ -448,6 +450,7 @@ export function ApprovalInbox(
   return (
     <section
       className="panel approval-inbox"
+      ref={inbox}
       id="workspace-approvals"
       aria-labelledby="approvals-title"
       tabIndex={-1}
@@ -634,6 +637,7 @@ export function ApprovalInbox(
           scope={scope}
           preview={selectedPreview}
           busy={busy === preview.id}
+          restoreFallback={inbox}
           onScope={setScope}
           onCancel={() => setPreview(undefined)}
           onConfirm={() => decide(preview, "always_approve", scope)}
@@ -867,16 +871,20 @@ const nativeResolutionLabel: Record<
 };
 
 function ScopeDialog(
-  { request, scope, preview, busy, onScope, onCancel, onConfirm }: {
+  { request, scope, preview, busy, restoreFallback, onScope, onCancel, onConfirm }: {
     request: PermissionRequest;
     scope: Scope;
     preview: PermissionScopePreview;
     busy: boolean;
+    restoreFallback: RefObject<HTMLElement | null>;
     onScope: (scope: Scope) => void;
     onCancel: () => void;
     onConfirm: () => void;
   },
 ) {
+  const dialog = useRef<HTMLElement>(null);
+  const lifetime = useRef<HTMLSelectElement>(null);
+  const trapTab = useDialogFocus(dialog, lifetime, onCancel, undefined, restoreFallback);
   const [sample, setSample] = useState(request.command_display || "");
   const [coverage, setCoverage] = useState<
     import("../types").PermissionCoveragePreview
@@ -927,6 +935,9 @@ function ScopeDialog(
         role="dialog"
         aria-modal="true"
         aria-labelledby="permission-preview-title"
+        ref={dialog}
+        tabIndex={-1}
+        onKeyDown={trapTab}
       >
         <header>
           <h2 id="permission-preview-title">Always approve matching actions</h2>
@@ -934,6 +945,7 @@ function ScopeDialog(
         <label>
           Lifetime
           <select
+            ref={lifetime}
             aria-label="Always approval lifetime"
             value={scope}
             onChange={(event) => onScope(event.target.value as Scope)}

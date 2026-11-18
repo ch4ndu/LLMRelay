@@ -350,21 +350,23 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
               current.effort === saved.effort;
           }),
         ));
-        if (entry.body.kind === "upsert_task_recipe") setRecipe((draft) => apply(
-          draft, entry.body.recipe_id,
-          draft.name === entry.body.name && draft.title === entry.body.title &&
-            draft.description === entry.body.description && draft.priority === entry.body.priority &&
-            draft.profileRevisionId === entry.body.profile_revision_id &&
-            JSON.stringify(draft.criteria.split("\n").map((text) => text.trim()).filter(Boolean)) ===
-              JSON.stringify(entry.body.acceptance_criteria) &&
-            JSON.stringify(draft.checkIds) === JSON.stringify(entry.body.required_check_ids),
-        ));
+        if (entry.body.kind === "upsert_task_recipe") setRecipe((draft) =>
+          draft.family === "single_agent" ? draft : apply(
+            draft, entry.body.recipe_id,
+            draft.name === entry.body.name && draft.title === entry.body.title &&
+              draft.description === entry.body.description && draft.priority === entry.body.priority &&
+              draft.profileRevisionId === entry.body.profile_revision_id &&
+              JSON.stringify(draft.criteria.split("\n").map((text) => text.trim()).filter(Boolean)) ===
+                JSON.stringify(entry.body.acceptance_criteria) &&
+              JSON.stringify(draft.checkIds) === JSON.stringify(entry.body.required_check_ids),
+          ));
         if (entry.body.kind === "upsert_single_agent_recipe") setRecipe((draft) => {
+          if (draft.family !== "single_agent") return draft;
           const saved = entry.body.recipe as Record<string, unknown>;
           const selection = saved.selection as Record<string, unknown>;
           const current = draft.selection;
           return apply(draft, entry.body.recipe_id,
-            draft.family === "single_agent" && draft.name === saved.name &&
+            draft.name === saved.name &&
             draft.title === saved.title && draft.description === saved.description &&
             draft.priority === saved.priority &&
             JSON.stringify(draft.criteria.split("\n").map((text) => text.trim()).filter(Boolean)) === JSON.stringify(saved.acceptance_criteria) &&
@@ -476,7 +478,11 @@ export function Recipes({ state, project, onChanged, onOpenTask }: {
       typeof result.version === "number"
     ) {
       const { entity_id: id, version } = result;
-      setRecipe((draft) => ({ ...draft, id, version }));
+      setRecipe((draft) =>
+        draft.family === recipe.family && draft.id === recipe.id && draft.version === recipe.version
+          ? { ...draft, id, version }
+          : draft
+      );
     }
   };
   const saveSchedule = async () => {

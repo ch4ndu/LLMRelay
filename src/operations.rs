@@ -30,6 +30,40 @@ use std::sync::{Arc, Mutex, RwLock};
 mod context_delivery;
 mod conversation;
 
+#[derive(Debug)]
+pub(crate) struct CheckedOperationRefused {
+    message: String,
+    terminal_operation_id: Option<String>,
+}
+
+impl CheckedOperationRefused {
+    pub(crate) fn new(error: anyhow::Error) -> Self {
+        Self {
+            message: format!("{error:#}"),
+            terminal_operation_id: None,
+        }
+    }
+
+    fn from_terminal_receipt(operation_id: &str, error: anyhow::Error) -> Self {
+        Self {
+            message: format!("{error:#}"),
+            terminal_operation_id: Some(operation_id.to_owned()),
+        }
+    }
+
+    pub(crate) fn confirms_terminal_refusal(&self, operation_id: &str) -> bool {
+        self.terminal_operation_id.as_deref() == Some(operation_id)
+    }
+}
+
+impl std::fmt::Display for CheckedOperationRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CheckedOperationRefused {}
+
 #[cfg(test)]
 thread_local! {
     static TEST_INTERRUPT_DRAIN_AFTER_CAPTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -3322,18 +3356,15 @@ impl Application {
         self.store.require_execution_unheld("role session resume")?;
         let request_hash =
             json_hash(&serde_json::json!({"session_id":session_id,"prompt":prompt}))?;
-        if let Some(existing) =
-            self.store
-                .browser_launch_receipt(operation_id, "role_resume", &request_hash)?
-        {
-            return browser_launch_receipt(existing);
-        }
         let receipt = BrowserLaunchReceipt {
             operation_id,
             operation_kind: "role_resume",
             input_hash: &request_hash,
             entity_id: session_id,
         };
+        if let Some(existing) = self.read_browser_launch_receipt(receipt)? {
+            return self.checked_browser_launch_receipt(receipt, existing);
+        }
         let result = self.resume_role_session_inner(session_id, prompt, Some(receipt), true, None);
         if let Err(error) = &result {
             self.record_permanent_resume_rejection(session_id, error, None)?;
@@ -3568,7 +3599,11 @@ impl Application {
             let error=anyhow!("Checkout protections changed after resume reservation; the native conversation was not started");
             self.store
                 .restore_resume_after_proven_nondelivery(session_id, &error.to_string())?;
-            return Err(error);
+            return Err(if browser_receipt.is_some() {
+                CheckedOperationRefused::new(error).into()
+            } else {
+                error
+            });
         }
         let process = if self.synthetic_dispatch_for_tests {
             self.store
@@ -3658,7 +3693,8 @@ impl Application {
         attempt_id: &str,
         role: crate::domain::RoleKind,
     ) -> Result<ValidationLaunchResult> {
-        self.dispatch_trip_setup_role_inner(attempt_id, role, false, None)
+        self.dispatch_trip_setup_role_inner_with_browser(attempt_id, role, None, None)
+            .and_then(browser_launch_dispatch_result)
     }
 
     pub fn dispatch_trip_setup_role_with_operation(
@@ -3673,61 +3709,35 @@ impl Application {
             "role":role,
             "fresh_resume_rejection":fresh_resume_rejection,
         }))?;
-        if let Some(existing) =
-            self.store
-                .browser_launch_receipt(operation_id, "trip_setup_dispatch", &request_hash)?
-        {
-            return browser_launch_receipt(existing);
-        }
         let receipt = BrowserLaunchReceipt {
             operation_id,
             operation_kind: "trip_setup_dispatch",
             input_hash: &request_hash,
             entity_id: attempt_id,
         };
+        if let Some(existing) = self.read_browser_launch_receipt(receipt)? {
+            return self.checked_browser_launch_receipt(receipt, existing);
+        }
         let result = self.dispatch_trip_setup_role_inner_with_browser(
             attempt_id,
             role,
-            false,
             Some(receipt),
             fresh_resume_rejection,
         );
         self.finish_browser_launch(receipt, result)
     }
 
-    fn dispatch_trip_setup_role_inner(
-        &self,
-        attempt_id: &str,
-        role: crate::domain::RoleKind,
-        runtime_probe: bool,
-        fresh_resume_rejection: Option<&serde_json::Value>,
-    ) -> Result<ValidationLaunchResult> {
-        self.dispatch_trip_setup_role_inner_with_browser(
-            attempt_id,
-            role,
-            runtime_probe,
-            None,
-            fresh_resume_rejection,
-        )
-        .and_then(browser_launch_dispatch_result)
-    }
-
     fn dispatch_trip_setup_role_inner_with_browser(
         &self,
         attempt_id: &str,
         role: crate::domain::RoleKind,
-        runtime_probe: bool,
         browser_receipt: Option<BrowserLaunchReceipt<'_>>,
         fresh_resume_rejection: Option<&serde_json::Value>,
     ) -> Result<BrowserLaunchDispatch> {
         let prompt = crate::trip::setup_launch_prompt(&self.store, attempt_id, role)?;
         let context = self
             .store
-            .trip_setup_role_launch_context(attempt_id, role, runtime_probe)?;
-        let runtime_policy = runtime_probe
-            .then(|| crate::trip::runtime_probe_launch_policy(&self.store, attempt_id, role, None))
-            .transpose()?
-            .flatten();
+            .trip_setup_role_launch_context(attempt_id, role, false)?;
         if let Some(receipt) = browser_receipt {
             self.dispatch_context_with_browser_receipt(
                 attempt_id,
@@ -3737,7 +3747,7 @@ impl Application {
                 context,
                 None,
                 None,
-                runtime_policy.as_ref(),
+                None,
                 receipt,
                 fresh_resume_rejection,
             )
@@ -3750,7 +3760,7 @@ impl Application {
                 context,
                 None,
                 None,
-                runtime_policy.as_ref(),
+                None,
                 None,
                 fresh_resume_rejection,
             )
@@ -3763,52 +3773,292 @@ impl Application {
         admission_id: &str,
         role: crate::domain::RoleKind,
     ) -> Result<ValidationLaunchResult> {
+        if operation_id.trim().is_empty() {
+            bail!(CheckedOperationRefused::new(anyhow!(
+                "operation_id is required"
+            )))
+        }
+        let request_hash =
+            json_hash(&serde_json::json!({"admission_id":admission_id,"role":role}))?;
+        let receipt = BrowserLaunchReceipt {
+            operation_id,
+            operation_kind: "runtime_probe_launch",
+            input_hash: &request_hash,
+            entity_id: admission_id,
+        };
+        if let Some(existing) = self.read_browser_launch_receipt(receipt)? {
+            return self.checked_browser_launch_receipt(receipt, existing);
+        }
+
+        let role_text = role.to_string();
+        {
+            let connection = self.store.lock()?;
+            let legacy_target: Option<(String, Option<String>)> = connection.query_row(
+                "SELECT entity_id,json_extract(detail_json,'$.role') FROM audit_events
+                 WHERE operation_id=?1 AND event_code='runtime_probe.launch' AND entity_kind='runtime_admission'
+                 ORDER BY rowid LIMIT 1",
+                [operation_id], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            if let Some((prior_admission, prior_role)) = legacy_target {
+                if prior_admission != admission_id
+                    || prior_role
+                        .as_deref()
+                        .is_some_and(|prior| prior != role_text.as_str())
+                {
+                    bail!(CheckedOperationRefused::new(anyhow!(
+                        "operation ID was already used with different input"
+                    )))
+                }
+                return Err(crate::trip::outcome_unknown(anyhow!(
+                    "The earlier runtime probe launch audit has no exact request receipt"
+                )));
+            }
+            let incomplete: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM trip_runtime_probes p
+                   WHERE p.admission_id=?1 AND p.role=?2 AND p.session_id IS NOT NULL
+                   AND p.state IN ('authorized','running','awaiting_resume','evidence_recorded','published')
+                   AND NOT EXISTS(SELECT 1 FROM audit_events e WHERE e.event_code='runtime_probe.launch'
+                       AND e.entity_kind='runtime_admission' AND e.entity_id=p.admission_id
+                       AND json_extract(e.detail_json,'$.session_id')=p.session_id))",
+                rusqlite::params![admission_id, role_text], |row| row.get(0),
+            )?;
+            if incomplete {
+                return Err(crate::trip::outcome_unknown(anyhow!(
+                    "The runtime probe has a reserved session without a confirmed launch receipt"
+                )));
+            }
+        }
         let runtime = crate::trip::CapabilityRuntime::from_store(
             &self.store,
             self.hooks.clone(),
             self.paths.role_socket.clone(),
             self.executable.clone(),
         );
-        let (attempt, current_scope) = {
-            let connection = self.store.lock()?;
-            let attempt: String = connection.query_row("SELECT p.attempt_id FROM trip_runtime_probes p JOIN trip_runtime_admissions a ON a.id=p.admission_id WHERE p.admission_id=?1 AND p.role=?2 AND p.state='authorized' AND a.state IN ('authorized','running') AND NOT EXISTS(SELECT 1 FROM sessions s JOIN role_generations rg ON rg.id=s.role_generation_id WHERE rg.attempt_id=p.attempt_id AND s.status IN ('launch_reserved','running','interrupt_requested','recovery_required'))",rusqlite::params![admission_id,role.to_string()],|row|row.get(0)).optional()?.ok_or_else(||anyhow!("ordinary runtime probe is not explicitly authorized or already has active, consumed, or recorded evidence; prepare corrected runtime verification for a fresh scope"))?;
-            let current_scope = crate::trip::require_current_runtime_admission_scope(
-                &connection,
-                &runtime,
-                admission_id,
-            );
-            (attempt, current_scope)
-        };
-        match current_scope
-            .and_then(|()| self.dispatch_trip_setup_role_inner(&attempt, role, true, None))
-        {
-            Ok(result) => {
-                let now = Utc::now().to_rfc3339();
+        let mut attempt = None;
+        let mut session = None;
+        let launch = (|| {
+            let attempt_id = {
                 let connection = self.store.lock()?;
-                let changed = connection.execute(
-                    "UPDATE trip_runtime_probes SET state=CASE WHEN state='authorized' THEN 'running' ELSE state END,
-                       updated_at=CASE WHEN state='authorized' THEN ?2 ELSE updated_at END
-                     WHERE admission_id=?3 AND role=?4 AND session_id=?1 AND attempt_id=?5
-                       AND state IN ('authorized','running','awaiting_resume','evidence_recorded','published','failed','stale')",
-                    rusqlite::params![result.session_id,now,admission_id,role.to_string(),attempt],
+                let candidate: String = connection.query_row(
+                    "SELECT p.attempt_id FROM trip_runtime_probes p
+                     JOIN trip_runtime_admissions a ON a.id=p.admission_id
+                     WHERE p.admission_id=?1 AND p.role=?2 AND p.state='authorized'
+                       AND p.session_id IS NULL AND a.state IN ('authorized','running')
+                       AND NOT EXISTS(SELECT 1 FROM sessions s
+                           JOIN role_generations rg ON rg.id=s.role_generation_id
+                           WHERE rg.attempt_id=p.attempt_id AND s.status IN
+                             ('launch_reserved','running','interrupt_requested','recovery_required'))",
+                    rusqlite::params![admission_id, role_text], |row| row.get(0),
+                ).optional()?.ok_or_else(||anyhow!("ordinary runtime probe is not explicitly authorized or already has active, consumed, or recorded evidence; prepare corrected runtime verification for a fresh scope"))?;
+                let attempt_id = attempt.insert(candidate);
+                crate::trip::require_current_runtime_admission_scope(
+                    &connection,
+                    &runtime,
+                    admission_id,
                 )?;
-                if changed != 1 {
-                    bail!("runtime probe launch lost its exact reserved session binding")
+                attempt_id.as_str()
+            };
+            let prompt = crate::trip::setup_launch_prompt(&self.store, attempt_id, role)?;
+            let context = self
+                .store
+                .trip_setup_role_launch_context(attempt_id, role, true)?;
+            session = Some(context.session_id.clone());
+            let permit_id = context.permit_id.clone();
+            let dispatch = (|| {
+                let policy =
+                    crate::trip::runtime_probe_launch_policy(&self.store, attempt_id, role, None)?;
+                self.dispatch_context_with_browser_receipt(
+                    attempt_id,
+                    role,
+                    &prompt,
+                    None,
+                    context,
+                    None,
+                    None,
+                    policy.as_ref(),
+                    receipt,
+                    None,
+                )
+            })();
+            dispatch.map_err(|error| {
+                match self.store.release_unconsumed_launch_permits(
+                    Some(&permit_id),
+                    "runtime probe launch preparation did not complete",
+                ) {
+                    Ok(_) => error,
+                    Err(cleanup) => crate::trip::outcome_unknown(error.context(format!(
+                        "runtime probe permit cleanup also failed: {cleanup:#}"
+                    ))),
                 }
-                crate::trip::refresh_runtime_admission_state(&connection, admission_id, &now)?;
-                connection.execute("INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at) VALUES(?1,?2,'human','runtime_probe.launch','runtime_admission',?3,?4,?5)",rusqlite::params![uuid::Uuid::new_v4().to_string(),operation_id,admission_id,serde_json::json!({"role":role,"session_id":result.session_id,"attempt_id":attempt}).to_string(),now])?;
-                Ok(result)
+            })
+        })();
+        match launch {
+            Ok(BrowserLaunchDispatch::Existing(existing)) => {
+                self.checked_browser_launch_receipt(receipt, existing)
             }
-            Err(error) if error.is::<crate::store::RoleLaunchCapacityError>() => Err(error),
-            Err(error) => {
-                let reason = format!("{error:#}");
-                let now = Utc::now().to_rfc3339();
-                let connection = self.store.lock()?;
-                connection.execute("UPDATE trip_runtime_probes SET state='failed',failure_reason=?1,updated_at=?2 WHERE admission_id=?3 AND role=?4",rusqlite::params![reason,now,admission_id,role.to_string()])?;
-                crate::trip::refresh_runtime_admission_state(&connection, admission_id, &now)?;
-                Err(error)
+            Ok(BrowserLaunchDispatch::Launched(result)) => {
+                self.record_runtime_probe_launch(receipt, role, &result)
+                    .map_err(crate::trip::outcome_unknown)?;
+                self.finish_browser_launch(receipt, Ok(BrowserLaunchDispatch::Launched(result)))
+                    .map_err(crate::trip::outcome_unknown)
+            }
+            Err(error) => self.finish_runtime_probe_launch_error(
+                receipt,
+                &role_text,
+                attempt.as_deref(),
+                session.as_deref(),
+                error,
+            ),
+        }
+    }
+
+    fn record_runtime_probe_launch(
+        &self,
+        receipt: BrowserLaunchReceipt<'_>,
+        role: crate::domain::RoleKind,
+        result: &ValidationLaunchResult,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.store.lock()?;
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE trip_runtime_probes SET state=CASE WHEN state='authorized' THEN 'running' ELSE state END,
+               updated_at=CASE WHEN state='authorized' THEN ?2 ELSE updated_at END
+             WHERE admission_id=?3 AND role=?4 AND session_id=?1 AND attempt_id=?5
+               AND state IN ('authorized','running','awaiting_resume','evidence_recorded','published','failed','stale')",
+            rusqlite::params![result.session_id, now, receipt.entity_id, role.to_string(), result.attempt_id],
+        )?;
+        if changed != 1 {
+            bail!("runtime probe launch lost its exact reserved session binding")
+        }
+        crate::trip::refresh_runtime_admission_state(&tx, receipt.entity_id, &now)?;
+        let detail = serde_json::json!({"role":role,"session_id":result.session_id,"attempt_id":result.attempt_id});
+        tx.execute(
+            "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+             VALUES(?1,?2,'human','runtime_probe.launch','runtime_admission',?3,?4,?5)",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), receipt.operation_id, receipt.entity_id, detail.to_string(), now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn finish_runtime_probe_launch_error(
+        &self,
+        receipt: BrowserLaunchReceipt<'_>,
+        role: &str,
+        attempt: Option<&str>,
+        session: Option<&str>,
+        error: anyhow::Error,
+    ) -> Result<ValidationLaunchResult> {
+        let now = Utc::now().to_rfc3339();
+        let reason = format!("{error:#}");
+        let mut connection = self.store.lock()?;
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing = crate::store::browser_launch_receipt_in(
+            &tx,
+            receipt.operation_id,
+            receipt.operation_kind,
+            receipt.input_hash,
+        )?;
+        let owned_status: Option<String> = tx
+            .query_row(
+                "SELECT s.status FROM trip_runtime_probes p JOIN sessions s ON s.id=p.session_id
+             WHERE p.admission_id=?1 AND p.role=?2 AND p.attempt_id=?3 AND s.id=?4",
+                rusqlite::params![receipt.entity_id, role, attempt, session],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if owned_status.is_none() || existing["state"].as_str() != Some("reserved") {
+                drop(tx);
+                drop(connection);
+                return self.checked_browser_launch_receipt(receipt, existing);
+            }
+        } else if owned_status.is_none() {
+            if !can_confirm_launch_preflight_refusal(&error) {
+                return Err(error);
+            }
+            let preparing: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM launch_permits
+                 WHERE attempt_id=?1 AND role=?2 AND state='issued')",
+                rusqlite::params![attempt, role],
+                |row| row.get(0),
+            )?;
+            if preparing {
+                return Err(crate::trip::outcome_unknown(error.context(
+                    "A runtime probe launch is already being prepared for this request target",
+                )));
+            }
+            // Bind the refusal before changing the unlaunched probe. A concurrent
+            // request with the same ID must see the same hash or lose reservation.
+            crate::store::reserve_browser_launch_receipt_in(
+                &tx,
+                receipt,
+                serde_json::json!({"preflight_rejected":true}),
+                &now,
+            )?;
+            let changed = tx.execute(
+                "UPDATE operation_receipts SET result_json=?1 WHERE operation_id=?2
+                 AND actor_key='human_control' AND operation_kind=?3",
+                rusqlite::params![
+                    serde_json::json!({"state":"rejected","reason":reason}).to_string(),
+                    receipt.operation_id,
+                    receipt.operation_kind
+                ],
+            )?;
+            if changed != 1 {
+                bail!("browser launch refusal receipt is missing or changed")
+            }
+        } else {
+            return Err(crate::trip::outcome_unknown(anyhow!(
+                "The reserved runtime probe session is missing its launch receipt"
+            )));
+        }
+        let spawn_failure = error.downcast_ref::<SpawnFailure>();
+        let proven_nondelivery = match spawn_failure {
+            Some(SpawnFailure::ProvenNondelivery { .. }) => true,
+            Some(SpawnFailure::DeliveryUnknown { .. }) => false,
+            None => owned_status.as_deref() == Some("launch_failed"),
+        };
+        if !error.is::<crate::store::RoleLaunchCapacityError>()
+            && (owned_status.is_none() || proven_nondelivery || spawn_failure.is_some())
+        {
+            let changed = tx.execute(
+                "UPDATE trip_runtime_probes SET state='failed',failure_reason=?1,updated_at=?2
+                 WHERE admission_id=?3 AND role=?4 AND attempt_id=?5 AND session_id IS ?6
+                   AND state='authorized'",
+                rusqlite::params![
+                    reason,
+                    now,
+                    receipt.entity_id,
+                    role,
+                    attempt,
+                    session.filter(|_| owned_status.is_some())
+                ],
+            )?;
+            if changed == 1 {
+                crate::trip::refresh_runtime_admission_state(&tx, receipt.entity_id, &now)?;
             }
         }
+        tx.commit()?;
+        drop(connection);
+        if owned_status.is_none() {
+            return Err(CheckedOperationRefused::from_terminal_receipt(
+                receipt.operation_id,
+                error,
+            )
+            .into());
+        }
+        if proven_nondelivery && can_confirm_launch_preflight_refusal(&error) {
+            return self
+                .finish_browser_launch(receipt, Err(CheckedOperationRefused::new(error).into()));
+        }
+        // Keep the receipt reserved when the process may have started. HTTP
+        // already classifies the native delivery-unknown error as uncertain.
+        if matches!(spawn_failure, Some(SpawnFailure::DeliveryUnknown { .. })) {
+            return Err(error);
+        }
+        Err(crate::trip::outcome_unknown(error))
     }
 
     pub fn resume_runtime_probe(
@@ -3883,23 +4133,67 @@ impl Application {
     ) -> Result<ValidationLaunchResult> {
         let request_hash =
             json_hash(&serde_json::json!({"admission_id":admission_id,"role":role}))?;
-        if let Some(existing) = self.store.browser_launch_receipt(
-            operation_id,
-            "runtime_probe_resume",
-            &request_hash,
-        )? {
-            return browser_launch_receipt(existing);
-        }
         let receipt = BrowserLaunchReceipt {
             operation_id,
             operation_kind: "runtime_probe_resume",
             input_hash: &request_hash,
             entity_id: admission_id,
         };
+        if let Some(existing) = self.read_browser_launch_receipt(receipt)? {
+            return self.checked_browser_launch_receipt(receipt, existing);
+        }
         self.finish_browser_launch(
             receipt,
             self.resume_runtime_probe_inner(admission_id, role, Some(receipt)),
         )
+    }
+
+    fn read_browser_launch_receipt(
+        &self,
+        receipt: BrowserLaunchReceipt<'_>,
+    ) -> Result<Option<serde_json::Value>> {
+        self.store.browser_launch_receipt(
+            receipt.operation_id,
+            receipt.operation_kind,
+            receipt.input_hash,
+        )
+    }
+
+    fn checked_browser_launch_receipt(
+        &self,
+        request: BrowserLaunchReceipt<'_>,
+        receipt: serde_json::Value,
+    ) -> Result<ValidationLaunchResult> {
+        let state = receipt["state"].as_str();
+        if state == Some("reserved") {
+            return browser_launch_receipt(receipt).map_err(crate::trip::outcome_unknown);
+        }
+        if state != Some("rejected") {
+            return browser_launch_receipt(receipt);
+        }
+        // Older writers recorded errors after reservation as rejected even when
+        // delivery was unknown. Only an explicit proof can settle their replay.
+        let refused = receipt["proven_nondelivery"].as_bool() == Some(true)
+            || self.store.lock()?.query_row(
+                "SELECT COALESCE(json_extract(detail_json,'$.authority.preflight_rejected'),0)
+                 FROM audit_events WHERE operation_id=?1 AND event_code='browser.launch.reserved'
+                   AND json_extract(detail_json,'$.operation_kind')=?2
+                   AND json_extract(detail_json,'$.input_hash')=?3
+                 ORDER BY rowid DESC LIMIT 1",
+                rusqlite::params![
+                    request.operation_id,
+                    request.operation_kind,
+                    request.input_hash
+                ],
+                |row| row.get::<_, bool>(0),
+            )?;
+        browser_launch_receipt(receipt).map_err(|error| {
+            if refused {
+                CheckedOperationRefused::from_terminal_receipt(request.operation_id, error).into()
+            } else {
+                crate::trip::outcome_unknown(error)
+            }
+        })
     }
 
     fn finish_browser_launch(
@@ -3918,39 +4212,56 @@ impl Application {
                 )?;
                 Ok(result)
             }
-            Ok(BrowserLaunchDispatch::Existing(existing)) => browser_launch_receipt(existing),
-            Err(error) => {
-                match self.store.browser_launch_receipt(
-                    receipt.operation_id,
-                    receipt.operation_kind,
-                    receipt.input_hash,
-                )? {
-                    Some(existing)
-                        if existing.get("state").and_then(serde_json::Value::as_str)
-                            == Some("reserved") =>
-                    {
-                        self.store.finalize_browser_launch_receipt(
-                            receipt.operation_id,
-                            receipt.operation_kind,
-                            receipt.input_hash,
-                            None,
-                            Some(format!("{error:#}")),
-                        )?;
-                        Err(error)
-                    }
-                    Some(existing) => browser_launch_receipt(existing),
-                    None => {
-                        self.store.reject_browser_launch_without_reservation(
-                            receipt.operation_id,
-                            receipt.operation_kind,
-                            receipt.input_hash,
-                            receipt.entity_id,
-                            &format!("{error:#}"),
-                        )?;
-                        Err(error)
-                    }
-                }
+            Ok(BrowserLaunchDispatch::Existing(existing)) => {
+                self.checked_browser_launch_receipt(receipt, existing)
             }
+            Err(error) => match self.read_browser_launch_receipt(receipt)? {
+                Some(existing) if existing["state"].as_str() == Some("reserved") => {
+                    let refused = error.is::<CheckedOperationRefused>()
+                        || matches!(
+                            error.downcast_ref::<SpawnFailure>(),
+                            Some(SpawnFailure::ProvenNondelivery { .. })
+                        );
+                    if !refused {
+                        return Err(crate::trip::outcome_unknown(error));
+                    }
+                    // Persist the proof so replay can distinguish this outcome
+                    // from historical rejections after an ambiguous dispatch.
+                    self.store.finalize_browser_launch_receipt(
+                        receipt.operation_id,
+                        receipt.operation_kind,
+                        receipt.input_hash,
+                        Some(serde_json::json!({
+                            "state":"rejected", "reason":format!("{error:#}"),
+                            "proven_nondelivery":true,
+                        })),
+                        None,
+                    )?;
+                    Err(
+                        CheckedOperationRefused::from_terminal_receipt(receipt.operation_id, error)
+                            .into(),
+                    )
+                }
+                Some(existing) => self.checked_browser_launch_receipt(receipt, existing),
+                None => {
+                    if !can_confirm_launch_preflight_refusal(&error) {
+                        return Err(error);
+                    }
+                    self.store.reject_browser_launch_without_reservation(
+                        receipt.operation_id,
+                        receipt.operation_kind,
+                        receipt.input_hash,
+                        receipt.entity_id,
+                        &format!("{error:#}"),
+                    )?;
+                    // A concurrent request can reserve the ID before this
+                    // write, so settle against the receipt that actually won.
+                    let existing = self
+                        .read_browser_launch_receipt(receipt)?
+                        .context("browser launch preflight refusal receipt is missing")?;
+                    self.checked_browser_launch_receipt(receipt, existing)
+                }
+            },
         }
     }
 
@@ -4161,9 +4472,14 @@ impl Application {
             Ok(_) => error,
             Err(cleanup) => {
                 let original = format!("{error:#}");
-                error.context(format!(
+                let error = error.context(format!(
                     "launch permit cleanup also failed after `{original}`: {cleanup:#}"
-                ))
+                ));
+                if browser_receipt.is_some() {
+                    crate::trip::outcome_unknown(error)
+                } else {
+                    error
+                }
             }
         };
         if !self.dispatch_enabled() {
@@ -4303,6 +4619,12 @@ impl Application {
         match reservation {
             Ok(BrowserLaunchReservation::Reserved) => {}
             Ok(BrowserLaunchReservation::Existing(existing)) => {
+                if runtime_probe {
+                    self.store.release_unconsumed_launch_permits(
+                        Some(&context.permit_id),
+                        "runtime probe request already has a durable receipt",
+                    )?;
+                }
                 return Ok(BrowserLaunchDispatch::Existing(existing));
             }
             Err(error) => {
@@ -4318,7 +4640,11 @@ impl Application {
             );
             self.store
                 .update_session_launch_failed(&context.session_id, &error.to_string())?;
-            return Err(error);
+            return Err(if browser_receipt.is_some() {
+                CheckedOperationRefused::new(error).into()
+            } else {
+                error
+            });
         }
         if let Some((cell, operation, hash)) = validation {
             self.store
@@ -5752,6 +6078,17 @@ fn browser_launch_receipt(receipt: serde_json::Value) -> Result<ValidationLaunch
         ),
         _ => serde_json::from_value(receipt).context("parse durable browser launch receipt"),
     }
+}
+
+fn can_confirm_launch_preflight_refusal(error: &anyhow::Error) -> bool {
+    !error.is::<crate::trip::TripOutcomeUnknown>()
+        && !error.is::<serde_json::Error>()
+        && !matches!(error.downcast_ref::<rusqlite::Error>(), Some(sqlite)
+            if !matches!(sqlite, rusqlite::Error::QueryReturnedNoRows))
+        && !matches!(
+            error.downcast_ref::<SpawnFailure>(),
+            Some(SpawnFailure::DeliveryUnknown { .. })
+        )
 }
 
 fn permanent_resume_rejection_category(error: &anyhow::Error) -> Option<&'static str> {

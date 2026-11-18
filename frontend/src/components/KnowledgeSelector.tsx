@@ -52,6 +52,8 @@ export function KnowledgeSelector(
 ) {
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<KnowledgeSearchHit[]>([]);
+  const [nextEntryId, setNextEntryId] = useState<string | null>(null);
+  const [searching, setSearching] = useState(false);
   const [selection, setSelection] = useState<KnowledgeSelection[]>(
     initialSelection,
   );
@@ -84,6 +86,8 @@ export function KnowledgeSelector(
     previousProject.current = projectId;
     epoch.current++;
     setHits([]);
+    setNextEntryId(null);
+    setSearching(false);
     setSelection([]);
     setDetails({});
     setPreview(undefined);
@@ -96,9 +100,9 @@ export function KnowledgeSelector(
   useEffect(() => () => {
     epoch.current++;
   }, []);
-  async function search(): Promise<void> {
+  async function search(after: string | null = null): Promise<void> {
     const current = ++epoch.current;
-    setBusy(true);
+    setSearching(true);
     setError("");
     try {
       const result = await knowledgeRead(projectId, {
@@ -107,15 +111,17 @@ export function KnowledgeSelector(
           query,
           include_drafts: false,
           include_archived: false,
-          after_entry_id: null,
+          after_entry_id: after,
           limit: 50,
         },
       });
-      if (current === epoch.current) setHits(result);
+      if (current !== epoch.current) return;
+      setHits((old) => after ? [...old, ...result] : result);
+      setNextEntryId(result.length === 50 ? result[result.length - 1].entry.id : null);
     } catch (cause) {
-      if (current === epoch.current) setError(String(cause));
+      if (current === epoch.current) setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      if (current === epoch.current) setBusy(false);
+      if (current === epoch.current) setSearching(false);
     }
   }
   function change(next: KnowledgeSelection[]): void {
@@ -160,7 +166,9 @@ export function KnowledgeSelector(
         acknowledged_warning: false,
       }]);
     } catch (cause) {
-      if (current === epoch.current) setError(String(cause));
+      if (current === epoch.current && before === liveIdentity.current) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      }
     } finally {
       if (current === epoch.current) setBusy(false);
     }
@@ -179,9 +187,9 @@ export function KnowledgeSelector(
         setPreview({ identity: before, value: result });
       }
     } catch (cause) {
-      if (current === epoch.current) {
+      if (current === epoch.current && liveIdentity.current === before) {
         setPreview(undefined);
-        setError(String(cause));
+        setError(cause instanceof Error ? cause.message : String(cause));
       }
     } finally {
       if (current === epoch.current) setBusy(false);
@@ -200,13 +208,19 @@ export function KnowledgeSelector(
         Find approved knowledge<input
           value={query}
           disabled={disabled || busy}
-          onChange={(event) =>
-            setQuery(event.target.value)}
+          onChange={(event) => {
+            epoch.current++;
+            setQuery(event.target.value);
+            setHits([]);
+            setNextEntryId(null);
+            setSearching(false);
+            setError("");
+          }}
         />
       </label>
       <button
         type="button"
-        disabled={disabled || busy || utf8Bytes(query) > 512}
+        disabled={disabled || busy || searching || utf8Bytes(query) > 512}
         onClick={() =>
           void search()}
       >
@@ -217,7 +231,7 @@ export function KnowledgeSelector(
           <li key={hit.entry.id}>
             <button
               type="button"
-              disabled={disabled || busy || selection.length >= 16 ||
+              disabled={disabled || busy || searching || selection.length >= 16 ||
                 selection.some((item) => item.entry_id === hit.entry.id)}
               onClick={() =>
                 void add(hit)}
@@ -227,6 +241,11 @@ export function KnowledgeSelector(
           </li>
         ))}
       </ul>
+      {nextEntryId !== null && (
+        <button type="button" disabled={disabled || busy || searching} onClick={() => void search(nextEntryId)}>
+          Load more approved knowledge
+        </button>
+      )}
       <ol>
         {selection.map((item, index) => {
           const detail = details[item.revision_id];
@@ -248,6 +267,9 @@ export function KnowledgeSelector(
                     Freshness: {observation?.state.replaceAll("_", " ")}{" "}
                     · checked {observation?.checked_at}
                   </p>
+                  {observation?.sources_omitted !== undefined && (
+                    <p>Freshness details omitted for {observation.sources_omitted} sources.</p>
+                  )}
                   <pre>{detail.revision.statement}</pre>
                   <details>
                     <summary>Exact provenance</summary>
@@ -283,10 +305,9 @@ export function KnowledgeSelector(
                             }
                             : selected
                         ))}
-                    />I acknowledge this current warning:{" "}
-                    {observation.sources.map((source) => source.reason).join(
-                      "; ",
-                    )}
+                    />{observation.sources_omitted !== undefined
+                      ? "I acknowledge the current freshness warning."
+                      : `I acknowledge this current warning: ${observation.sources.map((source) => source.reason).join("; ")}`}
                   </label>
                 )}
               <button
@@ -335,7 +356,7 @@ export function KnowledgeSelector(
       {(selection.length > 0 || allowEmptyPreview) && (
         <button
           type="button"
-          disabled={disabled || busy || !consumer ||
+          disabled={disabled || busy || searching || !consumer ||
             selection.some((item) =>
               details[item.revision_id]?.observation.restore_operation_id
             )}
@@ -448,7 +469,7 @@ export function TaskKnowledgePanel(
         setPending(value as Command);
       }
     } catch (cause) {
-      setError(String(cause));
+      setError(cause instanceof Error ? cause.message : String(cause));
     }
     return () => {
       scope.active = false;
@@ -512,59 +533,58 @@ export function TaskKnowledgePanel(
       }
       : undefined;
   async function dispatch(request: Command, replay = false): Promise<void> {
-    if (busy || (pending && !replay)) return;
+    if (busy || (replay ? !checked || pending !== request : !!pending)) return;
     const scope = lifetime.current;
     const current = () => scope.active && lifetime.current === scope;
+    const body = JSON.stringify(request);
+    let journaled = false;
+    let accepted = false;
+    const removeExact = () => withStorageLock(key, () => {
+      if (localStorage.getItem(key) === body) localStorage.removeItem(key);
+    });
+    const errorText = (value: unknown) => value instanceof Error ? value.message : String(value);
     setBusy(true);
     setError("");
+    setChecked(false);
     try {
       await withStorageLock(key, () => {
-        const raw = localStorage.getItem(key);
-        if (raw && raw !== JSON.stringify(request)) {
-          throw new Error(
-            "A saved task knowledge operation needs outcome checking first.",
-          );
+        const existing = localStorage.getItem(key);
+        if (replay ? existing !== body : existing !== null) {
+          throw new Error("The task knowledge journal changed. Refresh the task and check the saved request.");
         }
-        localStorage.setItem(key, JSON.stringify(request));
+        if (!replay) localStorage.setItem(key, body);
       });
+      journaled = true;
       if (current()) setPending(request);
       const result = await command(request);
-      await withStorageLock(key, () => {
-        if (localStorage.getItem(key) === JSON.stringify(request)) {
-          localStorage.removeItem(key);
-        }
-      });
+      accepted = true;
+      await removeExact();
+      journaled = false;
       if (!current()) return;
       setPending(undefined);
       setConfirmation(undefined);
-      setChecked(false);
       if (typeof result.result.version === "number") {
         setSavedVersion(result.result.version);
       }
       onConfirmed?.();
       await onChanged();
     } catch (cause) {
-      if (
-        cause instanceof ApiError && !cause.ambiguous && cause.status >= 400 &&
-        cause.status < 500
-      ) {
-        await withStorageLock(key, () => {
-          if (localStorage.getItem(key) === JSON.stringify(request)) {
-            localStorage.removeItem(key);
-          }
-        });
-        if (current()) {
-          setPending(undefined);
-          setConfirmation(undefined);
-          setError(String(cause));
+      let message = errorText(cause);
+      if (journaled && !accepted && !replay &&
+        !(cause instanceof ApiError && cause.ambiguous)) {
+        try {
+          await removeExact();
+          journaled = false;
+          if (current()) setPending(undefined);
+        } catch (cleanupError) {
+          message = errorText(cleanupError);
         }
-      } else if (current()) {
-        setError(
-          `${
-            String(cause)
-          } Refresh and check the outcome before retrying. The exact operation is retained.`,
-        );
       }
+      if (current()) setError(
+        journaled
+          ? `${message} Refresh and check the outcome before retrying. The exact operation is retained.`
+          : message,
+      );
     } finally {
       if (current()) setBusy(false);
     }
@@ -746,7 +766,7 @@ function TaskKnowledgeManifest(
       .then((value) => {
         if (!abandoned) setManifest(value);
       }).catch((cause: unknown) => {
-        if (!abandoned) setError(String(cause));
+        if (!abandoned) setError(cause instanceof Error ? cause.message : String(cause));
       });
     return () => {
       abandoned = true;

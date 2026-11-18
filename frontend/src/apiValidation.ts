@@ -1,6 +1,7 @@
 import type {
   AppState,
   Command,
+  Operation,
   CompatibilityExplanation,
   HistoryExportText,
   HistoryPaneOutcome,
@@ -75,6 +76,135 @@ export const hasNullableString = (value: unknown, name: string) => {
   const item = field(value, name);
   return item === null || typeof item === "string";
 };
+const nonemptyString = (value: unknown): value is string =>
+  typeof value === "string" && value.trim().length > 0;
+const sha256String = (value: unknown): value is string =>
+  typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+export function guidanceApprovalIsFor(value: unknown, taskId: string): value is Command {
+  const files = field(value, "files");
+  return isRecord(value) && Object.keys(value).length === 9 &&
+    value.kind === "reauthorize_attempt_guidance" && value.task_id === taskId &&
+    ["operation_id", "attempt_id", "plan_hash", "config_revision_id", "policy_hash"]
+      .every((key) => nonemptyString(value[key])) &&
+    nonnegativeInteger(value.expected_version) &&
+    Array.isArray(files) && files.length > 0 && files.length <= 32 &&
+    files.every((file: unknown) =>
+      isRecord(file) && Object.keys(file).length === 3 && nonemptyString(file.path) &&
+      sha256String(file.previous_sha256) && sha256String(file.sha256)
+    ) && new Set(files.map((file) => field(file, "path"))).size === files.length;
+}
+
+export function guidanceApprovalResultMatches(command: Command, result: unknown): boolean {
+  const detail = field(result, "detail");
+  const files = field(detail, "files");
+  const expectedFiles = command.files;
+  return field(result, "operation_id") === command.operation_id &&
+    field(result, "entity_kind") === "attempt" &&
+    field(result, "entity_id") === command.attempt_id &&
+    field(result, "version") === Number(command.expected_version) + 1 &&
+    field(result, "state") === "guidance_reauthorized" &&
+    field(detail, "attempt_id") === command.attempt_id &&
+    field(detail, "task_version") === command.expected_version &&
+    field(detail, "plan_hash") === command.plan_hash &&
+    field(detail, "config_revision_id") === command.config_revision_id &&
+    field(detail, "previous_policy_hash") === command.policy_hash &&
+    sha256String(field(detail, "policy_hash")) &&
+    nonemptyString(field(detail, "approved_at")) &&
+    Array.isArray(expectedFiles) && Array.isArray(files) &&
+    files.length === expectedFiles.length && files.every((file, index) =>
+      ["path", "previous_sha256", "sha256"].every((key) =>
+        field(file, key) === field(expectedFiles[index], key)
+      )
+    );
+}
+
+const projectSetupReceipts: Record<string, { kind: string; states: string[] }> = {
+  inspect_project: { kind: "project", states: ["trip_inspected"] },
+  begin_setup: { kind: "trip_setup", states: ["discovery_ready"] },
+  save_setup_draft: { kind: "trip_setup", states: ["draft_saved"] },
+  revise_setup_draft: { kind: "trip_setup", states: ["revision_draft_saved"] },
+  stop_setup_manager: { kind: "trip_setup", states: [
+    "manager_interrupt_requested", "manager_quiescent", "manager_stop_held",
+    "manager_signal_delivery_failed",
+  ] },
+  change_setup_manager: { kind: "trip_setup", states: ["manager_replacement_ready"] },
+  authorize_setup_probes: { kind: "trip_setup", states: ["probes_authorized", "preflight_complete"] },
+  prepare_runtime_admission: { kind: "runtime_admission", states: ["pending_approval", "ready"] },
+  authorize_runtime_admission: { kind: "runtime_admission", states: ["authorized"] },
+  publish_runtime_proof: { kind: "runtime_admission", states: ["proof_published", "ready"] },
+  finalize_installation: { kind: "trip_setup", states: ["installation_finalized"] },
+  authorize_installation: { kind: "trip_setup", states: ["installation_authorized"] },
+  apply_installation: { kind: "trip_setup", states: ["activated"] },
+  recover_installation: { kind: "trip_setup", states: ["activated"] },
+  adopt_installation: { kind: "project", states: ["trip_adopted"] },
+};
+
+export function projectSetupResultMatches(command: Command, result: unknown): boolean {
+  const action = command.action;
+  if (command.kind !== "trip" || typeof action !== "string") return false;
+  const receipt = projectSetupReceipts[action];
+  const entity = field(result, "entity_id");
+  const state = field(result, "state");
+  const version = field(result, "version");
+  const detail = field(result, "detail");
+  if (!receipt || !nonemptyString(entity) || typeof state !== "string" ||
+    field(result, "operation_id") !== command.operation_id ||
+    field(result, "entity_kind") !== receipt.kind || !receipt.states.includes(state) ||
+    !(version === null || nonnegativeInteger(version)) || !isRecord(detail)) return false;
+
+  switch (action) {
+    case "begin_setup":
+      return detail.setup_operation_id === entity && detail.project_id === command.project_id;
+    case "revise_setup_draft":
+      return detail.supersedes_setup_operation_id === command.setup_operation_id;
+    case "change_setup_manager":
+      return detail.source_setup_operation_id === command.setup_operation_id;
+    case "inspect_project":
+    case "adopt_installation":
+      return entity === command.project_id;
+    case "prepare_runtime_admission":
+      return entity === detail.admission_id;
+    case "authorize_runtime_admission":
+      return entity === command.admission_id && detail.scope_hash === command.scope_hash;
+    case "publish_runtime_proof":
+      return entity === command.admission_id && detail.role === command.role;
+    default:
+      return entity === command.setup_operation_id;
+  }
+}
+
+export function projectSetupLaunchMatches(request: Operation, result: unknown): boolean {
+  const launch = field(result, "launch");
+  const process = field(result, "process");
+  const status = field(result, "status");
+  if (!nonemptyString(request.operation_id) || field(result, "operation_id") !== request.operation_id ||
+    !["session_id", "task_id", "attempt_id", "role_generation_id"]
+    .every((key) => nonemptyString(field(result, key))) ||
+    !hasStrings(launch, ["provider", "role", "model"]) ||
+    !hasStrings(process, ["native_start_marker", "observed_started_at"]) ||
+    !Number.isSafeInteger(field(process, "pid")) ||
+    !Number.isSafeInteger(field(process, "process_group_id"))) return false;
+
+  switch (request.kind) {
+    case "trip_setup_dispatch":
+      return status === "running" && field(result, "attempt_id") === request.attempt_id &&
+        field(launch, "role") === request.role;
+    case "role_resume":
+      return status === "running_resumed_unverified" &&
+        field(result, "session_id") === request.session_id;
+    case "runtime_probe_launch":
+      return status === "running" && field(launch, "role") === request.role &&
+        nonemptyString(request.admission_id) && field(result, "admission_id") === request.admission_id;
+    case "runtime_probe_resume":
+      return status === "running_resumed_unverified" && field(launch, "role") === request.role &&
+        nonemptyString(request.admission_id) && field(result, "admission_id") === request.admission_id;
+    default:
+      return false;
+  }
+}
 const taskTargetIsCurrent = (value: unknown) =>
   hasStrings(value, ["project_id", "task_id"]) &&
   Number.isInteger(field(value, "task_version"));

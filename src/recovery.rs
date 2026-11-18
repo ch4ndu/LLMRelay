@@ -380,13 +380,6 @@ pub(crate) fn restart_session_facts(
     let mut statement = connection.prepare(
         "SELECT s.id,rg.id,a.id,t.id,p.id,s.status,s.launch_state,s.desired_running,
                 s.validation_cell,s.native_session_id IS NOT NULL AND s.native_session_id!='',
-                EXISTS(SELECT 1 FROM capabilities current_capability
-                  WHERE current_capability.rowid=(SELECT latest.rowid FROM capabilities latest
-                    WHERE latest.provider=s.provider AND latest.executable_version=s.executable_version
-                      AND latest.role=rg.role AND latest.mode='interactive_pty'
-                    ORDER BY latest.checked_at DESC,latest.rowid DESC LIMIT 1)
-                    AND current_capability.config_hash=s.capability_key
-                    AND current_capability.status='supported' AND current_capability.proof_json!='{}'),
                 s.capability_identity_json IS NOT NULL,rg.role,rg.status,a.status,a.phase,t.lifecycle,
                 t.attention,t.archived_at IS NOT NULL,
                 a.id=(SELECT latest.id FROM attempts latest WHERE latest.task_id=t.id
@@ -433,8 +426,8 @@ pub(crate) fn restart_session_facts(
     let mut rows = statement
         .query_map(params![session_id], |row| {
             let session_id = row.get::<_, String>(0)?;
-            let candidate_state = row.get::<_, Option<String>>(33)?;
-            let candidate_result_raw = row.get::<_, Option<String>>(36)?;
+            let candidate_state = row.get::<_, Option<String>>(32)?;
+            let candidate_result_raw = row.get::<_, Option<String>>(35)?;
             let parsed_candidate = candidate_result_raw.as_deref().map(|raw| {
                 RestartCandidateResult::parse(raw).and_then(|result| {
                     if let Some(state) = candidate_state.as_deref() {
@@ -459,40 +452,40 @@ pub(crate) fn restart_session_facts(
                 desired_running: row.get(7)?,
                 validation_cell: row.get(8)?,
                 native_history: row.get(9)?,
-                current_capability: row.get(10)?,
-                capability_identity: row.get(11)?,
-                role: row.get(12)?,
-                generation_status: row.get(13)?,
-                attempt_status: row.get(14)?,
-                phase: row.get(15)?,
-                lifecycle: row.get(16)?,
-                attention: row.get(17)?,
-                archived: row.get(18)?,
-                latest_attempt: row.get(19)?,
-                latest_generation: row.get(20)?,
-                current_configuration: row.get(21)?,
-                preparation_review_delivered: row.get(22)?,
-                admission_review_authorized: row.get(23)?,
-                queue_open: row.get(24)?,
-                controls_clear: row.get(25)?,
-                active_restored_peer: row.get(26)?,
-                task_version: row.get(27)?,
-                project_version: row.get(28)?,
-                configuration_revision: row.get(29)?,
-                selected_checks_revision: row.get(30)?,
-                plan_hash: row.get(31)?,
-                candidate_hash: row.get(32)?,
+                current_capability: false,
+                capability_identity: row.get(10)?,
+                role: row.get(11)?,
+                generation_status: row.get(12)?,
+                attempt_status: row.get(13)?,
+                phase: row.get(14)?,
+                lifecycle: row.get(15)?,
+                attention: row.get(16)?,
+                archived: row.get(17)?,
+                latest_attempt: row.get(18)?,
+                latest_generation: row.get(19)?,
+                current_configuration: row.get(20)?,
+                preparation_review_delivered: row.get(21)?,
+                admission_review_authorized: row.get(22)?,
+                queue_open: row.get(23)?,
+                controls_clear: row.get(24)?,
+                active_restored_peer: row.get(25)?,
+                task_version: row.get(26)?,
+                project_version: row.get(27)?,
+                configuration_revision: row.get(28)?,
+                selected_checks_revision: row.get(29)?,
+                plan_hash: row.get(30)?,
+                candidate_hash: row.get(31)?,
                 candidate_state,
-                candidate_reason: row.get(34)?,
-                candidate_source: row.get(35)?,
+                candidate_reason: row.get(33)?,
+                candidate_source: row.get(34)?,
                 candidate_result,
                 candidate_metadata_error,
-                unresolved_recovery: row.get(37)?,
-                process_identity_json: row.get(38)?,
-                recovery_process_group_id: row.get(39)?,
-                recovery_anchor_json: row.get(40)?,
-                launch_boot_identity: row.get(41)?,
-                process_group_quiescent: row.get(42)?,
+                unresolved_recovery: row.get(36)?,
+                process_identity_json: row.get(37)?,
+                recovery_process_group_id: row.get(38)?,
+                recovery_anchor_json: row.get(39)?,
+                launch_boot_identity: row.get(40)?,
+                process_group_quiescent: row.get(41)?,
                 recorded_processes: Vec::new(),
                 admission_proof: None,
                 trip_readiness_error: None,
@@ -2928,7 +2921,7 @@ pub fn verify_check_quiescent(store: &Store, check_id: &str) -> Result<serde_jso
     )
 }
 
-fn verify_capture_settlement(
+pub(crate) fn verify_capture_settlement(
     check_id: &str,
     launch_boot: Option<&str>,
     capture_evidence: &serde_json::Value,

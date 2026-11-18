@@ -1,12 +1,18 @@
 use crate::config::{atomic_write, InstancePaths};
 use crate::diagnostics::{sanitize_value, DiagnosticSink};
 use crate::store::Store;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use std::path::Path;
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, Metadata};
+use std::io::ErrorKind;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path, PathBuf};
 
 pub fn export_sanitized(paths: &InstancePaths, output: &Path) -> Result<serde_json::Value> {
     crate::database::validate_live_database_family(paths)?;
+    let destination = export_destination(&paths.database, output)?;
     let store = Store::open_current_readonly(&paths.database)?;
     let state = sanitize_state(serde_json::to_value(crate::workflow::state(&store)?)?);
     let diagnostics =
@@ -27,8 +33,162 @@ pub fn export_sanitized(paths: &InstancePaths, output: &Path) -> Result<serde_js
         ("diagnostics.json", serde_json::to_vec_pretty(&diagnostics)?),
     ];
     let archive = stored_zip(&entries)?;
-    atomic_write(output, &archive)?;
+    atomic_write(&destination, &archive)?;
     Ok(serde_json::json!({"output":output,"bytes":archive.len(),"manifest":manifest}))
+}
+
+fn export_destination(database: &Path, output: &Path) -> Result<PathBuf> {
+    let database_parent = database
+        .parent()
+        .context("database has no parent directory")?;
+    let database_directory = fs::metadata(database_parent)
+        .with_context(|| format!("inspect database directory {}", database_parent.display()))?;
+    let database_name = database.file_name().context("database has no file name")?;
+    let protected_names = ["", "-wal", "-shm", "-journal"].map(|suffix| {
+        let mut name = database_name.to_os_string();
+        name.push(suffix);
+        name
+    });
+
+    let name = output
+        .file_name()
+        .filter(|name| {
+            output
+                .as_os_str()
+                .as_bytes()
+                .rsplit(|byte| *byte == b'/')
+                .next()
+                == Some(name.as_bytes())
+        })
+        .context("diagnostics export output must name a file")?;
+    let parent = output
+        .parent()
+        .context("diagnostics export output has no parent")?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let directory = resolve_export_directory(parent, &database_directory, &protected_names)?;
+    let destination = directory.join(name);
+    reject_export_database_name(&destination, name, &database_directory, &protected_names)?;
+
+    // rename replaces the final directory entry, even when that entry is a symlink.
+    if let Some(target) = export_entry_metadata(&destination)? {
+        for name in &protected_names {
+            if export_entry_metadata(&database_parent.join(name))?
+                .is_some_and(|protected| same_file(&target, &protected))
+            {
+                bail!(
+                    "diagnostics export cannot replace a live database file: {}",
+                    output.display()
+                );
+            }
+        }
+    }
+    Ok(destination)
+}
+
+fn resolve_export_directory(
+    parent: &Path,
+    database_directory: &Metadata,
+    protected_names: &[OsString],
+) -> Result<PathBuf> {
+    match parent.canonicalize() {
+        Ok(directory) => return Ok(directory),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("resolve export directory {}", parent.display()))
+        }
+    }
+
+    // atomic_write can create missing parents. Resolve symlinks before processing ".."
+    // and check each missing directory entry before it can occupy a sidecar name.
+    let absolute = std::path::absolute(parent)?;
+    let mut directory = PathBuf::from("/");
+    for component in absolute.components() {
+        match component {
+            Component::Normal(name) => {
+                let entry = directory.join(name);
+                directory = match export_entry_metadata(&entry)? {
+                    Some(_) => {
+                        let resolved = entry.canonicalize().with_context(|| {
+                            format!("resolve export directory {}", entry.display())
+                        })?;
+                        if !fs::metadata(&resolved)?.is_dir() {
+                            bail!("export parent is not a directory: {}", entry.display());
+                        }
+                        resolved
+                    }
+                    None => {
+                        reject_export_database_name(
+                            &entry,
+                            name,
+                            database_directory,
+                            protected_names,
+                        )?;
+                        entry
+                    }
+                };
+            }
+            Component::ParentDir => {
+                directory.pop();
+            }
+            _ => {}
+        }
+    }
+    Ok(directory)
+}
+
+fn reject_export_database_name(
+    entry: &Path,
+    name: &OsStr,
+    database_directory: &Metadata,
+    protected_names: &[OsString],
+) -> Result<()> {
+    // Reserve case variants even when a sidecar does not yet exist for an inode lookup.
+    // An ASCII SQLite name also has Unicode case variants, such as S and long s.
+    let unicode_uppercase = name
+        .to_str()
+        .filter(|name| !name.is_ascii())
+        .map(str::to_uppercase);
+    if protected_names.iter().any(|protected| {
+        name.eq_ignore_ascii_case(protected)
+            || unicode_uppercase
+                .as_deref()
+                .is_some_and(|upper| OsStr::new(upper).eq_ignore_ascii_case(protected))
+    }) {
+        let parent = entry.parent().context("export entry has no parent")?;
+        match fs::metadata(parent) {
+            Ok(directory) if same_file(&directory, database_directory) => {
+                bail!(
+                    "diagnostics export cannot replace a live database file: {}",
+                    entry.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect export directory {}", parent.display()))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn export_entry_metadata(path: &Path) -> Result<Option<Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("inspect export or database entry {}", path.display())),
+    }
+}
+
+fn same_file(left: &Metadata, right: &Metadata) -> bool {
+    (left.dev(), left.ino()) == (right.dev(), right.ino())
 }
 
 fn sanitize_diagnostics(events: Vec<serde_json::Value>) -> serde_json::Value {
@@ -467,8 +627,37 @@ fn push_u32(output: &mut Vec<u8>, value: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use rusqlite::params;
     use sha2::{Digest, Sha256};
+    use std::os::unix::fs::symlink;
+
+    async fn diagnostics_export_cli(paths: &InstancePaths, output: &Path) -> Result<()> {
+        let cli = crate::cli::Cli::try_parse_from([
+            OsStr::new("llmrelay"),
+            OsStr::new("diagnostics"),
+            OsStr::new("export"),
+            OsStr::new("--data-dir"),
+            paths.root.as_os_str(),
+            OsStr::new("--output"),
+            output.as_os_str(),
+        ])?;
+        crate::cli::run(cli).await
+    }
+
+    fn assert_valid_diagnostics_zip(archive: &Path) {
+        let check = std::process::Command::new("unzip")
+            .arg("-t")
+            .arg(archive)
+            .output()
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "invalid diagnostics ZIP: {} {}",
+            String::from_utf8_lossy(&check.stdout),
+            String::from_utf8_lossy(&check.stderr)
+        );
+    }
 
     #[test]
     fn schedule_authorization_export_keeps_identity_without_executable_scope() {
@@ -731,8 +920,8 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn public_export_omits_freeform_aliases_and_corrupt_log_bytes() {
+    #[tokio::test]
+    async fn public_export_omits_freeform_aliases_and_corrupt_log_bytes() {
         let root =
             std::env::temp_dir().join(format!("llmrelay-export-private-{}", uuid::Uuid::new_v4()));
         let paths = InstancePaths::resolve(Some(root.clone())).unwrap();
@@ -1326,8 +1515,10 @@ mod tests {
             "PRIVATE-DIAGNOSTIC-EXTENSION"
         );
         assert_eq!(local_event["detail"]["message"], r#"password="[REDACTED]""#);
-        let archive = root.join("diagnostics.zip");
-        export_sanitized(&paths, &archive).unwrap();
+        let archive = root.join("exports/diagnostics.zip");
+        assert!(!archive.exists());
+        diagnostics_export_cli(&paths, &archive).await.unwrap();
+        assert_valid_diagnostics_zip(&archive);
         let bytes = std::fs::read(&archive).unwrap();
         let exported = String::from_utf8_lossy(&bytes);
         for sentinel in sentinels.into_iter().chain([
@@ -1401,7 +1592,117 @@ mod tests {
         assert!(exported.contains("\"unterminated\": false"));
         assert!(exported.contains("\"surface_state\": \"unknown\""));
         assert!(exported.contains("\"signal_delivery_state\": \"failed\""));
+
+        sink.record(
+            "info",
+            "export.replacement_fixture",
+            "test",
+            "ok",
+            None,
+            serde_json::json!({}),
+        )
+        .unwrap();
+        diagnostics_export_cli(&paths, &archive).await.unwrap();
+        assert_valid_diagnostics_zip(&archive);
+        let replacement = fs::read(&archive).unwrap();
+        assert!(!exported.contains("export.replacement_fixture"));
+        assert!(String::from_utf8_lossy(&replacement).contains("export.replacement_fixture"));
+
+        let database_name = paths.database.file_name().unwrap().to_str().unwrap();
+        let wal = paths.state.join(format!("{database_name}-wal"));
+        let wal_link = root.join("wal-hard-link.zip");
+        fs::hard_link(&wal, &wal_link).unwrap();
+        let error = diagnostics_export_cli(&paths, &wal_link).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cannot replace a live database file"));
+        assert!(same_file(
+            &fs::metadata(&wal_link).unwrap(),
+            &fs::metadata(&wal).unwrap(),
+        ));
+        fs::remove_file(wal_link).unwrap();
+
         drop(store);
+        let database_bytes = fs::read(&paths.database).unwrap();
+        let directory_alias = root.join("state-alias");
+        symlink(&paths.state, &directory_alias).unwrap();
+        let hard_link = root.join("database-hard-link.zip");
+        fs::hard_link(&paths.database, &hard_link).unwrap();
+        for destination in [
+            paths.database.clone(),
+            directory_alias.join(database_name),
+            paths.state.join("../state").join(database_name),
+            paths.state.join("missing-parent/..").join(database_name),
+            directory_alias.join(database_name.to_ascii_uppercase()),
+            hard_link.clone(),
+        ] {
+            let error = diagnostics_export_cli(&paths, &destination)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot replace a live database file"),
+                "{destination:?}: {error:#}"
+            );
+        }
+        assert!(!paths.state.join("missing-parent").exists());
+        assert!(same_file(
+            &fs::metadata(&hard_link).unwrap(),
+            &fs::metadata(&paths.database).unwrap(),
+        ));
+        fs::remove_file(hard_link).unwrap();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let name = format!("{database_name}{suffix}");
+            let sidecar = paths.state.join(&name);
+            assert!(!sidecar.exists());
+            for destination in [
+                sidecar.clone(),
+                directory_alias.join(name.to_ascii_uppercase()),
+                directory_alias.join(name.replace('s', "ſ")),
+            ] {
+                let error = diagnostics_export_cli(&paths, &destination)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("cannot replace a live database file"),
+                    "{destination:?}: {error:#}"
+                );
+                assert!(!destination.exists());
+                assert!(!sidecar.exists());
+            }
+        }
+        let journal = paths.state.join(format!("{database_name}-journal"));
+        let error = diagnostics_export_cli(&paths, &journal.join("diagnostics.zip"))
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cannot replace a live database file"));
+        assert!(!journal.exists());
+
+        let final_symlink = root.join("database-symlink.zip");
+        symlink(&paths.database, &final_symlink).unwrap();
+        diagnostics_export_cli(&paths, &final_symlink)
+            .await
+            .unwrap();
+        assert!(fs::symlink_metadata(&final_symlink).unwrap().is_file());
+        assert_valid_diagnostics_zip(&final_symlink);
+        assert_eq!(fs::read(&paths.database).unwrap(), database_bytes);
+        let reopened = Store::open_current_readonly(&paths.database).unwrap();
+        let title: String = reopened
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT title FROM tasks WHERE id='export-task'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "PRIVATE-TASK-TITLE");
+        drop(reopened);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

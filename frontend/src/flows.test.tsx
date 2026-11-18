@@ -14,6 +14,7 @@ import type {
   CmuxViewOutcome,
   ContinuationAction,
   DecisionExplanation,
+  DiagnosticsRuntimeBinding,
   ObservedUsage,
   WorkflowComparisonPage,
   WorkflowComparisonQuery,
@@ -61,7 +62,7 @@ for (
   });
 }
 
-const { act, useState } = await import("react");
+const { act, useLayoutEffect, useState } = await import("react");
 const { createRoot } = await import("react-dom/client");
 const { AttentionInbox } = await import("./components/AttentionInbox");
 const { ApprovalInbox } = await import("./components/ApprovalInbox");
@@ -93,6 +94,7 @@ const {
   getState,
   recipeScheduleExecutionPreview,
   getTaskContent,
+  recoveryJournalChanged,
   waitForState,
   transportTimeouts,
 } = await import("./api");
@@ -409,6 +411,8 @@ Deno.test("M9 Recipes creates an exact draft and explicitly arms a paused schedu
   };
   let failNextSave = false;
   let failNextConflict = false;
+  let deferRecipeSave = false;
+  let finishRecipeSave: ((response: Response) => void) | undefined;
   const currentProject: Project = {
     ...initialized,
     trip: { ...initialized.trip!, active_config_revision_id: "config-1" },
@@ -471,6 +475,9 @@ Deno.test("M9 Recipes creates an exact draft and explicitly arms a paused schedu
     (async (_input: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       requests.push(body);
+      if (deferRecipeSave && body.kind === "upsert_task_recipe") {
+        return await new Promise<Response>((resolve) => { finishRecipeSave = resolve; });
+      }
       if (failNextSave) {
         failNextSave = false;
         throw new ApiError(
@@ -589,6 +596,23 @@ Deno.test("M9 Recipes creates an exact draft and explicitly arms a paused schedu
       ),
       "recipe edit reused a historical check instead of requiring reselection",
     );
+    click("New", recipePanel);
+    change(findField("Name", recipePanel), "Original recipe");
+    change(findField("Task title", recipePanel), "Original task title");
+    change(recipePanel.querySelectorAll<HTMLSelectElement>("select")[1], "profile-rev-1");
+    deferRecipeSave = true;
+    click("Save recipe");
+    await settle();
+    check(!!finishRecipeSave && requests.at(-1)?.recipe_id === null,
+      "the new recipe save did not reach the deferred response");
+    change(recipePanel.querySelector<HTMLSelectElement>("select")!, "single_agent");
+    change(findField("Task title", recipePanel), "New workflow title");
+    deferRecipeSave = false;
+    finishRecipeSave?.(new Response(JSON.stringify({ result: { entity_id: "late-trip-recipe", version: 1 } })));
+    await settle();
+    check(recipePanel.querySelector("h3")?.textContent === "New recipe" &&
+      findField("Task title", recipePanel).value === "New workflow title",
+      "a late TRIP save attached the old identity or replaced text after switching workflow family");
     const schedulePanel = sections.find((element) =>
       element.querySelector("h2")?.textContent === "Foreground schedules"
     )!;
@@ -1789,6 +1813,283 @@ Deno.test("M7 unknown Claude contract explains the release route and blocks setu
     unmount();
   }
 });
+Deno.test("W06 F17 Diagnostics reads current runtime proof and refreshes mounted events independently", async () => {
+  const profile = {
+    adapter: "llmrelay_codex", provider: "codex" as const, model: "gpt-6.2-sol",
+    effort: "medium", authority: "workspace-write", session: "retained",
+  };
+  const hashProfile = async (value: object) => {
+    const bytes = new TextEncoder().encode(JSON.stringify(value));
+    const digest = await crypto.subtle.digest("SHA-256", bytes);
+    return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  };
+  // SetupProfile serializes in field order. The runtime JSON value sorts its keys.
+  const setupProfileHash = await hashProfile(profile);
+  const runtimeProfileHash = await hashProfile(Object.fromEntries(
+    Object.keys(profile).sort().map((key) => [key, profile[key as keyof typeof profile]]),
+  ));
+  check(setupProfileHash !== runtimeProfileHash, "fixture profile hashes must distinguish the two writers");
+  const proof = (config_hash: string, rowid = 1): AppState["capabilities"][number] & { id: string; rowid: number } => ({
+    id: `capability-${config_hash}`, rowid, version: "codex-cli 0.162.1",
+    provider: "codex", role: "implementer", mode: "interactive_pty",
+    config_hash, status: "supported", gaps: [], checked_at: "2026-11-17T10:00:00Z",
+  });
+  const receipt = (profile_hash: string, capability_key: string): TripSetupState["probe_receipts"][number] => ({
+    id: `receipt-${profile_hash}-${capability_key}`, profile_id: profile_hash, profile_hash, capability_key,
+    provider: "codex", role: "implementer", adapter_hash: "adapter",
+    authority: "workspace-write", session_mode: "retained", generation_id: "probe-generation",
+    result: "success", model_evidence: "recorded-model",
+    evidence: { session_mode_observed: "retained" }, created_at: "2026-11-17",
+  });
+  const setup: TripSetupState = {
+    setup_operation_id: "selected-setup", project_id: "p1", state: "draft",
+    target_inventory: {}, final_files: [], installation_source_binding_complete: false,
+    installation_source_binding_reason: "pending", agents_file: {}, sessions: [], runtime_admissions: [],
+    selected_profiles: [{
+      role: "implementer", selection_state: "selected",
+      profile,
+      profile_hash: setupProfileHash, current_adapter_hash: "adapter",
+    }],
+    probe_receipts: [
+      receipt("old-profile", "old-proof"),
+      { ...receipt(setupProfileHash, "old-proof"), adapter_hash: "old-adapter" },
+    ],
+    created_at: "2026-11-17", updated_at: "2026-11-17",
+  };
+  const probe: RuntimeAdmissionState["probes"][number] = {
+    role: "implementer", profile, profile_hash: runtimeProfileHash,
+    project_config_revision_id: "configuration-revision", project_configuration_hash: "configuration-hash",
+    adapter: "llmrelay_codex", adapter_hash: "adapter", capability_key: "runtime-proof",
+    capability_id: "capability-runtime-proof", nonce: "runtime-nonce",
+    state: "published", published_at: "2026-11-17T10:00:00Z",
+    attempt_id: "runtime-attempt", session_id: "runtime-session", has_native_session: true,
+  };
+  const runtimeProof = proof(probe.capability_key, 2);
+  const binding: DiagnosticsRuntimeBinding = {
+    project_id: setup.project_id,
+    setup_operation_id: setup.setup_operation_id,
+    role: probe.role,
+    profile_hash: setupProfileHash,
+    runtime_profile_hash: runtimeProfileHash,
+    project_config_revision_id: probe.project_config_revision_id,
+    adapter_hash: probe.adapter_hash,
+    capability_id: runtimeProof.id,
+    capability_key: probe.capability_key,
+  };
+  const activated: TripSetupState = {
+    ...setup, state: "activated", fixture_project_id: "fixture-project",
+    installation_source_binding_complete: true,
+    installation_source_binding_reason: "Exact post-preflight bytes and destination preimages are frozen",
+    probe_receipts: [...setup.probe_receipts, receipt(setupProfileHash, "current-proof")],
+    runtime_admissions: [{
+      id: "ordinary-runtime", project_id: setup.project_id, task_id: null,
+      scope_hash: "runtime-scope", state: "ready", fresh_call_count: 1, probes: [probe],
+    }],
+  };
+  const alternative: TripSetupState = {
+    ...activated,
+    setup_operation_id: "alternative-setup",
+    selected_profiles: [{
+      ...activated.selected_profiles[0],
+      profile: { ...profile, effort: "high" },
+      profile_hash: "alternative-profile",
+    }],
+  };
+  const currentCapabilities = [proof("old-proof"), runtimeProof];
+  const show = (
+    selected: TripSetupState,
+    revision: string | null,
+    capabilities = currentCapabilities,
+  ) => (
+    <DiagnosticsPanel
+      capabilities={capabilities}
+      setups={selected === alternative ? [activated, alternative] : [selected]}
+      projects={[{
+        ...project,
+        settings: { roles: { [selected.selected_profiles[0].role]: selected.selected_profiles[0].profile } },
+        trip: {
+          readiness: revision ? "ready" : "setup_in_progress",
+          active_config_revision_id: revision,
+          setup_operation_id: selected.setup_operation_id,
+          reason: "",
+          detected_installation: "fixture",
+        },
+      }]}
+      attention={[]}
+    />
+  );
+  const eventResponses: Array<(response: Response) => void> = [];
+  const bindingResponses: typeof eventResponses = [];
+  globalThis.fetch = (async (url, init) => {
+    if (String(url) === "/api/diagnostics/runtime-bindings") {
+      check((init?.method ?? "GET") === "GET" && init?.credentials === "same-origin" &&
+        new Headers(init.headers).has("x-llmrelay-protocol"),
+        "runtime verification did not use the authenticated dashboard read");
+      return await new Promise<Response>((resolve) => { bindingResponses.push(resolve); });
+    }
+    check(String(url) === "/api/diagnostics", "unexpected Diagnostics request");
+    return await new Promise<Response>((resolve) => { eventResponses.push(resolve); });
+  }) as typeof fetch;
+  try {
+    mount(show(setup, null, [proof("old-proof")]));
+    await settle();
+    const panel = document.querySelector(".diagnostics");
+    const selectedLabel = () => [...(panel?.querySelectorAll("strong") || [])]
+      .find((label) => label.parentElement?.querySelector("p")?.textContent?.startsWith("Selected profile"))
+      ?.textContent;
+    check(panel?.textContent?.includes("Not verified yet") &&
+      panel.textContent.includes("Historical evidence · Verified"),
+      "a capability for a different profile masked the selected profile");
+    check(bindingResponses.length === 1, "entering Diagnostics did not read runtime proof");
+    rerender(show(activated, binding.project_config_revision_id));
+    await settle();
+    check(eventResponses.length === 2 && document.querySelector(".diagnostics") === panel,
+      "new state did not refresh the mounted diagnostic list");
+    eventResponses[1](knowledgeJson({ events: [{ outcome: "current_snapshot" }] }));
+    check(bindingResponses.length === 2, "newly published proof did not trigger a read");
+    await settle();
+    eventResponses[0](knowledgeJson({ events: [{ outcome: "old_snapshot" }] }));
+    await settle();
+    check(panel?.textContent?.includes("Codex · Implementer · Setup proof recorded") &&
+      panel.textContent.includes("Historical evidence · Verified") &&
+      !panel.textContent.includes("Not verified yet") &&
+      panel.textContent.includes("current snapshot") && !panel.textContent.includes("old snapshot"),
+      "exact proof did not update the selected row or a stale event response displaced current events");
+    bindingResponses[1](knowledgeJson({ bindings: [binding] }));
+    await settle();
+    check(selectedLabel()?.includes("· Verified") && panel?.textContent?.includes("Setup proof recorded") &&
+      !panel.textContent.includes("Capability binding runtime-proof"),
+      "published ordinary runtime proof was shown as historical evidence or hid the separate setup proof");
+
+    rerender(show(structuredClone(activated), binding.project_config_revision_id, structuredClone(currentCapabilities)));
+    await settle();
+    check(eventResponses.length === 3 && bindingResponses.length === 2 && selectedLabel()?.includes("· Verified"),
+      "refreshing only events also refreshed or invalidated the runtime proof");
+
+    rerender(show(alternative, "alternative-revision"));
+    await settle();
+    check(bindingResponses.length === 3 && selectedLabel()?.includes("Not verified yet") &&
+      panel?.textContent?.includes("Selected profile · gpt-6.2-sol · high"),
+      "switching configurations reused the previous verification or selected the historical setup");
+    bindingResponses[2](knowledgeJson({ bindings: [binding] }));
+    await settle();
+    check(selectedLabel()?.includes("Not verified yet"),
+      "the previous configuration's binding was accepted for the current selection");
+
+    rerender(show(activated, binding.project_config_revision_id));
+    await settle();
+    check(bindingResponses.length === 4 && selectedLabel()?.includes("Setup proof recorded"),
+      "returning to a configuration reused its previous result before the on-demand read");
+    const superseding = { ...proof("other-runtime-proof", 3), status: "unsupported" as const };
+    rerender(show(activated, binding.project_config_revision_id, [...currentCapabilities, superseding]));
+    await settle();
+    check(bindingResponses.length === 5, "a superseding capability did not trigger a read");
+    bindingResponses[4](knowledgeJson({ bindings: [binding] }));
+    await settle();
+    check(selectedLabel()?.includes("Setup proof recorded"),
+      "a runtime binding superseded by a capability with a higher row ID was accepted");
+    bindingResponses[3](knowledgeJson({ bindings: [binding] }));
+    await settle();
+    check(selectedLabel()?.includes("Setup proof recorded") &&
+      panel?.textContent?.includes("Capability binding runtime-proof"),
+      "an earlier response restored superseded runtime proof");
+
+    rerender(show(activated, binding.project_config_revision_id));
+    await settle();
+    check(bindingResponses.length === 6, "changing the capability winner did not refresh proof");
+    bindingResponses[5](knowledgeJson({ bindings: [binding] }));
+    await settle();
+    check(selectedLabel()?.includes("· Verified"), "current proof did not return after a fresh read");
+    bindingResponses[0](knowledgeJson({ bindings: [] }));
+    await settle();
+    check(selectedLabel()?.includes("· Verified"), "a delayed empty response cleared current proof");
+    rerender(show({ ...activated, runtime_admissions: [] }, binding.project_config_revision_id));
+    await settle();
+    check(bindingResponses.length === 7 && selectedLabel()?.includes("Setup proof recorded"),
+      "changing only the admission did not invalidate runtime proof");
+    bindingResponses[6](knowledgeJson({ bindings: [binding] }));
+    await settle();
+    check(selectedLabel()?.includes("Setup proof recorded"),
+      "a runtime binding without a matching published admission verified the role");
+
+    rerender(show(activated, binding.project_config_revision_id));
+    await settle();
+    check(bindingResponses.length === 8, "restoring the admission did not fetch current proof");
+    bindingResponses[7](knowledgeJson({ bindings: [binding] }));
+    await settle();
+    check(selectedLabel()?.includes("· Verified"), "current proof did not verify the restored admission");
+    const refocus = async () => {
+      act(() => window.dispatchEvent(new window.Event("focus")));
+      await settle();
+    };
+    await refocus();
+    check(bindingResponses.length === 9 && document.querySelector(".diagnostics") === panel &&
+      selectedLabel()?.includes("Setup proof recorded"),
+      "returning focus with an unchanged snapshot did not immediately invalidate old proof");
+    await refocus();
+    check(bindingResponses.length === 10, "a second focus did not supersede the pending proof read");
+    bindingResponses[9](knowledgeJson({ bindings: [] }));
+    await settle();
+    bindingResponses[8](knowledgeJson({ bindings: [binding] }));
+    await settle();
+    check(selectedLabel()?.includes("Setup proof recorded"),
+      "a late pre-change response restored proof after the executable was no longer verified");
+
+    await refocus();
+    check(bindingResponses.length === 11, "returning focus did not recheck the two profile bindings");
+    bindingResponses[10](knowledgeJson({ bindings: [
+      { ...binding, profile_hash: runtimeProfileHash },
+      { ...binding, runtime_profile_hash: setupProfileHash },
+    ] }));
+    await settle();
+    check(selectedLabel()?.includes("Setup proof recorded"),
+      "a binding with the wrong setup or runtime profile hash verified the role");
+
+    const managerProfile = { provider: profile.provider, model: profile.model, effort: profile.effort };
+    const managerSetupHash = await hashProfile(managerProfile);
+    const managerRuntimeProfile = {
+      adapter: "llmrelay_service_native_manager", authority: "read-only",
+      effort: profile.effort, model: profile.model, provider: profile.provider, session: "retained",
+    };
+    const managerRuntimeHash = await hashProfile(managerRuntimeProfile);
+    const managerProbe = {
+      ...probe, role: "manager" as const, profile: managerRuntimeProfile, profile_hash: managerRuntimeHash,
+      adapter: managerRuntimeProfile.adapter, adapter_hash: "manager-adapter",
+    };
+    const managerSetup: TripSetupState = {
+      ...activated,
+      selected_profiles: [{
+        role: "manager", selection_state: "selected", profile: managerProfile,
+        profile_hash: managerSetupHash, current_adapter_hash: managerProbe.adapter_hash,
+      }],
+      runtime_admissions: [{ ...activated.runtime_admissions[0], probes: [managerProbe] }],
+    };
+    const managerBinding: DiagnosticsRuntimeBinding = {
+      ...binding, role: "manager", profile_hash: managerSetupHash, runtime_profile_hash: managerRuntimeHash,
+      adapter_hash: managerProbe.adapter_hash,
+    };
+    rerender(show(managerSetup, binding.project_config_revision_id, [{ ...runtimeProof, role: "manager" }]));
+    await settle();
+    check(bindingResponses.length === 12, "switching to the Manager profile did not recheck proof");
+    bindingResponses[11](knowledgeJson({ bindings: [managerBinding] }));
+    await settle();
+    check(selectedLabel()?.includes("· Verified"), "the service Manager's runtime profile did not verify");
+    click("Refresh diagnostics");
+    await settle();
+    check(bindingResponses.length === 13 && selectedLabel()?.includes("Not verified yet"),
+      "explicit Diagnostics refresh did not invalidate the Manager's proof");
+    bindingResponses[12](knowledgeJson({ bindings: [{ ...managerBinding, runtime_profile_hash: managerSetupHash }] }));
+    await settle();
+    check(selectedLabel()?.includes("Not verified yet"),
+      "Manager verification ignored the published runtime profile hash");
+  } finally {
+    unmount();
+    for (const respond of eventResponses) respond(knowledgeJson({ events: [] }));
+    for (const respond of bindingResponses) respond(knowledgeJson({ bindings: [] }));
+    globalThis.fetch = nativeFetch;
+  }
+});
+
 Deno.test("M7 fresh qualification stays reachable while stale exact resume is held", async () => {
   localStorage.clear();
   const priorFetch = globalThis.fetch;
@@ -1802,15 +2103,13 @@ Deno.test("M7 fresh qualification stays reachable while stale exact resume is he
         if (prepareFailure === "ambiguous") {
           throw new Error("Preparation response lost");
         }
-        return new Response(JSON.stringify({ error: "Preparation refused" }), {
+        return new Response(JSON.stringify({ error: "Preparation refused", operation_id: request.operation_id, outcome_unknown: false }), {
           status: 409,
         });
       }
-      return new Response(
-        JSON.stringify({
-          result: { state: "ready", entity_id: "created-group" },
-        }),
-      );
+      return request.action === "prepare_runtime_admission"
+        ? preparedRuntimeReceipt(request)
+        : setupLaunchReceipt(request);
     }) as typeof fetch;
   const compatibility = (
     status:
@@ -2505,8 +2804,9 @@ Deno.test("M7 fresh Codex discovery and stale probe retry preserve exact resume 
   const requests: Record<string, unknown>[] = [];
   globalThis.fetch =
     (async (_input: string | URL | Request, init?: RequestInit) => {
-      requests.push(JSON.parse(String(init?.body)));
-      return new Response(JSON.stringify({ result: {} }));
+      const request = JSON.parse(String(init?.body));
+      requests.push(request);
+      return setupLaunchReceipt(request);
     }) as typeof fetch;
   const profile = {
     provider: "codex" as const,
@@ -2762,6 +3062,52 @@ const cmuxFixture = async (_sessionId = ""): Promise<CmuxViewOutcome> => ({
   retry_available: false,
 });
 
+function setupReceipt(
+  request: Record<string, unknown>,
+  entityKind: string,
+  entityId: unknown,
+  state: string,
+  version: unknown,
+  detail: Record<string, unknown>,
+) {
+  return new Response(JSON.stringify({ result: {
+    operation_id: request.operation_id,
+    entity_kind: entityKind,
+    entity_id: entityId,
+    state,
+    version,
+    detail,
+  } }));
+}
+
+function preparedRuntimeReceipt(request: Record<string, unknown>) {
+  return setupReceipt(request, "runtime_admission", "created-group", "ready", null, {
+    admission_id: "created-group",
+  });
+}
+
+function setupLaunchReceipt(request: Record<string, unknown>) {
+  const resume = ["role_resume", "runtime_probe_resume"].includes(String(request.kind));
+  return new Response(JSON.stringify({ result: {
+    operation_id: request.operation_id,
+    ...(request.kind === "runtime_probe_launch" || request.kind === "runtime_probe_resume"
+      ? { admission_id: request.admission_id }
+      : {}),
+    task_id: "setup-validation-task",
+    attempt_id: request.attempt_id ?? "setup-fixture-attempt",
+    session_id: request.session_id ?? "setup-fixture-session",
+    role_generation_id: "setup-fixture-generation",
+    status: resume ? "running_resumed_unverified" : "running",
+    launch: { provider: "codex", role: request.role ?? "explorer", model: "setup-model" },
+    process: {
+      pid: 42,
+      process_group_id: 42,
+      native_start_marker: "process-start",
+      observed_started_at: "2026-01-01T00:00:00Z",
+    },
+  } }));
+}
+
 const project: Project = {
   id: "p1",
   display_name: "Fixture",
@@ -2988,6 +3334,7 @@ Deno.test("setup migration review follows installation kind rather than path inv
   });
   const requests: Array<
     {
+      operation_id: string;
       proposal: {
         canonical_migration?: {
           observed_kind: string;
@@ -2997,10 +3344,14 @@ Deno.test("setup migration review follows installation kind rather than path inv
       };
     }
   > = [];
+  let loseProposalResponse = false;
   globalThis.fetch =
     (async (_input: string | URL | Request, init?: RequestInit) => {
-      requests.push(JSON.parse(String(init?.body)));
-      return new Response(JSON.stringify({ result: { state: "draft" } }));
+      const request = JSON.parse(String(init?.body));
+      requests.push(request);
+      if (loseProposalResponse) return new Response("{");
+      return setupReceipt(request, "trip_setup", request.setup_operation_id, "draft_saved",
+        request.expected_project_version, { proposal_hash: "draft-hash" });
     }) as typeof fetch;
   try {
     for (const kind of ["compatible", "absent", "partial", "conflicting"]) {
@@ -3068,6 +3419,42 @@ Deno.test("setup migration review follows installation kind rather than path inv
       }
       unmount();
     }
+    localStorage.clear();
+    const renderCompatible = () => <ProjectSetup project={observed("compatible")}
+      setup={setup} onChanged={noop} onViewSession={cmuxFixture} />;
+    const key = "llmrelay.trip.operations.p1";
+    const beforeFailedSave = requests.length;
+    mount(renderCompatible());
+    field("Project name", "Original proposal");
+    click("Review changes");
+    loseProposalResponse = true;
+    click("Save setup proposal"); await settle();
+    const saved = localStorage.getItem(key);
+    const original = requests.at(-1);
+    check(!!original && requests.length === beforeFailedSave + 1 &&
+      saved?.includes(original.operation_id) && saved.includes("Original proposal"),
+    "malformed save success did not preserve the original proposal");
+    click("Project settings");
+    field("Project name", "Edited proposal");
+    click("Review changes");
+    click("Save setup proposal"); await settle();
+    check(requests.length === beforeFailedSave + 1 && localStorage.getItem(key) === saved,
+      "editing the proposal replaced or dispatched over the unresolved save");
+    mount(renderCompatible());
+    loseProposalResponse = false;
+    click("Recover saved setup proposal"); await settle();
+    check(requests.length === beforeFailedSave + 2 &&
+      JSON.stringify(requests.at(-1)) === JSON.stringify(original) && localStorage.getItem(key) === "[]",
+      "recovering the original proposal changed its operation or body");
+    click("Project settings");
+    check(findField("Project name").value === "Edited proposal", "recovering the earlier proposal erased local edits");
+    click("Review changes");
+    click("Save setup proposal"); await settle();
+    check(requests.length === beforeFailedSave + 3 &&
+      requests.at(-1)?.operation_id !== original?.operation_id &&
+      JSON.stringify(requests.at(-1)?.proposal).includes("Edited proposal"),
+      "settling the original proposal did not allow a new save for the edited proposal");
+    unmount();
     localStorage.clear();
     mount(
       <ProjectSetup
@@ -3157,6 +3544,28 @@ function unmount() {
   const mounted = root;
   root = undefined;
   act(() => mounted.unmount());
+}
+function SettleJournalBeforeSubscription(
+  { storage, storageKey, saved, pendingControl }: {
+    storage: Pick<Storage, "getItem" | "removeItem">;
+    storageKey: string;
+    saved: string;
+    pendingControl: string;
+  },
+) {
+  useLayoutEffect(() => {
+    // The replacement panel has rendered the saved request. Publish its
+    // settlement at the browser boundary before passive effects subscribe.
+    check(document.body.textContent?.includes(pendingControl) && storage.getItem(storageKey) === saved,
+      "the replacement panel did not initially see the saved request");
+    storage.removeItem(storageKey);
+    // The installed browser global exposes the DOM CustomEvent's string detail type.
+    const browserWindow = globalThis.window;
+    browserWindow.dispatchEvent(
+      new browserWindow.CustomEvent(recoveryJournalChanged, { detail: storageKey }),
+    );
+  }, [storage, storageKey, saved, pendingControl]);
+  return null;
 }
 function change(
   element: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement,
@@ -3707,10 +4116,10 @@ Deno.test("A04 setup clears definite stale identity but preserves an ambiguous e
     const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
     definiteRequests.push(body);
     return definiteRequests.length === 1
-      ? new Response(JSON.stringify({ error: "stale project version" }), {
+      ? new Response(JSON.stringify({ error: "stale project version", operation_id: body.operation_id, outcome_unknown: false }), {
         status: 409,
       })
-      : new Response(JSON.stringify({ result: { state: "prepared" } }));
+      : preparedRuntimeReceipt(body);
   }) as typeof fetch;
   try {
     mount(
@@ -3767,7 +4176,7 @@ Deno.test("A04 setup clears definite stale identity but preserves an ambiguous e
           true,
         );
       }
-      return new Response(JSON.stringify({ result: { state: "prepared" } }));
+      return preparedRuntimeReceipt(body);
     }) as typeof fetch;
     mount(
       <ProjectSetup
@@ -3863,6 +4272,339 @@ Deno.test("A13 setup storage failure stays visible and releases the command guar
       value: originalSetItem,
     });
     localStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Project Setup retains the exact request until a matching receipt confirms it", async () => {
+  const key = `llmrelay.trip.operations.${initialized.id}`;
+  const wrongId = (request: Record<string, unknown>) =>
+    preparedRuntimeReceipt({ ...request, operation_id: "different-setup-request" });
+  const badReplies = [
+    ["empty", () => new Response("")],
+    ["malformed", () => new Response("private fixture bytes")],
+    ["wrong envelope", () => new Response(JSON.stringify({ result: [] }))],
+    ["wrong receipt shape", () => new Response(JSON.stringify({ result: { state: "ready" } }))],
+    ["unreadable body", () => {
+      const response = new Response();
+      response.text = () => Promise.reject(new Error("private fixture bytes"));
+      return response;
+    }],
+    ["different operation", wrongId],
+  ] as const;
+  for (const [label, reply] of badReplies) {
+    localStorage.clear();
+    const bodies: string[] = [];
+    let refreshes = 0;
+    globalThis.fetch = (async (_input, init) => {
+      const body = String(init?.body);
+      const request = JSON.parse(body);
+      bodies.push(body);
+      switch (bodies.length) {
+        case 1:
+          return reply(request);
+        case 2:
+          return wrongId(request);
+        case 3:
+          return new Response(JSON.stringify({ error: "stale version" }), { status: 409 });
+        default:
+          return preparedRuntimeReceipt(request);
+      }
+    }) as typeof fetch;
+    const setup = (version: number) => <ProjectSetup
+      project={{ ...initialized, version }}
+      onChanged={() => { refreshes++; }}
+      onViewSession={cmuxFixture}
+    />;
+    try {
+      mount(setup(4));
+      click("Prepare exact runtime verification");
+      await settle();
+      const original = JSON.parse(bodies[0]);
+      const { kind: _kind, operation_id: id, ...action } = original;
+      const saved = localStorage.getItem(key);
+      check(saved === JSON.stringify([["prepare-runtime", { body: JSON.stringify(action), id }]]) &&
+        document.body.textContent?.includes("outcome is uncertain") &&
+        !document.body.textContent.includes("private fixture bytes"),
+      `${label} discarded the exact saved request or showed unchecked response text`);
+      mount(setup(5));
+      await settle();
+      check(bodies.length === 1, `${label} caused an automatic redispatch`);
+      const claimed = JSON.stringify([["prepare-runtime", { body: JSON.stringify(action), id, replayClaimed: true }]]);
+      for (const expectedCount of [2, 3]) {
+        click("Prepare exact runtime verification");
+        await settle();
+        check(bodies.length === expectedCount && bodies.at(-1) === bodies[0] &&
+          localStorage.getItem(key) === claimed,
+        `${label} changed or cleared the exact request before a matching receipt`);
+      }
+      click("Prepare exact runtime verification");
+      await settle();
+      check(bodies.length === 4 && bodies[3] === bodies[0] && refreshes === 4 &&
+        localStorage.getItem(key) === "[]" && !document.body.textContent?.includes("outcome is uncertain"),
+      `${label} did not settle after the matching receipt`);
+    } finally {
+      unmount();
+      localStorage.clear();
+      globalThis.fetch = nativeFetch;
+    }
+  }
+});
+
+async function verifySetupAuthorizationRecovery(settledBy: "matching receipt" | "terminal refusal") {
+  const key = `llmrelay.trip.operations.${initialized.id}`;
+  const authorizationLabel = "Authorize affected profile probes and exact unchanged reuse";
+  const draft: TripSetupState = {
+    setup_operation_id: "authorize-setup",
+    project_id: initialized.id,
+    state: "draft",
+    proposal_hash: "proposal-a",
+    target_inventory: {}, final_files: [], agents_file: {},
+    installation_source_binding_complete: false,
+    installation_source_binding_reason: "draft",
+    selected_profiles: [], probe_receipts: [], sessions: [], runtime_admissions: [],
+    created_at: "", updated_at: "",
+  };
+  const setupProject: Project = {
+    ...initialized,
+    trip: { ...initialized.trip!, readiness: "setup_in_progress", setup_operation_id: draft.setup_operation_id },
+  };
+  const show = (setup: TripSetupState) => (
+    <ProjectSetup project={setupProject} setup={setup} onChanged={noop} onViewSession={cmuxFixture} />
+  );
+  const requests: Array<{ path: string; body: string }> = [];
+  let finishReplay: ((response: Response) => void) | undefined;
+  globalThis.fetch = async (input, init) => {
+    const body = String(init?.body);
+    requests.push({ path: String(input), body });
+    if (requests.length === 1) {
+      // Proposal A never reached the service in the supersession case.
+      throw new TypeError(settledBy === "terminal refusal" ? "Authorization never reached the service" : "Probe authorization response lost");
+    }
+    const request = JSON.parse(body);
+    if (request.proposal_hash === "proposal-b") {
+      return setupReceipt(request, "trip_setup", draft.setup_operation_id, "probes_authorized", null,
+        { proposal_hash: request.proposal_hash });
+    }
+    return await new Promise<Response>((resolve) => { finishReplay = resolve; });
+  };
+  const recoveryButtons = () => [...document.querySelectorAll<HTMLButtonElement>("button")]
+    .filter((button) => /recover saved/i.test(button.textContent ?? ""));
+  let releaseLock: (() => void) | undefined;
+  localStorage.removeItem(key);
+  try {
+    mount(show(draft));
+    releaseLock = holdStorageLock(key);
+    click(authorizationLabel);
+    await settle();
+    check(requests.length === 0 && localStorage.getItem(key) === null,
+      "authorization published its identity or dispatched while another window held the journal lock");
+    releaseLock();
+    releaseLock = undefined;
+    await settle();
+
+    check(requests.length === 1 && requests[0].path === "/api/command",
+      "the initial authorization did not send a command");
+    const original = JSON.parse(requests[0].body);
+    const saved = localStorage.getItem(key);
+    check(saved && original.kind === "trip" && original.action === "authorize_setup_probes" &&
+      original.setup_operation_id === draft.setup_operation_id && original.proposal_hash === "proposal-a" &&
+      JSON.parse(saved)[0][1].id === original.operation_id, "proposal A was not saved with its exact identity");
+    if (!saved) throw new Error("missing authorization journal");
+
+    const newer = { ...draft, proposal_hash: "proposal-b" };
+    rerender(show(newer));
+    check(document.body.textContent?.includes("proposal-b"), "the visible proposal did not change");
+    click(authorizationLabel);
+    await settle();
+    check(requests.length === 1 && localStorage.getItem(key) === saved,
+      "authorizing the visible proposal overwrote or sent the unresolved proposal");
+
+    const recover = recoveryButtons()[0];
+    check(recoveryButtons().length === 1 && recover && !recover.disabled,
+      "the earlier probe authorization was missing from Project Setup recovery");
+    const recoverOriginal = async () => {
+      const before = requests.length;
+      finishReplay = undefined;
+      click("Recover saved setup probe authorization");
+      await settle();
+      check(requests.length === before + 1 && requests[before].path === "/api/command" &&
+        requests[before].body === requests[0].body && finishReplay,
+        "recovery did not send proposal A and its original ID to the command route");
+    };
+    const unmarked = {
+      error: "Setup proposal has changed",
+      operation_id: original.operation_id,
+      outcome_unknown: false,
+    };
+    const exactRefusal = { ...unmarked, terminal_refusal: true };
+    if (settledBy === "terminal refusal") {
+      const originalIdentity = JSON.parse(saved)[0][1];
+      for (const refusal of [
+        { ...exactRefusal, operation_id: "foreign-authorization" },
+        { ...exactRefusal, outcome_unknown: true },
+        unmarked,
+      ]) {
+        await recoverOriginal();
+        finishReplay?.(knowledgeJson(refusal, 409));
+        await settle();
+        const before = requests.length;
+        click(authorizationLabel);
+        await settle();
+        const identity = JSON.parse(localStorage.getItem(key) ?? "[]")[0]?.[1];
+        check(identity?.id === originalIdentity.id && identity.body === originalIdentity.body &&
+          requests.length === before, "an inconclusive refusal cleared A or let B dispatch");
+      }
+    }
+
+    await recoverOriginal();
+    const claimed = localStorage.getItem(key);
+    if (!claimed) throw new Error("missing replay journal");
+    releaseLock = holdStorageLock(key);
+    finishReplay?.(settledBy === "terminal refusal" ? knowledgeJson(exactRefusal, 409) :
+      setupReceipt(original, "trip_setup", draft.setup_operation_id, "probes_authorized", null,
+        { proposal_hash: original.proposal_hash }));
+    await settle();
+    check(localStorage.getItem(key) === claimed, "recovery removed the entry before acquiring the journal lock");
+    const otherWindowEntry = ["prepare-runtime", {
+      id: "other-window-prepare",
+      body: JSON.stringify({ action: "prepare_runtime_admission", project_id: initialized.id, expected_version: initialized.version }),
+    }];
+    localStorage.setItem(key, JSON.stringify([...JSON.parse(claimed), otherWindowEntry]));
+    releaseLock();
+    releaseLock = undefined;
+    await settle();
+    check(localStorage.getItem(key) === JSON.stringify([otherWindowEntry]),
+      "settlement removed another window's saved request");
+
+    if (settledBy === "terminal refusal") {
+      const before = requests.length;
+      const authorize = findButton(authorizationLabel);
+      act(() => { authorize.click(); authorize.click(); });
+      await settle();
+      const fresh = JSON.parse(requests.at(-1)!.body);
+      check(requests.length === before + 1 && requests[before].path === "/api/command" &&
+        fresh.proposal_hash === "proposal-b" && typeof fresh.operation_id === "string" &&
+        fresh.operation_id !== original.operation_id &&
+        localStorage.getItem(key) === JSON.stringify([otherWindowEntry]),
+        "settlement did not permit one fresh authorization for proposal B");
+    }
+
+    const beforeMalformed = requests.length;
+    const malformed = JSON.stringify([["authorize-probes", {
+      id: original.operation_id,
+      body: JSON.stringify({
+        action: "authorize_setup_probes", setup_operation_id: draft.setup_operation_id,
+        proposal_hash: draft.proposal_hash,
+        kind: "runtime_probe_launch", admission_id: "wrong-route", role: "implementer",
+      }),
+    }]]);
+    localStorage.setItem(key, malformed);
+    mount(show(newer));
+    for (const button of recoveryButtons()) act(() => button.click());
+    click(authorizationLabel);
+    await settle();
+    check(requests.length === beforeMalformed && localStorage.getItem(key) === malformed,
+      "a mismatched saved action was routed to transport or overwritten");
+  } finally {
+    releaseLock?.();
+    finishReplay?.(new Response(null, { status: 409 }));
+    unmount();
+    localStorage.removeItem(key);
+    globalThis.fetch = nativeFetch;
+  }
+}
+
+Deno.test("Project Setup recovers the original probe authorization and preserves another window's entry", () =>
+  verifySetupAuthorizationRecovery("matching receipt"));
+
+Deno.test("Project Setup recovers a superseded probe authorization through an exact terminal refusal", () =>
+  verifySetupAuthorizationRecovery("terminal refusal"));
+
+Deno.test("Project Setup keeps an uncertain peer replay after the initial window's admission refusal", async () => {
+  const key = `llmrelay.trip.operations.${initialized.id}`;
+  const pending = "prepare-runtime";
+  const unrelated = ["inspect", {
+    id: "other-window-inspection",
+    body: JSON.stringify({ action: "inspect_project", project_id: initialized.id }),
+  }];
+  const windowA = new Map<string, string>();
+  const windowB = new Map<string, string>();
+  const setup = (inFlightRequests: Map<string, string>) => <ProjectSetup
+    project={initialized}
+    onChanged={noop}
+    onViewSession={cmuxFixture}
+    inFlightRequests={inFlightRequests}
+  />;
+  const show = (showPeer: boolean) => <>
+    <section id="setup-window-a">{setup(windowA)}</section>
+    <section id="setup-window-b">{showPeer && setup(windowB)}</section>
+  </>;
+  const requests: Array<{ path: string; body: string }> = [];
+  let refuseInitial: (() => void) | undefined;
+  let loseReplay: (() => void) | undefined;
+  globalThis.fetch = async (input, init) => {
+    const body = String(init?.body);
+    requests.push({ path: String(input), body });
+    if (requests.length === 1) {
+      return await new Promise<Response>((resolve) => {
+        refuseInitial = () => resolve(knowledgeJson({
+          error: "Initial attempt denied admission",
+          operation_id: JSON.parse(body).operation_id,
+          outcome_unknown: false,
+        }, 503));
+      });
+    }
+    if (requests.length === 2) {
+      return await new Promise<Response>((_resolve, reject) => {
+        loseReplay = () => reject(new TypeError("Peer response lost"));
+      });
+    }
+    return preparedRuntimeReceipt(JSON.parse(body));
+  };
+  localStorage.setItem(key, JSON.stringify([unrelated]));
+  try {
+    mount(show(false));
+    const a = document.getElementById("setup-window-a")!;
+    const b = document.getElementById("setup-window-b")!;
+    click("Prepare exact runtime verification", a);
+    await settle();
+    const sent = requests[0];
+    check(requests.length === 1 && sent.path === "/api/command" && refuseInitial,
+      "window A did not send and hold the initial request");
+    const { kind: _kind, operation_id: id, ...request } = JSON.parse(sent.body);
+    const original = { body: JSON.stringify(request), id };
+    check(localStorage.getItem(key) === JSON.stringify([unrelated, [pending, original]]),
+      "window A did not publish the exact request alongside the unrelated entry");
+
+    rerender(show(true));
+    const recover = "Recover saved runtime verification preparation";
+    click(recover, b);
+    await settle();
+    check(requests.length === 2 && requests[1].path === sent.path && requests[1].body === sent.body && loseReplay,
+      "window B did not recover the same operation while window A was in flight");
+    loseReplay?.();
+    await settle();
+    check(b.textContent?.includes("outcome is uncertain"), "window B did not observe the lost response");
+
+    refuseInitial?.();
+    await settle();
+    check(a.textContent?.includes("Initial attempt denied admission") &&
+      a.textContent.includes("outcome is uncertain") &&
+      localStorage.getItem(key) === JSON.stringify([unrelated, [pending, { ...original, replayClaimed: true }]]),
+      "window A's late admission refusal lost the peer's exact request or an unrelated entry");
+
+    click(recover, b);
+    await settle();
+    check(requests.length === 3 && requests[2].path === sent.path && requests[2].body === sent.body &&
+      localStorage.getItem(key) === JSON.stringify([unrelated]),
+      "window B could not recover the original request without disturbing unrelated work");
+  } finally {
+    unmount();
+    refuseInitial?.();
+    loseReplay?.();
+    await settle();
+    localStorage.removeItem(key);
     globalThis.fetch = nativeFetch;
   }
 });
@@ -4148,6 +4890,20 @@ Deno.test("T15 role control and human review dispatch exact authority without fa
             }),
           },
         }));
+      }
+      if (request.action === "prepare_runtime_admission" && !request.task_id) return preparedRuntimeReceipt(request);
+      if (request.action === "stop_setup_manager") {
+        return setupReceipt(request, "trip_setup", request.setup_operation_id,
+          "manager_interrupt_requested", request.expected_project_version, {});
+      }
+      if (request.action === "change_setup_manager") {
+        return setupReceipt(request, "trip_setup", "replacement-setup",
+          "manager_replacement_ready", Number(request.expected_project_version) + 1,
+          { source_setup_operation_id: request.setup_operation_id });
+      }
+      if (request.session_id === "setup-recovery-session-current-50" && request.kind === "role_resume" ||
+        request.admission_id === "runtime-recovery-admission" && request.kind === "runtime_probe_resume") {
+        return setupLaunchReceipt(request);
       }
       return new Response(JSON.stringify({ result: { state: "requested" } }));
     }) as typeof fetch;
@@ -6695,7 +7451,8 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
         "permission request did not expose exactly three actions",
       );
     }
-    click("Always approve matching actions");
+    const opener = findButton("Always approve matching actions");
+    act(() => { opener.focus(); opener.click(); });
     if (requests.length !== 0) {
       throw new Error("opening the project suggestion submitted a decision");
     }
@@ -6711,7 +7468,22 @@ Deno.test("T19 permission inbox scopes exact actions, refreshes conflicts, and r
     if (scope.value !== "project") {
       throw new Error("Project scope was not the backend-backed default");
     }
-    change(scope as unknown as HTMLInputElement, "session");
+    const dialog = scope.closest('[role="dialog"]')!;
+    const last = dialog.querySelector<HTMLElement>("summary")!;
+    for (const element of dialog.querySelectorAll<HTMLElement>("select, input, button, summary")) {
+      Object.defineProperty(element, "getClientRects", { configurable: true, value: () => [{}] });
+    }
+    check(document.activeElement === scope, "approval scope did not receive initial focus");
+    act(() => scope.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true })));
+    check(document.activeElement === last, "Shift+Tab escaped the approval dialog");
+    act(() => last.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true })));
+    check(document.activeElement === scope, "Tab escaped the approval dialog");
+    act(() => scope.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
+    check(!dialog.isConnected && document.activeElement === opener && requests.length === 0,
+      "Escape did not restore the approval opener or sent a decision");
+    click("Always approve matching actions");
+    const reopenedScope = findSelect("Lifetime");
+    change(reopenedScope, "session");
     if (
       !document.body.textContent?.includes(
         "this exact managed role/native session and worktree",
@@ -11268,17 +12040,19 @@ Deno.test("Board and header actions open every destination kind exactly, list ev
 
 Deno.test("Progress facts and paused-service notices keep raw causes in technical details", async () => {
   const priorEnvironment = { ...liveEnvironment };
-  globalThis.fetch = (async () =>
-    new Response(JSON.stringify({
-      events: [{
-        timestamp: "2026-01-01T00:00:00Z",
-        severity: "warn",
-        event_code: "coordinator.tick",
-        component: "coordinator",
-        outcome: "deferred",
-        detail: { cause: "sqlite busy at 0xdeadbeef" },
-      }],
-    }))) as typeof fetch;
+  globalThis.fetch = (async (url) =>
+    String(url) === "/api/diagnostics/runtime-bindings"
+      ? knowledgeJson({ error: "Not found" }, 404)
+      : knowledgeJson({
+        events: [{
+          timestamp: "2026-01-01T00:00:00Z",
+          severity: "warn",
+          event_code: "coordinator.tick",
+          component: "coordinator",
+          outcome: "deferred",
+          detail: { cause: "sqlite busy at 0xdeadbeef" },
+        }],
+      })) as typeof fetch;
   const progressing: Task = {
     ...task,
     progress: {
@@ -12319,8 +13093,11 @@ Deno.test("Setup installation review explains the files and steps plainly and ke
   const requests: Record<string, unknown>[] = [];
   globalThis.fetch =
     (async (_input: string | URL | Request, init?: RequestInit) => {
-      requests.push(JSON.parse(String(init?.body)));
-      return new Response(JSON.stringify({ result: {} }));
+      const request = JSON.parse(String(init?.body));
+      requests.push(request);
+      return setupReceipt(request, "trip_setup", request.setup_operation_id,
+        request.action === "authorize_installation" ? "installation_authorized" : "installation_finalized",
+        null, { proposal_hash: request.proposal_hash });
     }) as typeof fetch;
   const fresh: Project = {
     ...initialized,
@@ -13865,11 +14642,20 @@ Deno.test("Failed session stop and native notice dismissal keep exact requests a
     unmount();
     mount(render(stopping, prompted));
     check(requests.length === 1, "reconnect replayed a stop without a click");
+    const stopStorageKey = `llmrelay.failure.stop.${stopped.id}`;
+    const savedStop = localStorage.getItem(stopStorageKey);
+    respond = () => new Response(JSON.stringify({ error: "stop authority changed" }), { status: 409 });
+    click("Check previous stop request");
+    await settle();
+    check(!!savedStop && localStorage.getItem(stopStorageKey) === savedStop &&
+      JSON.stringify(requests[1]) === JSON.stringify(requests[0]),
+    "a refusal on stop replay settled the earlier uncertain request");
     respond = () => receipt("stop_recovery_required");
     click("Check previous stop request");
     await settle();
     check(
-      JSON.stringify(requests[1]) === JSON.stringify(requests[0]),
+      JSON.stringify(requests[2]) === JSON.stringify(requests[0]) &&
+        localStorage.getItem(stopStorageKey) === null,
       "stop reconciliation invented new authority or an operation ID",
     );
     const paused = {
@@ -13893,7 +14679,7 @@ Deno.test("Failed session stop and native notice dismissal keep exact requests a
     click("Dismiss notice");
     await settle();
     const { operation_id: dismissId, kind: dismissKind, ...dismissal } =
-      requests[2];
+      requests[3];
     check(
       dismissKind === "dismiss_native_prompt" && dismissId !== stopId &&
         JSON.stringify(dismissal) ===
@@ -13942,8 +14728,8 @@ Deno.test("Failed session stop and native notice dismissal keep exact requests a
     click("Dismiss notice");
     await settle();
     check(
-      requests[3].displayed_boundary_hook_event_id === "notice-3" &&
-        requests[3].operation_id !== dismissId,
+      requests[4].displayed_boundary_hook_event_id === "notice-3" &&
+        requests[4].operation_id !== dismissId,
       "a later same-turn notice reused the old dismissal frontier",
     );
     const historyStopped: Session = {
@@ -13963,7 +14749,7 @@ Deno.test("Failed session stop and native notice dismissal keep exact requests a
     click("Stop failed session and pause task");
     await settle();
     const { operation_id: historyStopId, kind: historyKind, ...historyBinding } =
-      requests[4];
+      requests[5];
     check(
       historyKind === "stop_failed_session" && historyStopId !== stopId &&
         JSON.stringify(historyBinding) ===
@@ -15783,6 +16569,23 @@ Deno.test("H1 failed-step retry waits for unknown outcomes and an exact selectio
   }
 });
 
+function guidanceApprovalReceipt(request: Record<string, unknown>) {
+  return setupReceipt(
+    request, "attempt", request.attempt_id, "guidance_reauthorized",
+    Number(request.expected_version) + 1,
+    {
+      attempt_id: request.attempt_id,
+      task_version: request.expected_version,
+      plan_hash: request.plan_hash,
+      config_revision_id: request.config_revision_id,
+      previous_policy_hash: request.policy_hash,
+      policy_hash: "c".repeat(64),
+      approved_at: "2026-01-01T00:00:00Z",
+      files: request.files,
+    },
+  );
+}
+
 Deno.test("Planned documentation recovery previews content and approves only its exact current binding", async () => {
   const requests: Record<string, unknown>[] = [];
   let refreshes = 0;
@@ -15805,10 +16608,9 @@ Deno.test("Planned documentation recovery previews content and approves only its
       if (String(input).endsWith("/guidance-reauthorization")) {
         return new Response(JSON.stringify(preview));
       }
-      requests.push(JSON.parse(String(init?.body)));
-      return new Response(
-        JSON.stringify({ result: { state: "guidance_reauthorized" } }),
-      );
+      const request = JSON.parse(String(init?.body));
+      requests.push(request);
+      return guidanceApprovalReceipt(request);
     }) as typeof fetch;
   try {
     mount(
@@ -15863,6 +16665,154 @@ Deno.test("Planned documentation recovery previews content and approves only its
     );
   } finally {
     unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Guidance Recovery checks the saved approval after remount and a stale attempt", async () => {
+  const originalTask = { ...task, id: "guidance-recovery-replay" };
+  const key = `llmrelay.guidance.approval.${originalTask.project_id}:${originalTask.id}`;
+  const nextTask = {
+    ...originalTask,
+    progress: null,
+    version: originalTask.version + 1,
+    active_attempt: { ...originalTask.active_attempt!, id: "a2", plan_hash: "new-plan" },
+  };
+  const bodies: string[] = [];
+  let previews = 0;
+  let refreshes = 0;
+  const pendingResponse: { finish?: (response: Response) => void } = {};
+  const render = (selected: Task) => <GuidanceRecovery
+    task={selected}
+    onChanged={() => { refreshes++; }}
+  />;
+  const details = (selected: Task) => <TaskDetail task={selected}
+    state={{ ...liveBase, tasks: [selected], recovery: [] }}
+    onClose={noop} onChanged={() => { refreshes++; }} />;
+  globalThis.fetch = (async (input, init) => {
+    if (String(input).endsWith("/guidance-reauthorization")) {
+      previews++;
+      const selected = previews === 1 ? originalTask : nextTask;
+      return new Response(JSON.stringify({
+        task_id: selected.id,
+        attempt_id: selected.active_attempt!.id,
+        expected_version: selected.version,
+        plan_hash: selected.active_attempt!.plan_hash ?? "original-plan",
+        config_revision_id: "project-config",
+        policy_hash: "d".repeat(64),
+        files: [{
+          path: "README.md",
+          previous_sha256: "a".repeat(64),
+          sha256: "b".repeat(64),
+          content: "Reviewed documentation content",
+        }],
+      }));
+    }
+    if (String(input) !== "/api/command") return new Response("[]");
+    const body = String(init?.body);
+    bodies.push(body);
+    const request = JSON.parse(body);
+    switch (bodies.length) {
+      case 1: return new Response(null, { status: 204 });
+      case 2: return new Response(JSON.stringify({ error: "attempt no longer current" }), { status: 409 });
+      case 3: return guidanceApprovalReceipt({ ...request, attempt_id: "unrelated-attempt" });
+      case 4: return guidanceApprovalReceipt(request);
+      case 6: return await new Promise<Response>((resolve) => { pendingResponse.finish = resolve; });
+      default: return new Response(JSON.stringify({ error: "new preview stale", operation_id: request.operation_id, outcome_unknown: false }), { status: 409 });
+    }
+  }) as typeof fetch;
+  const checkApproval = () => {
+    act(() => findField("I checked the task activity").click());
+    click("Check saved instruction approval");
+  };
+  try {
+    mount(render(originalTask));
+    click("Review planned documentation update");
+    await settle();
+    click("Approve planned documentation update");
+    await settle();
+    const original = bodies[0];
+    check(!!original && localStorage.getItem(key) === original &&
+      !original.includes("Reviewed documentation content"),
+    "an unreadable success failed to preserve the exact approval hashes and operation ID");
+
+    mount(details({
+      ...originalTask,
+      progress: {
+        reason_code: "workflow.attempt_readiness_stale",
+        waiting_reason: "Instructions changed",
+        responsible: "you",
+        responsible_role: null,
+        next_operation: null,
+        next_target: null,
+        waiting_since: null,
+        last_meaningful_at: null,
+        last_meaningful_event: null,
+        last_agent_activity_at: null,
+        activity: "no_live_agent",
+      },
+    }));
+    rerender(details(nextTask));
+    check(findButton("Check saved instruction approval").disabled,
+      "refresh hid the original approval or skipped its required activity check");
+    mount(details(nextTask));
+    await settle();
+    check(bodies.length === 1 && previews === 1 &&
+      findButton("Check saved instruction approval").disabled &&
+      !document.body.textContent?.includes("Approve planned documentation update") &&
+      !document.body.textContent?.includes("Reviewed documentation content"),
+    "remount automatically sent a mutation, enabled a new approval, or exposed saved payload");
+    for (const expectedCount of [2, 3]) {
+      checkApproval();
+      await settle();
+      check(bodies.length === expectedCount && bodies.at(-1) === original &&
+        localStorage.getItem(key) === original,
+      "a refusal or mismatched receipt replaced the original approval");
+    }
+    checkApproval();
+    await settle();
+    check(bodies.length === 4 && bodies[3] === original && refreshes === 4 &&
+      localStorage.getItem(key) === null,
+    "the matching receipt did not settle the saved approval for the old attempt");
+    check(!document.querySelector(".guidance-recovery"),
+      "fresh instruction review was offered after the conflict and saved request cleared");
+
+    mount(render(nextTask));
+    click("Review planned documentation update");
+    await settle();
+    click("Approve planned documentation update");
+    await settle();
+    const next = JSON.parse(bodies[4]);
+    check(bodies.length === 5 && next.attempt_id === "a2" &&
+      next.operation_id !== JSON.parse(original).operation_id &&
+      localStorage.getItem(key) === null &&
+      document.body.textContent?.includes("new preview stale"),
+    "fresh approval after reconciliation did not use current authority or clear its definite refusal");
+    click("Approve planned documentation update"); await settle();
+    check(pendingResponse.finish && localStorage.getItem(key) === bodies[5], "the approval was not saved before remount");
+    mount(render(nextTask));
+    check(findButton("Check saved instruction approval").disabled, "remount enabled replay of an approval still in flight");
+    await act(async () => pendingResponse.finish?.(guidanceApprovalReceipt(JSON.parse(bodies[5]))));
+    await settle();
+    check(bodies.length === 6 && refreshes === 5 && localStorage.getItem(key) === null &&
+      !document.body.textContent?.includes("Check saved instruction approval") &&
+      !findButton("Review planned documentation update").disabled,
+    "original settlement did not unlock the mounted approval or invoked a stale refresh callback");
+
+    localStorage.setItem(key, bodies[5]);
+    mount(<>
+      {render(nextTask)}
+      <SettleJournalBeforeSubscription storage={localStorage} storageKey={key}
+        saved={bodies[5]} pendingControl="Check saved instruction approval" />
+    </>);
+    check(bodies.length === 6 && refreshes === 5 && localStorage.getItem(key) === null &&
+      !document.body.textContent?.includes("Check saved instruction approval") &&
+      !findButton("Review planned documentation update").disabled,
+      "the remounted approval missed settlement between its initial read and subscription");
+  } finally {
+    pendingResponse.finish?.(new Response("{}", { status: 409 }));
+    unmount();
+    localStorage.removeItem(key);
     globalThis.fetch = nativeFetch;
   }
 });
@@ -16704,6 +17654,42 @@ Deno.test("Queued dependencies can be removed and added with exact task versions
   }
 });
 
+Deno.test("F17 dependency integration refs stay with their edges after refresh", async () => {
+  localStorage.clear();
+  const first = { task_id: "AJ-dependency-a", verified_at: null };
+  const second = { task_id: "AJ-dependency-b", verified_at: null };
+  const queued: Task = { ...task, lifecycle: "backlog", active_attempt: undefined, dependencies: [first, second] };
+  const view = (selected: Task) => <TaskDetail task={selected}
+    state={{ ...liveBase, tasks: [selected] }} onClose={noop} onChanged={noop} />;
+  const commands: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (url, init) => {
+    if (String(url) !== "/api/command") return new Response("[]");
+    commands.push(JSON.parse(String(init?.body)));
+    return knowledgeJson({ result: { state: "integration_recorded" } });
+  }) as typeof fetch;
+  try {
+    mount(view(queued));
+    click("Changes");
+    const refFor = (id: string) => findField(`Integration ref for ${id}`);
+    change(refFor(first.task_id), "main-with-a");
+    check(refFor(second.task_id).value === "", "editing one dependency changed its neighbor");
+    change(refFor(second.task_id), "main-with-b");
+    rerender(view({ ...queued, version: queued.version + 1, dependencies: [second, first] }));
+    check(refFor(first.task_id).value === "main-with-a" && refFor(second.task_id).value === "main-with-b",
+      "the refreshed dependency order moved refs to different edges");
+    click("Record", refFor(second.task_id).closest(".review-row")!);
+    await settle();
+    check(commands.length === 1 && commands[0].kind === "record_integration" &&
+      commands[0].depends_on_task_id === second.task_id && commands[0].git_ref === "main-with-b" &&
+      commands[0].expected_version === queued.version + 1,
+      "Record submitted a different dependency, ref, or task version");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
+});
+
 Deno.test("Uncertain draft deletion retains the exact operation after reopening", async () => {
   const requests: Record<string, unknown>[] = [];
   let closed = 0;
@@ -17221,10 +18207,56 @@ Deno.test("Queued edit remains pending when another client advances the task ver
 });
 
 Deno.test("Probe launch explains conflicting writer and reviewer sessions before dispatch", async () => {
+  localStorage.clear();
   const requests: Record<string, unknown>[] = [];
+  const runtimeBodies: string[] = [];
+  const runtimeStarts = new Set<unknown>();
+  const capacityBodies: string[] = [];
+  let refusedLaunchId: unknown;
+  let capacityFull = true;
+  let replayReply: "admission" | "wrong-hash" | "wrong-id" | "pending" | "terminal" = "admission";
   globalThis.fetch = (async (_input, init) => {
-    requests.push(JSON.parse(String(init?.body)));
-    return new Response(JSON.stringify({ result: { state: "launched" } }));
+    const body = String(init?.body);
+    const request = JSON.parse(body);
+    requests.push(request);
+    if (request.kind === "runtime_probe_launch") {
+      if (request.admission_id === "capacity-scope") {
+        capacityBodies.push(body);
+        if (capacityFull && capacityBodies.length === 1) {
+          refusedLaunchId = request.operation_id;
+          throw new TypeError("Connection lost after saving the capacity refusal");
+        }
+        if (request.operation_id === refusedLaunchId) {
+          switch (replayReply) {
+            case "admission":
+              return knowledgeJson({ error: "Request admission refused", outcome_unknown: false }, 403);
+            case "wrong-hash":
+              return knowledgeJson({ error: "Request hash mismatch", operation_id: refusedLaunchId, outcome_unknown: false }, 409);
+            case "wrong-id":
+              return knowledgeJson({ error: "Another launch was refused", operation_id: "other-launch", outcome_unknown: false, terminal_refusal: true }, 409);
+            case "pending":
+              return knowledgeJson({ error: "Launch still pending", operation_id: refusedLaunchId, outcome_unknown: true }, 409);
+            case "terminal":
+              return knowledgeJson({ error: "At capacity", operation_id: refusedLaunchId, outcome_unknown: false, terminal_refusal: true }, 409);
+          }
+        }
+        check(!capacityFull, "the client requested a new launch before the saved refusal was confirmed");
+        runtimeStarts.add(request.operation_id);
+        return setupLaunchReceipt(request);
+      }
+      runtimeStarts.add(request.operation_id);
+      runtimeBodies.push(body);
+      if (runtimeBodies.length === 1) {
+        return setupLaunchReceipt({
+          ...request, operation_id: "other-launch", admission_id: "other-admission",
+          attempt_id: "other-attempt", session_id: "other-session",
+        });
+      }
+      if (runtimeBodies.length === 2) {
+        return setupLaunchReceipt({ ...request, admission_id: "other-admission" });
+      }
+    }
+    return requests.length === 1 ? new Response("null") : setupLaunchReceipt(request);
   }) as typeof fetch;
   const reader: TripSetupState["sessions"][number] = {
     id: "probe-reader",
@@ -17290,6 +18322,14 @@ Deno.test("Probe launch explains conflicting writer and reviewer sessions before
       requests.length === 1 && requests[0].role === "implementer",
       "unblocked writer lost its exact dispatch role",
     );
+    const key = `llmrelay.trip.operations.${initialized.id}`;
+    check(localStorage.getItem(key)?.includes(String(requests[0].operation_id)),
+      "an invalid launch envelope cleared the saved dispatch");
+    act(() => implementer().querySelector<HTMLButtonElement>("button")!.click());
+    await settle();
+    check(requests.length === 2 && JSON.stringify(requests[1]) === JSON.stringify(requests[0]) &&
+      localStorage.getItem(key) === "[]",
+    "the checked launch result did not settle the exact saved dispatch");
     unmount();
     mount(
       card({
@@ -17337,6 +18377,86 @@ Deno.test("Probe launch explains conflicting writer and reviewer sessions before
         runtimeRow.querySelector<HTMLButtonElement>("button")?.disabled,
       "runtime probe omitted its conflicting reader",
     );
+    rerender(card({ ...runtime, sessions: [] }));
+    click("Launch bounded probe"); await settle();
+    const runtimeSaved = localStorage.getItem(key);
+    check(runtimeBodies.length === 1 && runtimeSaved?.includes("runtime-scope") &&
+      runtimeSaved.includes(String(requests.at(-1)?.operation_id)),
+      "a valid same-role response for another admission settled the original launch");
+    // The original launch became visible in the service before its receipt was recovered.
+    mount(card({
+      ...runtime, sessions: [],
+      runtime_admissions: [{
+        ...runtime.runtime_admissions[0], state: "running",
+        probes: [{ ...runtime.runtime_admissions[0].probes[0], state: "running" }],
+      }],
+    }));
+    check(runtimeBodies.length === 1, "remount redispatched the runtime launch");
+    click("Recover saved runtime probe launch"); await settle();
+    const claimedRuntime = JSON.parse(runtimeSaved!);
+    claimedRuntime[0][1].replayClaimed = true;
+    check(runtimeBodies.length === 2 && localStorage.getItem(key) === JSON.stringify(claimedRuntime),
+      "matching operation ID alone settled a receipt for the wrong admission");
+    click("Recover saved runtime probe launch"); await settle();
+    check(runtimeBodies.length === 3 && runtimeBodies.every((body) => body === runtimeBodies[0]) &&
+      runtimeStarts.size === 1 && localStorage.getItem(key) === "[]" &&
+      !document.querySelector('[aria-label="Saved runtime probe launch"]'),
+      "the runtime launch did not recover its exact receipt once");
+
+    const atCapacity = {
+      ...runtime,
+      sessions: [],
+      runtime_admissions: [{ ...runtime.runtime_admissions[0], id: "capacity-scope" }],
+    };
+    mount(card(atCapacity));
+    click("Activate");
+    click("Launch bounded probe"); await settle();
+    const refusedBody = capacityBodies[0];
+    const launchKey = "runtime:capacity-scope:implementer:launch";
+    const unrelatedEntry = ["prepare-runtime", {
+      id: "other-window-prepare",
+      body: JSON.stringify({ action: "prepare_runtime_admission", project_id: initialized.id, expected_version: initialized.version }),
+    }];
+    const pendingLaunch = localStorage.getItem(key);
+    check(typeof refusedLaunchId === "string" && pendingLaunch && JSON.parse(pendingLaunch)[0][0] === launchKey &&
+      JSON.parse(pendingLaunch)[0][1].id === refusedLaunchId && runtimeStarts.size === 1,
+      "losing the first capacity refusal lost the launch identity or started a probe");
+    if (!pendingLaunch) throw new Error("missing launch journal");
+    const savedWithOtherWindow = JSON.stringify([...JSON.parse(pendingLaunch), unrelatedEntry]);
+    localStorage.setItem(key, savedWithOtherWindow);
+    const claimedLaunch = JSON.parse(savedWithOtherWindow);
+    claimedLaunch[0][1].replayClaimed = true;
+    mount(card(atCapacity));
+    click("Activate");
+    check(capacityBodies.length === 1, "remount sent an unrequested launch");
+    const recoverLaunch = async () => {
+      click("Recover saved runtime probe launch");
+      await settle();
+    };
+    for (const reply of ["admission", "wrong-hash", "wrong-id", "pending"] as const) {
+      replayReply = reply;
+      const before = capacityBodies.length;
+      await recoverLaunch();
+      check(capacityBodies.length === before + 1 && capacityBodies.at(-1) === refusedBody &&
+        localStorage.getItem(key) === JSON.stringify(claimedLaunch) && runtimeStarts.size === 1,
+        `the ${reply} response lost the original saved launch or dispatched another probe`);
+    }
+    replayReply = "terminal";
+    await recoverLaunch();
+    const unrelatedOnly = JSON.stringify([unrelatedEntry]);
+    check(capacityBodies.length === 6 && capacityBodies.every((body) => body === refusedBody) &&
+      localStorage.getItem(key) === unrelatedOnly && runtimeStarts.size === 1 &&
+      !document.querySelector('[aria-label="Saved runtime probe launch"]'),
+      "the exact terminal refusal did not clear only the refused launch");
+    capacityFull = false;
+    const freshLaunch = findButton("Launch bounded probe");
+    check(!freshLaunch.disabled, "the confirmed refusal left the eligible probe blocked");
+    act(() => { freshLaunch.click(); freshLaunch.click(); });
+    await settle();
+    check(capacityBodies.length === 7 && typeof JSON.parse(capacityBodies[6]).operation_id === "string" &&
+      JSON.parse(capacityBodies[6]).operation_id !== refusedLaunchId &&
+      runtimeStarts.size === 2 && localStorage.getItem(key) === unrelatedOnly,
+      "capacity returning did not permit exactly one new launch identity");
   } finally {
     unmount();
     globalThis.fetch = nativeFetch;
@@ -19691,10 +20811,9 @@ Deno.test("Instruction-file review labels its comparison source and keeps the co
       if (String(input).endsWith("/guidance-reauthorization")) {
         return new Response(JSON.stringify(preview()));
       }
-      requests.push(JSON.parse(String(init?.body)));
-      return new Response(
-        JSON.stringify({ result: { state: "guidance_reauthorized" } }),
-      );
+      const request = JSON.parse(String(init?.body));
+      requests.push(request);
+      return guidanceApprovalReceipt(request);
     }) as typeof fetch;
   const section = (path: string) =>
     [...document.querySelectorAll("details")].find((item) =>
@@ -20297,6 +21416,246 @@ Deno.test("Audit Recipes settles only its exact journal entry after project swit
   } finally {
     unmount();
     sessionStorage.clear();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+const legacyPreviewResult = (title: string, hash: string) =>
+  new Response(JSON.stringify({
+    result: {
+      source_hash: hash,
+      frontmatter: { title },
+      validation_runs: [],
+      validation_bugs: [],
+    },
+  }));
+
+function openLegacyImport(): HTMLDetailsElement {
+  const details = [...document.querySelectorAll("details")].find((detail) =>
+    detail.firstElementChild?.textContent === "Import legacy tasks (optional)"
+  );
+  if (!details) throw new Error("Legacy import settings were missing");
+  details.open = true;
+  return details;
+}
+
+Deno.test("Legacy import previews discard late success and error after source edits", async () => {
+  const project = { ...initialized, id: "legacy-preview-race" };
+  const key = `llmrelay.legacy-import:${project.id}`;
+  const requests: Array<{
+    kind: string;
+    source: string;
+    operationId: unknown;
+    respond: (response: Response) => void;
+  }> = [];
+  globalThis.fetch = (_input, init) => {
+    const request = JSON.parse(String(init?.body));
+    return new Promise((respond) =>
+      requests.push({ kind: request.kind, source: request.source, operationId: request.operation_id, respond })
+    );
+  };
+  try {
+    mount(<ProjectSettings project={project} onChanged={noop} />);
+    const panel = openLegacyImport();
+    const preview = async (path: string) => {
+      change(findField("Legacy task source", panel), path);
+      click("Preview", panel);
+      await settle();
+    };
+
+    await preview("/old.md");
+    await preview("/middle.md");
+    await preview("/also-old.md");
+    change(findField("Legacy task source", panel), "/current.md");
+    requests[0].respond(legacyPreviewResult("Old task", "a".repeat(64)));
+    await settle();
+    check(!panel.textContent?.includes("Import unchanged source"), "editing left a late preview actionable");
+
+    click("Preview", panel);
+    await settle();
+    requests[3].respond(legacyPreviewResult("Current task", "c".repeat(64)));
+    await settle();
+    requests[1].respond(new Response(JSON.stringify({ error: "Old preview failed" }), { status: 409 }));
+    await settle();
+    check(
+      requests.map(({ source }) => source).join() === "/old.md,/middle.md,/also-old.md,/current.md" &&
+        panel.textContent?.includes("Current task") &&
+        panel.textContent?.includes("Import unchanged source") &&
+        !panel.querySelector('[role="alert"]'),
+      "a stale preview failure disturbed the current actionable result",
+    );
+    click("Import unchanged source", panel);
+    await settle();
+    requests[2].respond(legacyPreviewResult("Another stale task", "a".repeat(64)));
+    await settle();
+    check(
+      requests[4].kind === "legacy_import" && requests[4].source === "/current.md" &&
+        panel.textContent?.includes("Import request in progress") &&
+        !panel.textContent?.includes("Another stale task") &&
+        !panel.textContent?.includes("Import unchanged source"),
+      "a late preview became actionable during import",
+    );
+    const { operationId, respond } = requests[4];
+    check(typeof operationId === "string" && operationId.length > 0, "the import request had no operation ID");
+    respond(knowledgeJson({
+      error: "project version is stale; preview again against current project state",
+      operation_id: operationId,
+      outcome_unknown: false,
+    }, 409));
+    await settle();
+    check(
+      !panel.textContent?.includes("Retry exact import") && sessionStorage.getItem(key) === null,
+      "a definitive first refusal left a pending request",
+    );
+  } finally {
+    unmount();
+    sessionStorage.removeItem(key);
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+Deno.test("Legacy import keeps the exact checked request through lost response, remount, and replay refusal", async () => {
+  const project = { ...initialized, id: "legacy-import-recovery" };
+  const other = { ...project, id: "legacy-import-other-project" };
+  const key = `llmrelay.legacy-import:${project.id}`;
+  const otherKey = `llmrelay.legacy-import:${other.id}`;
+  const hash = "d".repeat(64);
+  const source = "/original-alias.md";
+  const imports: string[] = [];
+  let outcome = "lost";
+  let refreshes = 0;
+  const pendingResponse: { finish?: () => void } = {};
+  globalThis.fetch = async (_input, init) => {
+    const raw = String(init?.body);
+    const request = JSON.parse(raw);
+    if (request.kind === "legacy_preview") return legacyPreviewResult("Legacy task", hash);
+    imports.push(raw);
+    if (outcome === "lost") throw new TypeError("Connection lost");
+    if (outcome === "refuse") {
+      return knowledgeJson({ error: "Source identity could not be verified", operation_id: request.operation_id, outcome_unknown: false }, 409);
+    }
+    if (outcome === "empty") return new Response(null);
+    if (outcome === "malformed") return new Response("{");
+    if (outcome === "null") return new Response("null");
+    if (outcome === "wrong-shape") return new Response('{"result":{"imported":true}}');
+    if (outcome === "unreadable") {
+      const response = new Response();
+      response.text = () => Promise.reject(new TypeError("Connection lost during response read"));
+      return response;
+    }
+    const receipt = new Response(JSON.stringify({
+      result: {
+        imported: true,
+        operation_id: outcome === "wrong-id" ? "wrong-operation" : request.operation_id,
+        project_id: request.project_id,
+        task_id: "legacy-task",
+        source: "/original-canonical.md",
+        source_hash: hash,
+      },
+    }));
+    if (outcome === "in-flight") {
+      return await new Promise<Response>((resolve) => { pendingResponse.finish = () => resolve(receipt); });
+    }
+    return receipt;
+  };
+  const settings = (current: Project) =>
+    <ProjectSettings project={current} onChanged={() => { refreshes += 1; }} />;
+  const retry = async (panel: HTMLDetailsElement) => {
+    const checked = findField("I checked this project", panel);
+    act(() => checked.click());
+    click("Retry exact import", panel);
+    await settle();
+  };
+  sessionStorage.removeItem(key);
+  sessionStorage.setItem(otherKey, "unreadable prior state");
+  try {
+    mount(settings(project));
+    let panel = openLegacyImport();
+    change(findField("Legacy task source", panel), source);
+    click("Preview", panel);
+    await settle();
+    click("Import unchanged source", panel);
+    await settle();
+    const original = JSON.parse(imports[0]);
+    check(
+      original.kind === "legacy_import" && typeof original.operation_id === "string" &&
+        original.project_id === project.id && original.expected_project_version === project.version &&
+        original.source === source && original.expected_source_hash === hash &&
+        sessionStorage.getItem(key) === imports[0],
+      "the lost response did not preserve the original import body",
+    );
+
+    rerender(settings(other));
+    panel = openLegacyImport();
+    check(
+      !panel.textContent?.includes(source) && !panel.textContent?.includes("Retry exact import"),
+      "one project's recovery request appeared on another project",
+    );
+    mount(settings({ ...project, version: project.version + 1 }));
+    panel = openLegacyImport();
+    click("Retry exact import", panel);
+    await settle();
+    check(imports.length === 1, "remount sent a retry before the outcome check");
+
+    const replays = ["refuse", "empty", "malformed", "null", "wrong-shape", "unreadable", "wrong-id", "confirmed"];
+    for (const reply of replays) {
+      outcome = reply;
+      await retry(panel);
+      if (reply !== "confirmed") {
+        check(
+          sessionStorage.getItem(key) === imports[0] && refreshes === 0,
+          `the ${reply} reply settled an earlier uncertain import`,
+        );
+      }
+    }
+    check(
+      imports.length === replays.length + 1 && imports.every((body) => body === imports[0]) &&
+        sessionStorage.getItem(key) === null && refreshes === 1 &&
+        sessionStorage.getItem(otherKey) === "unreadable prior state" &&
+        !panel.textContent?.includes("Import unchanged source"),
+      "matching receipt did not settle only the exact original import",
+    );
+    outcome = "refuse";
+    change(findField("Legacy task source", panel), "/second-source.md");
+    click("Preview", panel); await settle();
+    click("Import unchanged source", panel); await settle();
+    const refused = imports.at(-1);
+    check(sessionStorage.getItem(key) === null && !panel.textContent?.includes("Retry exact import"),
+      "a definite fresh refusal retained an import as uncertain");
+    outcome = "in-flight";
+    click("Preview", panel); await settle();
+    click("Import unchanged source", panel); await settle();
+    const pending = imports.at(-1);
+    check(pendingResponse.finish && pending !== refused && sessionStorage.getItem(key) === pending,
+      "the next import did not record a distinct request before remount");
+    mount(settings(project));
+    panel = openLegacyImport();
+    check(panel.querySelector<HTMLButtonElement>("button")?.disabled,
+      "remount allowed an in-flight import to be checked again");
+    await act(async () => pendingResponse.finish?.());
+    await settle();
+    check(imports.length === replays.length + 3 && refreshes === 1 &&
+      sessionStorage.getItem(key) === null && !panel.textContent?.includes("Retry exact import") &&
+      !findField("Legacy task source", panel).disabled,
+      "the imported result did not unlock the mounted panel or invoked a stale refresh callback");
+
+    if (!pending) throw new Error("missing exact import request");
+    sessionStorage.setItem(key, pending);
+    mount(<>
+      {settings(project)}
+      <SettleJournalBeforeSubscription storage={sessionStorage} storageKey={key}
+        saved={pending} pendingControl="Retry exact import" />
+    </>);
+    panel = openLegacyImport();
+    check(imports.length === replays.length + 3 && refreshes === 1 &&
+      sessionStorage.getItem(key) === null && !panel.textContent?.includes("Retry exact import") &&
+      !findField("Legacy task source", panel).disabled,
+      "the remounted import missed settlement between its initial read and subscription");
+  } finally {
+    pendingResponse.finish?.();
+    unmount();
+    sessionStorage.removeItem(key);
+    sessionStorage.removeItem(otherKey);
     globalThis.fetch = nativeFetch;
   }
 });
@@ -22081,7 +23440,8 @@ Deno.test("Workflow command journals keep concurrent windows' identities and reb
     await settle();
     const remaining = JSON.parse(storage.getItem(journal)!);
     check(remaining.length === 1 && remaining[0][0] === "beta" && remaining[0][1].id === betaId &&
-      runners.get("b")!.uncertain.has("beta"),
+      ["a", "b"].every((name) => runners.get(name)!.uncertain.has("beta") &&
+        !runners.get(name)!.uncertain.has("alpha")),
       "settling alpha removed beta's uncertain identity");
 
     act(() => {
@@ -22112,6 +23472,27 @@ Deno.test("Workflow command journals keep concurrent windows' identities and reb
     check(sent().length === 4 && sent()[3].expected_version === 2 &&
       sent()[3].operation_id !== replaced.id && sent()[3].operation_id !== betaId,
       "reviewing the current identity did not send exactly one new request");
+    responses.get("beta-task")!.resolve(workflowResult(requests[3]));
+    await settle();
+    check(storage.getItem(journal) === "[]" &&
+      ["a", "b"].every((name) => !runners.get(name)!.uncertain.has("beta") &&
+        !runners.get(name)!.reviewed.has("beta")),
+      "settling the exact replay left another mounted runner showing stale uncertainty");
+
+    act(() => { void runners.get("a")!.submit("gamma", verify("gamma-task")); });
+    await settle();
+    responses.get("gamma-task")!.reject(new TypeError("gamma response lost"));
+    await settle();
+    const gammaId = sent().at(-1)!.operation_id;
+    check(runners.get("a")!.error && runners.get("b")!.uncertain.has("gamma"),
+      "mounted controls lost the unresolved request status");
+    act(() => { void runners.get("b")!.submit("gamma", verify("gamma-task")); });
+    await settle();
+    check(sent().at(-1)?.operation_id === gammaId, "a second control replaced the uncertain operation");
+    responses.get("gamma-task")!.resolve(workflowResult(requests.at(-1)!));
+    await settle();
+    check(!runners.get("a")!.error && !runners.get("a")!.uncertain.has("gamma"),
+      "a successful receipt in another mounted control left the original error visible");
   } finally {
     unmount();
     Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true, value: storage });
@@ -23184,7 +24565,7 @@ Deno.test("knowledge source draft preserves exact selector, explicit replacement
         entry = { ...entry, latest_draft_id: id, version: mutation.expected_version === null ? 1 : mutation.expected_version + 1 };
       } else if (mutation.kind === "approve") entry = { ...entry, version: entry.version + 1, approved_revision_id: mutation.revision_id, latest_draft_id: null };
       else entry = { ...entry, version: entry.version + 1, archived_at: "2026-11-09" };
-      return knowledgeJson(entry);
+      return knowledgeJson({ ...entry, operation_id: request.request.operation_id });
     }
     const read = body.read as import("./types").KnowledgeRead; reads.push(read);
     if (read.kind === "search") {
@@ -23280,17 +24661,144 @@ Deno.test("knowledge source draft preserves exact selector, explicit replacement
 });
 
 Deno.test("knowledge uncertain mutation retains exact body and ID across close and explicit outcome check", async () => {
-  localStorage.clear(); const bodies: string[] = [];
+  localStorage.clear();
+  const key = "llmrelay.knowledge.pending.p1";
+  const bodies: string[] = [];
+  const committed = new Map<string, string>([["other-draft-operation", "other-draft"]]);
+  const pendingResponse: { finish?: (response: Response) => void } = {};
   globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
-    if (String(url) === "/api/knowledge/command") { bodies.push(String(init?.body)); if (bodies.length === 1) throw new TypeError("response lost after commit"); return knowledgeJson({ ...knowledgeEntry(), latest_draft_id: "revision-draft" }); }
-    return knowledgeJson([]);
+    check(String(url) === "/api/knowledge/command", "unexpected draft request");
+    const raw = String(init?.body);
+    const { request: { operation_id } } = JSON.parse(raw);
+    bodies.push(raw);
+    if (bodies.length === 1) {
+      return knowledgeJson({ error: "The request was not started.", operation_id, outcome_unknown: false }, 503);
+    }
+    if (bodies.length === 2) {
+      committed.set(operation_id, "revision-draft");
+      return knowledgeJson({ error: "The request outcome is unavailable.", operation_id, outcome_unknown: true }, 409);
+    }
+    if (bodies.length === 3) {
+      return knowledgeJson({ error: "The request was refused.", operation_id, outcome_unknown: false }, 409);
+    }
+    if (bodies.length === 4) return new Response("{");
+    if (bodies.length === 5) return new Response(null, { status: 204 });
+    if (bodies.length === 6) {
+      const response = knowledgeJson({});
+      response.text = () => Promise.reject(new TypeError("Connection lost during response read"));
+      return response;
+    }
+    if (bodies.length === 7) return knowledgeJson({
+      ...knowledgeEntry(), id: "other-entry", version: 1,
+      operation_id: "other-draft-operation", latest_draft_id: committed.get("other-draft-operation"),
+    });
+    if (bodies.length === 9) {
+      committed.set(operation_id, "remounted-draft");
+      return await new Promise<Response>((resolve) => { pendingResponse.finish = resolve; });
+    }
+    return knowledgeJson({ ...knowledgeEntry(), version: 1, operation_id, latest_draft_id: committed.get(operation_id) });
   }) as typeof fetch;
+  const open = () => {
+    mount(<SaveKnowledgeSource projectId="p1" source={{ kind: "user_assertion" }} title="Uncertain note" />);
+    click("Save as knowledge");
+  };
+  const retry = "Check / retry exact saved operation";
   try {
-    mount(<SaveKnowledgeSource projectId="p1" source={{ kind: "user_assertion" }} title="Uncertain note" />); click("Save as knowledge"); field("Knowledge statement", "Retained text"); click("Save knowledge draft"); await settleKnowledge();
-    check(bodies.length === 1 && document.body.textContent?.includes("original operation identity is retained"), "uncertain draft was automatically retried");
-    unmount(); mount(<SaveKnowledgeSource projectId="p1" source={{ kind: "user_assertion" }} />); click("Save as knowledge"); await settleKnowledge();
-    check(bodies.length === 1, "remount resent the mutation"); toggleKnowledge("I refreshed and checked"); click("Check / retry exact saved operation"); await settleKnowledge();
-    check(bodies.length === 2 && bodies[0] === bodies[1], "retry changed the operation ID or body");
+    open();
+    field("Knowledge statement", "Retained text");
+    click("Save knowledge draft"); await settleKnowledge();
+    check(!localStorage.getItem(key) && !findButton("Save knowledge draft").disabled &&
+      findField("Knowledge statement").value === "Retained text", "admission refusal blocked the unchanged draft");
+    click("Save knowledge draft"); await settleKnowledge();
+    check(bodies.length === 2 && bodies[0] !== bodies[1] && localStorage.getItem(key) === bodies[1],
+      "post-work conflict lost the new exact operation");
+    unmount(); open(); await settleKnowledge();
+    check(bodies.length === 2 && findButton(retry).disabled, "remount resent or enabled unchecked replay");
+    toggleKnowledge("I refreshed and checked"); click(retry); await settleKnowledge();
+    check(bodies.length === 3 && localStorage.getItem(key) === bodies[1] && findButton(retry).disabled,
+      "definite refusal erased an earlier uncertain operation or skipped the next check");
+    for (const attempts of [4, 5, 6, 7]) {
+      toggleKnowledge("I refreshed and checked"); click(retry); await settleKnowledge();
+      check(bodies.length === attempts && localStorage.getItem(key) === bodies[1] &&
+        findButton(retry).disabled &&
+        !document.body.textContent?.includes("Knowledge draft saved."),
+      "an unusable response or receipt for another same-project draft cleared the journal");
+    }
+    toggleKnowledge("I refreshed and checked"); click(retry); await settleKnowledge();
+    check(bodies.length === 8 && bodies.slice(2).every((body) => body === bodies[1]) &&
+      committed.size === 2 &&
+      localStorage.getItem(key) === null && document.body.textContent?.includes("Knowledge draft saved."),
+      "exact replay changed the body or failed to reconcile the draft");
+    open();
+    field("Knowledge statement", "Closes before settlement");
+    click("Save knowledge draft"); await settleKnowledge();
+    check(pendingResponse.finish && localStorage.getItem(key) === bodies[8], "the pending draft was not journaled before send");
+    open();
+    await settleKnowledge();
+    check(findButton(retry).disabled && findButton("Save knowledge draft").closest("fieldset")?.disabled,
+      "the remounted editor did not protect the in-flight request");
+    const { request: { operation_id } } = JSON.parse(bodies[8]);
+    await act(async () => pendingResponse.finish?.(knowledgeJson({ ...knowledgeEntry(), version: 1, operation_id, latest_draft_id: committed.get(operation_id) })));
+    await settleKnowledge();
+    field("Knowledge statement", "New mounted draft");
+    check(bodies.length === 9 && localStorage.getItem(key) === null &&
+      !document.querySelector('[aria-label="Pending knowledge operation"]') &&
+      !findButton("Save knowledge draft").closest("fieldset")?.disabled &&
+      !document.body.textContent?.includes("Knowledge draft saved."),
+      "settling the original draft failed to unlock the mounted editor or updated it with the old callback");
+  } finally { pendingResponse.finish?.(knowledgeJson({})); unmount(); globalThis.fetch = nativeFetch; localStorage.clear(); }
+});
+
+Deno.test("task knowledge retains selection and exact recovery after refusal, interruption and wrong receipt", async () => {
+  localStorage.clear();
+  const selectedTask: Task = { ...task, id: "knowledge-recovery", lifecycle: "backlog", active_attempt: undefined,
+    knowledge: { selection: null, preparation: null, admission_hold: null, manifests: [], preview_user_text: "canonical" } };
+  const key = "llmrelay.task.knowledge.p1.knowledge-recovery";
+  const writes: string[] = [];
+  let refreshed = 0;
+  let confirmed = 0;
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    const raw = String(init?.body);
+    const body = JSON.parse(raw);
+    if (String(url) === "/api/knowledge/preview") return knowledgeJson(knowledgePreviewFixture(body));
+    check(String(url) === "/api/command", "unexpected task knowledge request");
+    writes.push(raw);
+    const { operation_id } = body;
+    if (writes.length === 1) return knowledgeJson({ error: "Selection refused", operation_id, outcome_unknown: false }, 409);
+    if (writes.length === 2) return knowledgeJson({ error: "Unclassified conflict" }, 409);
+    if (writes.length === 3) return knowledgeJson({ error: "Service cannot accept work", operation_id, outcome_unknown: false }, 503);
+    if (writes.length === 4) return knowledgeJson({ error: "Worker interrupted", operation_id, outcome_unknown: true }, 503);
+    return knowledgeJson({ result: {
+      operation_id: writes.length === 5 ? "different-operation" : operation_id,
+      entity_kind: "task", entity_id: selectedTask.id, version: selectedTask.version + 1, state: "knowledge_saved",
+    } });
+  }) as typeof fetch;
+  const view = () => <TaskKnowledgePanel task={selectedTask} initialSelection={[knowledgeSelectionFixture()]}
+    onChanged={() => { refreshed++; }} onConfirmed={() => { confirmed++; }} />;
+  const save = "Save confirmed task knowledge";
+  const retry = "Retry exact task knowledge operation";
+  try {
+    mount(view());
+    click("Preview knowledge attachment"); await settleKnowledge();
+    toggleKnowledge("I confirm these exact included revisions");
+    click(save); await settleKnowledge();
+    check(localStorage.getItem(key) === null && !findButton(save).disabled, "fresh refusal lost the confirmed selection");
+    click(save); await settleKnowledge();
+    check(writes.length === 2 && localStorage.getItem(key) === writes[1] &&
+      JSON.parse(writes[1]).request.selection[0].revision_id === "revision-approved",
+      "unclassified conflict lost the task request or changed the selected revision");
+    unmount(); mount(view()); await settleKnowledge();
+    check(writes.length === 2 && findButton(retry).disabled, "remount resent or enabled unchecked task replay");
+    click("Refresh task outcome");
+    for (const attempts of [3, 4, 5]) {
+      toggleKnowledge("I checked the task outcome."); click(retry); await settleKnowledge();
+      check(writes.length === attempts && localStorage.getItem(key) === writes[1] &&
+        findButton(retry).disabled && confirmed === 0, "refusal, interruption or wrong receipt resolved task recovery");
+    }
+    toggleKnowledge("I checked the task outcome."); click(retry); await settleKnowledge();
+    check(writes.length === 6 && writes.slice(2).every((body) => body === writes[1]) &&
+      !localStorage.getItem(key) && confirmed === 1 && refreshed === 2 &&
+      document.body.textContent?.includes("Knowledge saved."), "task replay did not confirm the exact operation once");
   } finally { unmount(); globalThis.fetch = nativeFetch; localStorage.clear(); }
 });
 
@@ -23300,7 +24808,7 @@ Deno.test("knowledge task selection confirms whole-entry omission and refuses st
   globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body));
     if (String(url) === "/api/knowledge/preview") return knowledgeJson(knowledgePreviewFixture(body, true));
-    if (String(url) === "/api/command") { commands.push(body); return knowledgeJson({ result: { version: 8, entity_id: task.id, state: "knowledge_saved" } }); }
+    if (String(url) === "/api/command") { commands.push(body); return knowledgeJson({ result: { operation_id: body.operation_id, entity_kind: "task", version: 9, entity_id: task.id, state: "knowledge_saved" } }); }
     throw new Error("Unexpected task knowledge request");
   }) as typeof fetch;
   let current: Task = { ...task, active_attempt: undefined, lifecycle: "backlog", knowledge: { selection: null, preparation: null, admission_hold: null, manifests: [], preview_user_text: "HOST-CANONICAL-TASK-INPUT" } };
@@ -23324,7 +24832,16 @@ Deno.test("knowledge-held rework has reachable save-only and exact explicit cont
   globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body));
     if (String(url) === "/api/knowledge/preview") return knowledgeJson(knowledgePreviewFixture(body));
-    commands.push(body); return knowledgeJson({ result: { version: 7, entity_id: task.id, state: "knowledge_prepared", detail: { child_attempt_id: null } } });
+    commands.push(body);
+    const request = body.request as import("./types").PrepareNextRunKnowledge;
+    const continuation = request.action === "save_and_continue_rework";
+    return knowledgeJson({ result: {
+      operation_id: request.operation_id, entity_kind: continuation ? "attempt" : "task",
+      version: request.expected_task_version + Number(continuation),
+      entity_id: continuation ? "child" : request.task_id,
+      state: continuation ? "rework_created" : "knowledge_prepared",
+      detail: { child_attempt_id: continuation ? "child" : null, parent_attempt_id: request.parent_attempt_id, preparation_version: 5 },
+    } });
   }) as typeof fetch;
   try {
     mount(<TaskKnowledgePanel task={held} onChanged={noop} />);
@@ -23365,6 +24882,212 @@ Deno.test("knowledge exact source unavailable retains original revision identity
     check(sourceReads.length === 1 && sourceReads[0].kind === "source" && sourceReads[0].revision_id === "revision-approved", "exact source identity changed");
     check(document.body.textContent?.includes("no current source was substituted") && document.body.textContent.includes("Complete approved statement"), "missing source hid approved text or claimed current replacement");
   } finally { unmount(); globalThis.fetch = nativeFetch; localStorage.clear(); }
+});
+
+Deno.test("project knowledge revalidation keeps the open revision until an exact response confirms it", async () => {
+  localStorage.clear();
+  const key = "llmrelay.knowledge.pending.p1";
+  const writes: string[] = [];
+  const otherOperation = "other-revalidation";
+  const boundedSource = {
+    identity_hash: "source-identity", original_content_hash: "original-content",
+    observed_content_hash: "original-content", state: "verified" as const,
+    reason: "Full source freshness detail",
+  };
+  const oversizedSources = Array.from({ length: 16 }, (_, index) => ({
+    ...boundedSource, identity_hash: `source-${index}`,
+    state: "needs_revalidation" as const,
+    reason: `Repository scope changed: /${"directory/".repeat(450)}`,
+  }));
+  const revision: KnowledgeFixtureRevision = {
+    ...knowledgeRevision(),
+    sources: oversizedSources.map((source, index) => ({
+      selector: { kind: "repository", commit: "abc", path: `docs/source-${index}.md` },
+      content_hash: source.original_content_hash, identity_hash: source.identity_hash,
+      repository_scope: {
+        repository_path: "/fixture", repository_identity: "/fixture/.git", registered_revision: "abc",
+      },
+    })),
+  };
+  check(new TextEncoder().encode(JSON.stringify(oversizedSources)).byteLength > 64 * 1024,
+    "the stored source details must exceed the freshness response limit");
+  const observations = new Map<string, import("./types").KnowledgeObservation & { operation_id: string }>([[otherOperation, {
+    ...knowledgeObservation(revision.id), operation_id: otherOperation,
+    fingerprint: "other-observation", sources: oversizedSources.map(({ identity_hash }) => ({
+      ...boundedSource, identity_hash,
+    })),
+  }]]);
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    const raw = String(init?.body);
+    if (String(url) === "/api/knowledge/command") {
+      writes.push(raw);
+      const { operation_id, project_id, entry_id, revision_id } = JSON.parse(raw);
+      if (!observations.has(operation_id)) observations.set(operation_id, {
+        ...knowledgeObservation(revision_id), operation_id, fingerprint: `observation-${observations.size}`,
+        checked_at: "2026-11-17T10:00:00Z",
+        state: "needs_revalidation", sources: oversizedSources,
+      });
+      if (writes.length === 1) return knowledgeJson(observations.get(otherOperation));
+      const confirmation = {
+        kind: "revalidation_confirmed", operation_id, project_id, entry_id, revision_id,
+        fingerprint: observations.get(operation_id)?.fingerprint,
+      };
+      return knowledgeJson(writes.length === 2 ? { ...confirmation, entry_id: "other-entry" } : confirmation);
+    }
+    const { read } = JSON.parse(raw) as { read: import("./types").KnowledgeRead };
+    if (read.kind === "search") return knowledgeJson([{ entry: knowledgeEntry(), revision_id: revision.id, title: revision.title }]);
+    if (read.kind === "entry") return knowledgeJson(knowledgeEntry());
+    if (read.kind === "revision") return knowledgeJson(revision);
+    if (read.kind === "freshness") {
+      const { operation_id: _operation, ...latest } = [...observations.values()].at(-1)!;
+      return knowledgeJson(latest.sources === oversizedSources
+        ? { ...latest, sources: [], sources_omitted: latest.sources.length }
+        : latest);
+    }
+    if (read.kind === "history") return knowledgeJson([]);
+    throw new Error("unexpected project knowledge read");
+  }) as typeof fetch;
+  const detail = () => document.querySelector('[aria-label="Knowledge revision"]')?.textContent;
+  const showsCompactFreshness = () => {
+    const text = detail() ?? "";
+    const omission = text.match(/[^.\n]*\b(?:omitted|too large)\b[^.\n]*/i)?.[0] ?? "";
+    return text.includes(revision.id) && text.includes("needs revalidation") &&
+      text.includes("2026-11-17T10:00:00Z") &&
+      /source|detail/i.test(omission) && omission.includes(String(oversizedSources.length));
+  };
+  try {
+    mount(<Knowledge projectId="p1" />);
+    await settleKnowledge(); click(revision.title); await settleKnowledge();
+    check(detail()?.includes(boundedSource.reason), "the ordinary read lost source freshness detail");
+    click("Revalidate exact revision"); await settleKnowledge();
+    const command: import("./types").KnowledgeCommand = JSON.parse(writes[0]);
+    check(command.kind === "revalidate" && command.revision_id === revision.id &&
+      command.expected_observation === "other-observation" &&
+      localStorage.getItem(key) === writes[0] && detail()?.includes(revision.id) &&
+      findButton("Edit as draft").disabled && observations.size === 2,
+      "another operation's valid observation for the same revision settled the original request");
+    click("Refresh Knowledge"); await settleKnowledge();
+    check(showsCompactFreshness(), "refresh did not show current freshness and explain omitted details");
+    toggleKnowledge("I refreshed and checked");
+    click("Check / retry exact saved operation"); await settleKnowledge();
+    check(writes.length === 2 && localStorage.getItem(key) === writes[0] &&
+      findButton("Edit as draft").disabled,
+      "compact confirmation for a different entry settled the original request");
+    toggleKnowledge("I refreshed and checked");
+    click("Check / retry exact saved operation"); await settleKnowledge();
+    check(writes.length === 3 && writes.every((body) => body === writes[0]) &&
+      observations.size === 2 && !localStorage.getItem(key) && showsCompactFreshness() &&
+      !findButton("Edit as draft").disabled && !document.querySelector('[aria-label="Pending knowledge operation"]'),
+      "exact compact confirmation failed to unlock edits or replay created another observation");
+    unmount();
+    mount(<Knowledge projectId="p1" />);
+    await settleKnowledge(); click(revision.title); await settleKnowledge();
+    check(showsCompactFreshness() && !findButton("Revalidate exact revision").disabled &&
+      writes.length === 3 && observations.size === 2,
+      "the same revision did not reopen with its still-oversized freshness observation");
+    click("Revalidate exact revision"); await settleKnowledge();
+    check(writes.length === 4 && command.kind === "revalidate" &&
+      JSON.parse(writes[3]).operation_id !== command.operation_id &&
+      observations.size === 3 &&
+      JSON.parse(writes[3]).expected_observation === "observation-1" &&
+      !localStorage.getItem(key) && showsCompactFreshness(),
+      "the next revalidation did not use the current compact observation fingerprint");
+  } finally { unmount(); globalThis.fetch = nativeFetch; localStorage.clear(); }
+});
+
+Deno.test("W04 conversation drafts follow selection through a late follow-up receipt", async () => {
+  const previousProtocolResponder = protocolFixtureResponder;
+  const previousFetch = globalThis.fetch;
+  const instanceId = "conversation-draft-fixture";
+  protocolFixtureResponder = () => Promise.resolve(protocolFixture([...allFeatures, "conversation_v1"], instanceId));
+  localStorage.clear();
+  const profile: import("./types").ConversationProfile = {
+    id: "profile", project_id: "p1", execution_config_revision_id: "config", model: "gpt-6.1-sol",
+    effort: "medium", instructions: "", instructions_hash: "instructions", profile_hash: "profile-hash",
+  };
+  const admission: import("./types").ConversationAdmission = {
+    id: "admission", profile_revision_id: profile.id, recorded_state: "active", evidence_hash: "evidence",
+    probe_invocation_id: "probe", live_eligibility_checked: false,
+  };
+  const conversations: import("./types").ConversationSummary[] = ["a", "b"].map((id) => ({
+    id, project_id: "p1", admission_id: admission.id, state: "idle", generation: `generation-${id}`,
+    session_id: `session-${id}`, reservation_state: "running", active_turn_id: null,
+    binding_valid: true, is_probe: false, created_at: "2026-11-09", updated_at: "2026-11-09",
+  }));
+  let finishRelease: (() => void) | undefined;
+  let receiptChecks = 0;
+  const sent: import("./types").ConversationMutation[] = [];
+  const composer = () => document.querySelector<HTMLTextAreaElement>("#conversation-input")!;
+  const view = (sourceConversationId: string) => <ConversationWorkspace projectId="p1" revision="1"
+    sourceConversationId={sourceConversationId} onOpenSetup={noop} onOpenProviders={noop} onPromote={noop} />;
+  try {
+    globalThis.fetch = (async () => knowledgeJson(snapshotAt(instanceId, "1"))) as typeof fetch;
+    await getState();
+    globalThis.fetch = (async (_url, init) => {
+      const { operation } = JSON.parse(String(init?.body)) as {
+        operation: import("./types").ConversationRead | import("./types").ConversationMutation;
+      };
+      if (operation.action === "workspace_identity") return knowledgeJson({ result: { project_id: "p1", storage_scope: "d".repeat(64) } });
+      if (operation.action === "list") return knowledgeJson({ result: { items: conversations, next_cursor: null } });
+      if (operation.action === "profiles") return knowledgeJson({ result: { items: [profile], next_cursor: null } });
+      if (operation.action === "admissions") return knowledgeJson({ result: { items: [admission], next_cursor: null } });
+      if (operation.action === "messages") return knowledgeJson({ result: { messages: [], through_sequence: 0, history_coverage: "partial" } });
+      if (operation.action === "detail") {
+        const conversation = conversations.find((item) => item.id === operation.conversation_id);
+        return knowledgeJson({ result: { conversation, profile, admission, unresolved_operation: false,
+          unresolved_operation_id: null, requests: [], events: [], next_after: 0, has_more: false,
+          history_coverage: "partial" } });
+      }
+      if (operation.action === "receipt") {
+        if (++receiptChecks === 2) await new Promise<void>((resolve) => { finishRelease = resolve; });
+        return knowledgeJson({ result: { operation_id: operation.operation_id, request_hash: operation.request_hash,
+          found: true, kind: "submit", delivery_state: "bound", conversation_id: "b", generation: "generation-b",
+          profile_revision_id: profile.id, admission_id: admission.id, state: "completed", quiescence: null } });
+      }
+      if (operation.action !== "submit") throw new Error("Unexpected conversation operation");
+      sent.push(operation);
+      return knowledgeJson({ result: { conversation_id: "b" } });
+    }) as typeof fetch;
+    mount(view("a"));
+    await settleKnowledge();
+    change(composer(), "Draft for A");
+    const list = document.querySelector('[aria-label="Saved conversations"]')!;
+    const [openA, openB] = list.querySelectorAll<HTMLButtonElement>("li button");
+    act(() => openB.click());
+    await settleKnowledge();
+    check(composer().value === "" && sent.length === 0,
+      "switching to B carried A's draft or dispatched a mutation");
+    change(composer(), "Send only to B");
+    click("Send follow-up");
+    await settleKnowledge();
+    check(sent.length === 1 && sent[0].action === "submit" && sent[0].conversation_id === "b" &&
+      sent[0].input === "Send only to B", "Send follow-up used a different conversation or draft");
+    click("Continue after confirmed outcome");
+    await settleKnowledge();
+    check(!!finishRelease, "the second receipt did not defer");
+    change(composer(), "New draft for B");
+    change(composer(), "Send only to B");
+    rerender(view("b"));
+    rerender(view("a"));
+    await settleKnowledge();
+    check(composer().value === "Draft for A",
+      "returning to A lost its draft before the receipt arrived");
+    finishRelease?.();
+    await settleKnowledge();
+    check(openA.getAttribute("aria-current") === "true" &&
+      composer().value === "Draft for A" && sent.length === 1,
+      "B's late receipt replaced A's draft or resent an operation");
+    act(() => openB.click());
+    await settleKnowledge();
+    check(composer().value === "Send only to B", "B's late receipt erased a newer draft with identical text");
+  } finally {
+    finishRelease?.();
+    unmount();
+    localStorage.clear();
+    protocolFixtureResponder = previousProtocolResponder;
+    globalThis.fetch = (async () => knowledgeJson(snapshotAt("test-instance", "1"))) as typeof fetch;
+    try { await getState(); } finally { globalThis.fetch = previousFetch; }
+  }
 });
 
 Deno.test("conversation knowledge start submit and steer bind original operation and keep uncertain identity", async () => {
@@ -23473,7 +25196,7 @@ Deno.test("task creation with knowledge creates reachable draft before canonical
     }
     if (path === "/api/knowledge/preview") return knowledgeJson(knowledgePreviewFixture(body as unknown as import("./types").KnowledgePreviewRequest));
     if (path === "/api/command" && body.kind === "create_task") return knowledgeJson({ result: { entity_kind: "task", entity_id: created.id, version: 1, state: "created" } });
-    if (path === "/api/command" && body.kind === "set_task_knowledge") return knowledgeJson({ result: { entity_kind: "task", entity_id: created.id, version: 2, state: "knowledge_saved" } });
+    if (path === "/api/command" && body.kind === "set_task_knowledge") return knowledgeJson({ result: { operation_id: body.operation_id, entity_kind: "task", entity_id: created.id, version: 2, state: "knowledge_saved" } });
     throw new Error(`Unexpected knowledge create route ${path}`);
   }) as typeof fetch;
   try {
@@ -23488,6 +25211,92 @@ Deno.test("task creation with knowledge creates reachable draft before canonical
     check(request?.user_text === "HOST-CANONICAL-CREATED-TASK" && request.expected_consumer_version === 1 && savedId === created.id, "task creation failed canonical preview-before-confirmation sequence");
     check(!calls.some((call) => call.body.kind === "make_ready"), "knowledge save implicitly made work ready");
   } finally { unmount(); globalThis.fetch = nativeFetch; localStorage.clear(); }
+});
+
+Deno.test("W07 knowledge attachment advances the cursor and keeps later-page selections through a new query", async () => {
+  localStorage.clear();
+  const selectedTask: Task = { ...task, id: "knowledge-pagination-task", lifecycle: "backlog",
+    active_attempt: undefined, knowledge: { selection: null, preparation: null, admission_hold: null,
+      manifests: [], preview_user_text: "Canonical attachment destination" } };
+  const hit = (index: number) => {
+    const id = String(index).padStart(3, "0");
+    const revision_id = `revision-${id}`;
+    return { entry: { ...knowledgeEntry(), id: `entry-${id}`, approved_revision_id: revision_id },
+      revision_id, title: `Approved entry ${id}` };
+  };
+  const later = hit(51);
+  const projectUnavailable = "The project is unavailable; select an existing project";
+  const searches: import("./types").KnowledgeSearch[] = [];
+  const saves: import("./types").Command[] = [];
+  let finishStaleSearch: ((response: Response) => void) | undefined;
+  globalThis.fetch = (async (url, init) => {
+    const body = JSON.parse(String(init?.body));
+    if (String(url) === "/api/command") {
+      saves.push(body);
+      return knowledgeJson({ result: { operation_id: body.operation_id, entity_kind: "task", entity_id: selectedTask.id, version: 8, state: "knowledge_saved" } });
+    }
+    if (String(url) === "/api/knowledge/preview") return knowledgeJson(knowledgePreviewFixture(body));
+    const read = body.read as import("./types").KnowledgeRead;
+    if (read.kind === "search") {
+      searches.push(read.search);
+      if (read.search.query === "unavailable project") return knowledgeJson({ error: projectUnavailable }, 409);
+      if (read.search.query === "replacement") return knowledgeJson([hit(200)]);
+      if (!read.search.after_entry_id) return knowledgeJson(Array.from({ length: 50 }, (_, index) => hit(index + 1)));
+      if (read.search.after_entry_id === "entry-050") return knowledgeJson(Array.from({ length: 50 }, (_, index) => hit(index + 51)));
+      return await new Promise<Response>((resolve) => { finishStaleSearch = resolve; });
+    }
+    if (read.kind === "revision") return knowledgeJson({ ...knowledgeRevision(later.revision_id),
+      entry_id: later.entry.id, title: later.title });
+    if (read.kind === "freshness") return knowledgeJson(knowledgeObservation(later.revision_id));
+    throw new Error("Unexpected knowledge paging request");
+  }) as typeof fetch;
+  try {
+    mount(<TaskKnowledgePanel task={selectedTask} onChanged={noop} />);
+    click("Find approved knowledge");
+    await settleKnowledge();
+    click("Load more approved knowledge");
+    await settleKnowledge();
+    click(later.title);
+    await settleKnowledge();
+    click("Load more approved knowledge");
+    await settleKnowledge();
+    check(!!finishStaleSearch, "the third page did not defer");
+    field("Find approved knowledge", "replacement");
+    click("Find approved knowledge");
+    await settleKnowledge();
+    finishStaleSearch?.(knowledgeJson([hit(101)]));
+    await settleKnowledge();
+    check(searches.map((search) => search.after_entry_id).join("|") === "|entry-050|entry-100|" &&
+      searches.every((search) => search.limit === 50 && !search.include_drafts && !search.include_archived) &&
+      document.body.textContent?.includes("Approved entry 200") &&
+      !document.body.textContent.includes("Approved entry 101") &&
+      !document.body.textContent.includes("Load more approved knowledge") &&
+      findButton(`Remove revision ${later.revision_id}`),
+      "changing search accepted a late page, carried its cursor, or discarded the selection");
+    click("Preview knowledge attachment");
+    await settleKnowledge();
+    toggleKnowledge("I confirm these exact included revisions");
+    click("Save confirmed task knowledge");
+    await settleKnowledge();
+    const saved = saves[0];
+    const request = saved?.request as import("./types").KnowledgePreviewRequest | undefined;
+    check(saves.length === 1 && saved?.kind === "set_task_knowledge" &&
+      request?.consumer.kind === "task" && request.consumer.task_id === selectedTask.id &&
+      request.user_text === "Canonical attachment destination" &&
+      request.selection.length === 1 && request.selection[0].entry_id === later.entry.id &&
+      request.selection[0].revision_id === later.revision_id,
+      "later-page selection did not reach the exact task attachment");
+    field("Find approved knowledge", "unavailable project");
+    click("Find approved knowledge");
+    await settleKnowledge();
+    check(document.querySelector(".knowledge-selector .error-notice pre")?.textContent === projectUnavailable,
+      "knowledge search changed the service error text before passing it to ErrorNotice");
+  } finally {
+    finishStaleSearch?.(knowledgeJson([]));
+    unmount();
+    globalThis.fetch = nativeFetch;
+    localStorage.clear();
+  }
 });
 
 Deno.test("knowledge restored observation requires explicit revalidation before preview despite prior acknowledgement", async () => {
@@ -23512,7 +25321,7 @@ Deno.test("knowledge restored observation requires explicit revalidation before 
 Deno.test("report source action keeps the historical attempt and never prefills a report preview as complete evidence", async () => {
   localStorage.clear(); const { ReportList } = await import("./components/TaskReports");
   const saved: import("./types").KnowledgeCommand[] = [];
-  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => { saved.push(JSON.parse(String(init?.body))); return knowledgeJson({ ...knowledgeEntry(), latest_draft_id: "draft-from-report" }); }) as typeof fetch;
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => { saved.push(JSON.parse(String(init?.body))); return knowledgeJson({ ...knowledgeEntry(), version: 1, latest_draft_id: "draft-from-report" }); }) as typeof fetch;
   try {
     mount(<ReportList projectId="p1" taskId="AJ-1" attemptId="historical-attempt" started error="" content={{ task_id: "AJ-1", attempt_id: "historical-attempt", content_revision: "old-content", truncated: true, records: [{ kind: "report", id: "historical-report", role: "implementer", created_at: "2026-11-09", outcome: "candidate_ready", summary: "Bounded report preview" }] }} />);
     click("Save as knowledge"); check(findField("Knowledge statement").value === "", "bounded report preview was presented as a complete statement");
@@ -23548,7 +25357,12 @@ Deno.test("knowledge mutation late completions cannot close a new project editor
       check(document.querySelector('[aria-label="Pending knowledge operation"]')?.textContent?.includes("destination-operation"), "destination did not load its own pending operation");
       await act(async () => {
         if (outcome === "uncertain") fail?.(new TypeError("old scope response lost"));
-        else finish?.(outcome === "refusal" ? knowledgeJson({ error: "old scope refused" }, 409) : knowledgeJson({ ...knowledgeEntry(), latest_draft_id: "old-draft" }));
+        else {
+          const { request: { operation_id } } = JSON.parse(originalBody);
+          finish?.(outcome === "refusal"
+            ? knowledgeJson({ error: "old scope refused", operation_id, outcome_unknown: false }, 409)
+            : knowledgeJson({ ...knowledgeEntry(), operation_id, version: 1, latest_draft_id: "old-draft" }));
+        }
       });
       await settleKnowledge();
       check(localStorage.getItem(newKey) === destinationBody && document.querySelector('[aria-label="Pending knowledge operation"]')?.textContent?.includes("destination-operation"), `${outcome} completion discarded the destination operation or closed its editor`);
@@ -23590,7 +25404,7 @@ Deno.test("task knowledge late completions preserve new task state callbacks and
       check(document.body.textContent?.includes("destination-task-operation"), "new task did not load its own pending operation");
       await act(async () => {
         if (outcome === "uncertain") fail?.(new TypeError("old task response lost"));
-        else finish?.(outcome === "refusal" ? knowledgeJson({ error: "old task refused" }, 409) : knowledgeJson({ result: { version: 99, entity_id: first.id, state: "knowledge_saved" } }));
+        else finish?.(outcome === "refusal" ? knowledgeJson({ error: "old task refused", operation_id: JSON.parse(originalBody).operation_id, outcome_unknown: false }, 409) : knowledgeJson({ result: { operation_id: JSON.parse(originalBody).operation_id, entity_kind: "task", version: first.version + 1, entity_id: first.id, state: "knowledge_saved" } }));
       });
       await settleKnowledge();
       check(callbacks.length === 0 && !document.body.textContent?.includes("Knowledge saved.") && !document.body.textContent?.includes("old task"), `${outcome} completion updated the new task or invoked callbacks`);

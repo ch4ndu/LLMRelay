@@ -1,6 +1,7 @@
 import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
-import { useEffect, useState } from "react";
-import { command, operation, operationId } from "../api";
+import { useEffect, useRef, useState } from "react";
+import { ApiError, command, legacyImport, operation, operationId, recoveryJournalChanged } from "../api";
+import { field } from "../apiValidation";
 import type {
   AgentProfile,
   CmuxSessionSurface,
@@ -824,6 +825,273 @@ function SingleAgentProjectSettings(
   );
 }
 
+type LegacyImportRequest = {
+  kind: "legacy_import";
+  operation_id: string;
+  project_id: string;
+  expected_project_version: number;
+  source: string;
+  expected_source_hash: string;
+};
+
+const legacyImportsInFlight = new Set<string>();
+const isSourceHash = (value: unknown): value is string =>
+  typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+
+function readLegacyImport(storageKey: string, projectId: string) {
+  try {
+    const saved = sessionStorage.getItem(storageKey);
+    if (saved === null) return {};
+    const request: unknown = JSON.parse(saved);
+    const id = field(request, "operation_id");
+    const version = field(request, "expected_project_version");
+    const source = field(request, "source");
+    const hash = field(request, "expected_source_hash");
+    if (
+      typeof request !== "object" || request === null ||
+      Object.keys(request).length !== 6 ||
+      field(request, "kind") !== "legacy_import" ||
+      field(request, "project_id") !== projectId ||
+      typeof id !== "string" || !id ||
+      typeof version !== "number" || !Number.isSafeInteger(version) ||
+      typeof source !== "string" || !source.startsWith("/") || !isSourceHash(hash) ||
+      JSON.stringify(request) !== saved
+    ) throw new Error("Invalid saved legacy import request.");
+    // Keep the saved field order when the operation helper serializes the body.
+    return { saved, request: request as LegacyImportRequest };
+  } catch (cause) {
+    return {
+      error: new Error(
+        "Browser storage could not read the saved import. Check the project's current tasks before trying again.",
+        { cause },
+      ),
+    };
+  }
+}
+
+function LegacyTaskImport({ project, onChanged }: {
+  project: Project;
+  onChanged: () => Promise<void> | void;
+}) {
+  const storageKey = `llmrelay.legacy-import:${project.id}`;
+  const [path, setPath] = useState("");
+  const [preview, setPreview] = useState<{
+    sequence: number;
+    hash: string;
+    title: string;
+    runs: number;
+    bugs: number;
+  }>();
+  const [journal, setJournal] = useState(() => readLegacyImport(storageKey, project.id));
+  const [checked, setChecked] = useState<string>();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const previewSequence = useRef(0);
+  const lifecycle = useRef(new AbortController());
+  useEffect(() => {
+    const current = new AbortController();
+    lifecycle.current = current;
+    return () => current.abort();
+  }, []);
+  useEffect(() => {
+    const sync = () => {
+      const latest = readLegacyImport(storageKey, project.id);
+      setJournal(latest);
+      setChecked((reviewed) => reviewed === latest.saved ? reviewed : undefined);
+    };
+    const onLocalWrite = (event: Event) => {
+      if (event instanceof window.CustomEvent && event.detail === storageKey) sync();
+    };
+    window.addEventListener(recoveryJournalChanged, onLocalWrite);
+    sync();
+    return () => window.removeEventListener(recoveryJournalChanged, onLocalWrite);
+  }, [storageKey, project.id]);
+  const notifyJournal = () => window.dispatchEvent(
+    new window.CustomEvent(recoveryJournalChanged, { detail: storageKey }),
+  );
+
+  const previewSource = async () => {
+    if (legacyImportsInFlight.has(storageKey) || journal.saved || journal.error) return;
+    const sequence = ++previewSequence.current;
+    const signal = lifecycle.current.signal;
+    const isCurrent = () => !signal.aborted && sequence === previewSequence.current;
+    setPreview(undefined);
+    setError("");
+    try {
+      const result = await operation<unknown>({ kind: "legacy_preview", source: path });
+      if (!isCurrent()) return;
+      const hash = field(result, "source_hash");
+      const title = field(field(result, "frontmatter"), "title");
+      const runs = field(result, "validation_runs");
+      const bugs = field(result, "validation_bugs");
+      if (!isSourceHash(hash) || typeof title !== "string" || !Array.isArray(runs) ||
+        !Array.isArray(bugs)) {
+        throw new Error("The service returned an unreadable import preview. Try Preview again.");
+      }
+      setPreview({ sequence, hash, title, runs: runs.length, bugs: bugs.length });
+    } catch (cause) {
+      if (isCurrent()) setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
+  const submitImport = async (retry: boolean) => {
+    if (legacyImportsInFlight.has(storageKey)) {
+      setError("The saved import request is still in progress.");
+      return;
+    }
+    const current = readLegacyImport(storageKey, project.id);
+    setJournal(current);
+    if (current.error) return;
+    let request = current.request;
+    let saved = current.saved;
+    if (retry) {
+      if (!request || checked !== saved) return;
+    } else {
+      if (request || !preview || preview.sequence !== previewSequence.current) return;
+      request = {
+        kind: "legacy_import",
+        operation_id: operationId(),
+        project_id: project.id,
+        expected_project_version: project.version,
+        source: path,
+        expected_source_hash: preview.hash,
+      };
+      saved = JSON.stringify(request);
+      try {
+        sessionStorage.setItem(storageKey, saved);
+      } catch (cause) {
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        setError(`Browser storage could not save the import for recovery. The import was not sent. ${detail}`);
+        return;
+      }
+      setJournal({ saved, request });
+    }
+
+    const signal = lifecycle.current.signal;
+    legacyImportsInFlight.add(storageKey);
+    notifyJournal();
+    const sequence = ++previewSequence.current;
+    setPreview(undefined);
+    setChecked(undefined);
+    setError("");
+    setBusy(true);
+    let confirmed = false;
+    let removeRecoveryCopy = false;
+    let failure = "";
+    try {
+      const result = await legacyImport(request);
+      const taskId = field(result, "task_id");
+      const source = field(result, "source");
+      if (
+        field(result, "imported") !== true ||
+        field(result, "operation_id") !== request.operation_id ||
+        field(result, "project_id") !== request.project_id ||
+        field(result, "source_hash") !== request.expected_source_hash ||
+        typeof taskId !== "string" || !taskId ||
+        typeof source !== "string" || !source.startsWith("/")
+      ) throw new ApiError("The service response did not match the saved import.", 0, request.operation_id, true);
+      confirmed = true;
+      removeRecoveryCopy = true;
+    } catch (cause) {
+      failure = cause instanceof Error ? cause.message : String(cause);
+      // A refusal on replay cannot settle the earlier uncertain request.
+      removeRecoveryCopy = !retry && !(cause instanceof ApiError && cause.ambiguous);
+    }
+    try {
+      if (removeRecoveryCopy) {
+        if (sessionStorage.getItem(storageKey) === saved) {
+          sessionStorage.removeItem(storageKey);
+        } else {
+          confirmed = false;
+        }
+      }
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      failure = `Browser storage could not clear the saved import request. ${detail}`;
+    } finally {
+      legacyImportsInFlight.delete(storageKey);
+      notifyJournal();
+      if (!signal.aborted) {
+        setBusy(false);
+        setError(failure);
+      }
+    }
+    if (confirmed && !signal.aborted && sequence === previewSequence.current) {
+      setPath("");
+      try {
+        await onChanged();
+      } catch (cause) {
+        if (!signal.aborted && sequence === previewSequence.current) {
+          setError(cause instanceof Error ? cause.message : String(cause));
+        }
+      }
+    }
+  };
+
+  return (
+    <details>
+      <summary>Import legacy tasks (optional)</summary>
+      <p className="hint">
+        Import supported task Markdown. This does not register or change a Git
+        project. Preview validates the exact source without changing it;
+        import is idempotent for this project and preserves the original
+        source, frontmatter, sections, runs, bugs, and unknown fields.
+      </p>
+      {journal.request
+        ? (
+          <div className="preview">
+            <strong>{journal.request.source}</strong>
+            {busy || legacyImportsInFlight.has(storageKey)
+              ? <p role="status">Import request in progress.</p>
+              : <UncertainRequestNotice />}
+            <label>
+              <input
+                type="checkbox"
+                checked={checked === journal.saved}
+                disabled={busy || legacyImportsInFlight.has(storageKey)}
+                onChange={(event) => setChecked(event.target.checked ? journal.saved : undefined)}
+              />
+              I checked this project for the imported task.
+            </label>
+            <button disabled={busy || legacyImportsInFlight.has(storageKey) || checked !== journal.saved} onClick={() => void submitImport(true)}>
+              Retry exact import
+            </button>
+          </div>
+        )
+        : (
+          <div className="compact-fields">
+            <input
+              aria-label="Legacy task source"
+              value={path}
+              disabled={busy || !!journal.error}
+              onChange={(event) => {
+                ++previewSequence.current;
+                setPath(event.target.value);
+                setPreview(undefined);
+                setError("");
+              }}
+              placeholder="Absolute .md path"
+            />
+            <button disabled={busy || !!journal.error || !path.startsWith("/")} onClick={previewSource}>
+              Preview
+            </button>
+          </div>
+        )}
+      {preview && !journal.request && !journal.error && !busy && (
+        <div className="preview">
+          <strong>{preview.title}</strong>
+          <small>{preview.hash} · {preview.runs} runs · {preview.bugs} bugs</small>
+          <button className="primary" onClick={() => void submitImport(false)}>
+            Import unchanged source
+          </button>
+        </div>
+      )}
+      {journal.error && <ErrorNotice error={journal.error.message} />}
+      {error && <ErrorNotice error={error} />}
+    </details>
+  );
+}
+
 export function ProjectSettings(
   {
     project,
@@ -852,8 +1120,6 @@ export function ProjectSettings(
   },
 ) {
   const [path, setPath] = useState(project.repository_path);
-  const [legacyPath, setLegacyPath] = useState("");
-  const [legacyPreview, setLegacyPreview] = useState<Record<string, unknown>>();
   const [error, setError] = useState("");
   const [reportReminders, setReportReminders] = useState(
     project.settings.role_report_reminders === true,
@@ -887,34 +1153,6 @@ export function ProjectSettings(
     try {
       await command({ ...body, operation_id: operationId() } as never);
       setError("");
-      onChanged();
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    }
-  };
-  const previewLegacy = async () => {
-    try {
-      setLegacyPreview(
-        await operation({ kind: "legacy_preview", source: legacyPath }),
-      );
-      setError("");
-    } catch (cause) {
-      setLegacyPreview(undefined);
-      setError(cause instanceof Error ? cause.message : String(cause));
-    }
-  };
-  const importLegacy = async () => {
-    try {
-      await operation({
-        kind: "legacy_import",
-        operation_id: operationId(),
-        project_id: project.id,
-        expected_project_version: project.version,
-        source: legacyPath,
-        expected_source_hash: legacyPreview?.source_hash,
-      });
-      setLegacyPreview(undefined);
-      setLegacyPath("");
       onChanged();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -1031,52 +1269,7 @@ export function ProjectSettings(
           </p>
         )}
       </details>
-      <details>
-        <summary>Import legacy tasks (optional)</summary>
-        <p className="hint">
-          Import supported task Markdown. This does not register or change a Git
-          project. Preview validates the exact source without changing it;
-          import is idempotent for this project and preserves the original
-          source, frontmatter, sections, runs, bugs, and unknown fields.
-        </p>
-        <div className="compact-fields">
-          <input
-            aria-label="Legacy task source"
-            value={legacyPath}
-            onChange={(event) => {
-              setLegacyPath(event.target.value);
-              setLegacyPreview(undefined);
-            }}
-            placeholder="Absolute .md path"
-          />
-          <button
-            disabled={!legacyPath.startsWith("/")}
-            onClick={previewLegacy}
-          >
-            Preview
-          </button>
-        </div>
-        {legacyPreview && (
-          <div className="preview">
-            <strong>
-              {String(
-                (legacyPreview.frontmatter as Record<string, unknown>)?.title ||
-                  "Validated legacy task",
-              )}
-            </strong>
-            <small>
-              {String(legacyPreview.source_hash)} · {String(
-                (legacyPreview.validation_runs as unknown[])?.length || 0,
-              )} runs · {String(
-                (legacyPreview.validation_bugs as unknown[])?.length || 0,
-              )} bugs
-            </small>
-            <button className="primary" onClick={importLegacy}>
-              Import unchanged source
-            </button>
-          </div>
-        )}
-      </details>
+      <LegacyTaskImport key={project.id} project={project} onChanged={onChanged} />
       {error && <ErrorNotice error={error} />}
     </section>
   );

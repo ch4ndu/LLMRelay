@@ -97,6 +97,7 @@ pub fn prepare_with_runtime_probe_policy(
         read_denials,
         runtime_probe_policy,
         &crate::provider_compatibility::BundleSet::embedded(),
+        None,
     )
 }
 
@@ -117,8 +118,11 @@ pub(crate) fn prepare_with_bundles(
     read_denials: &[PathBuf],
     runtime_probe_policy: Option<&RuntimeProbeCommandPolicy>,
     bundles: &crate::provider_compatibility::BundleSet,
+    observed_executable: Option<(&Path, &str)>,
 ) -> Result<PreparedLaunch> {
-    let (executable, version) = if bundles.is_synthetic() {
+    let (executable, version) = if let Some((path, version)) = observed_executable {
+        (path.to_path_buf(), version.to_owned())
+    } else if bundles.is_synthetic() {
         // Synthetic bundle preparation stays inside the fixture and never inspects or launches Claude.
         (executable_path.to_path_buf(), "synthetic-claude-v1".into())
     } else {
@@ -1344,6 +1348,7 @@ mod tests {
             &[root.join("protected")],
             None,
             &bundles,
+            None,
         )
         .unwrap();
         assert_eq!(prepared.executable, executable);
@@ -1492,6 +1497,7 @@ mod tests {
             &[],
             None,
             &bundles,
+            None,
         )
         .unwrap();
         let writer_identity = crate::providers::capability_identity(&writer.config).unwrap();

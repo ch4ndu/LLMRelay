@@ -80,6 +80,14 @@ const settledReceipt = (receipt: ConversationReceipt, request: ConversationMutat
   receipt.found && (receipt.delivery_state === "completed" ||
     (["start", "submit", "steer", "probe"].includes(request.action === "with_knowledge" ? request.operation.action : request.action) && receipt.delivery_state === "bound"));
 
+function submittedMessage(request: ConversationMutation) {
+  const message = request.action === "with_knowledge" ? request.operation : request;
+  if (message.action === "start") return { draftKey: "", text: message.input };
+  if (message.action === "submit" || message.action === "steer") {
+    return { draftKey: message.conversation_id, text: message.input };
+  }
+}
+
 export function ConversationWorkspace(props: ConversationWorkspaceProps) {
   const [identity, setIdentity] = useState<ConversationWorkspaceIdentity>();
   const [error, setError] = useState("");
@@ -128,7 +136,28 @@ function ProjectConversationWorkspace({ projectId, storageScope, revision, execu
   const [admissionId, setAdmissionId] = useState("");
   const [configId, setConfigId] = useState("");
   const [instructions, setInstructions] = useState("");
-  const [input, setInput] = useState("");
+  const [drafts, setDrafts] = useState(() => new Map<string, { text: string }>());
+  const retainedDraft = useRef<{ operationId: string; draftKey: string; draft: { text: string } } | undefined>(undefined);
+  const input = drafts.get(selected)?.text ?? "";
+  const editDraft = (id: string, text: string) => {
+    setDrafts((previous) => {
+      const next = new Map(previous);
+      if (text) next.set(id, { text });
+      else next.delete(id);
+      return next;
+    });
+  };
+  const clearSubmittedDraft = (operationId: string) => {
+    const saved = retainedDraft.current;
+    if (!saved || saved.operationId !== operationId) return;
+    retainedDraft.current = undefined;
+    setDrafts((previous) => {
+      if (previous.get(saved.draftKey) !== saved.draft) return previous;
+      const next = new Map(previous);
+      next.delete(saved.draftKey);
+      return next;
+    });
+  };
   const [knowledgeSelection, setKnowledgeSelection] = useState<KnowledgeSelection[]>([]);
   const [knowledgeConfirmation, setKnowledgeConfirmation] = useState<KnowledgeConfirmation>();
   const [knowledgeConsumer, setKnowledgeConsumer] = useState<Omit<KnowledgePreviewRequest, "selection">>();
@@ -185,12 +214,21 @@ function ProjectConversationWorkspace({ projectId, storageScope, revision, execu
       setRetained(archived);
       if (!restoredInput.current) {
         restoredInput.current = true;
-        if (saved && "input" in saved.request) {
-          if (typeof saved.request.input === "string") setInput(saved.request.input);
-          else { setInstructions(saved.request.input.instructions); setConfigId(saved.request.input.execution_config_revision_id); }
+        if (saved) {
+          const message = submittedMessage(saved.request);
+          if (message) {
+            const draft = { text: message.text };
+            retainedDraft.current = { operationId: saved.id, draftKey: message.draftKey, draft };
+            setDrafts((previous) => new Map(previous).set(message.draftKey, draft));
+          } else if (saved.request.action === "create_profile") {
+            setInstructions(saved.request.input.instructions);
+            setConfigId(saved.request.input.execution_config_revision_id);
+          }
         }
         if (saved?.request.action === "start") setAdmissionId(saved.request.admission_id);
-        if (saved?.request.action === "with_knowledge") { setInput(saved.request.operation.input); if (saved.request.operation.action === "start") setAdmissionId(saved.request.operation.admission_id); }
+        if (saved?.request.action === "with_knowledge" && saved.request.operation.action === "start") {
+          setAdmissionId(saved.request.operation.admission_id);
+        }
       }
     }
     catch (cause) { setJournalError(errorText(cause)); }
@@ -333,6 +371,8 @@ function ProjectConversationWorkspace({ projectId, storageScope, revision, execu
   }
   async function send(request: ConversationMutation) {
     const selectionAtSend = selected;
+    const message = submittedMessage(request);
+    const draft = message && drafts.get(message.draftKey);
     setBusy(true); setError(""); setNotice("");
     try {
       await prepareConversationMutation(request);
@@ -351,7 +391,12 @@ function ProjectConversationWorkspace({ projectId, storageScope, revision, execu
       if (!fresh) throw new Error("A saved request already owns this project. Refresh and check its outcome before continuing.");
       if (mounted.current) syncJournal();
       if (!mounted.current) return;
-      if (["start", "submit", "steer", "with_knowledge"].includes(request.action)) { setKnowledgeSelection([]); setKnowledgeConfirmation(undefined); setKnowledgeConsumer(undefined); setKnowledgeGeneration((value) => value + 1); }
+      if (message && draft && draft.text === message.text) {
+        retainedDraft.current = { operationId: original.id, draftKey: message.draftKey, draft };
+      }
+      if (message && currentSelection.current === selectionAtSend) {
+        setKnowledgeSelection([]); setKnowledgeConfirmation(undefined); setKnowledgeConsumer(undefined); setKnowledgeGeneration((value) => value + 1);
+      }
       await deliver(original);
     } catch (cause) { if (mounted.current && currentSelection.current === selectionAtSend) setError(errorText(cause)); }
     finally { if (mounted.current) { setBusy(false); syncJournal(); setRefresh((value) => value + 1); } }
@@ -437,7 +482,7 @@ function ProjectConversationWorkspace({ projectId, storageScope, revision, execu
         return true;
       }, lifetime.current.signal);
       if (moved && mounted.current) {
-        setInput("");
+        clearSubmittedDraft(original.id);
         setNotice("The original request remains uncertain and retained for inspection. Its conversation is history only. Choose New conversation to deliberately start separate work.");
         setRefresh((value) => value + 1);
       }
@@ -445,6 +490,7 @@ function ProjectConversationWorkspace({ projectId, storageScope, revision, execu
     finally { if (mounted.current) { syncJournal(); setBusy(false); } }
   }
   async function releasePending(original: Journal) {
+    const selectionAtRelease = selected;
     setBusy(true);
     try {
       const receipt = await receiptFor(original);
@@ -460,9 +506,9 @@ function ProjectConversationWorkspace({ projectId, storageScope, revision, execu
       }
       await updateJournal(original, () => undefined);
       if (mounted.current) {
-        if (receipt?.conversation_id) choose(receipt.conversation_id);
+        if (receipt?.conversation_id && currentSelection.current === selectionAtRelease) choose(receipt.conversation_id);
         if (receipt?.admission_id) setAdmissionId(receipt.admission_id);
-        if (original.status === "succeeded" && "input" in original.request && typeof original.request.input === "string" && input === original.request.input) setInput("");
+        if (!refused) clearSubmittedDraft(original.id);
         setNotice(refused ? "The refused request was released. Review your text before sending a new request." : "The recorded request was resolved. Backend session state determines which actions are available.");
         setRefresh((value) => value + 1);
       }
@@ -585,7 +631,7 @@ function ProjectConversationWorkspace({ projectId, storageScope, revision, execu
           </div><p>Disconnect releases capacity only after the exact process has exited. Ready tasks may then start if pickup is enabled. Interrupt waits for the exact turn outcome and acknowledgement; it keeps the session reserved.</p>
         </>}
       </section> : <section className="panel"><h2>New conversation</h2><label>Admitted conversation profile<select value={admissionId} onChange={(event) => setAdmissionId(event.target.value)}><option value="">Choose a recorded active admission</option>{activeAdmissions.map((item) => { const profile = profiles.find((saved) => saved.id === item.profile_revision_id); return <option key={item.id} value={item.id}>{profile?.model} · {profile?.effort} · profile {profile?.id}</option>; })}</select></label><p>Active is a historical recorded state. Starting rechecks current eligibility and may refuse. Selecting a profile does not start a provider.</p>{!activeAdmissions.length && <p>No admitted profile is loaded. Use the setup steps below, or load more profiles and admissions.</p>}</section>}
-      <section className="panel"><label htmlFor="conversation-input">{selected ? "Follow-up or steering message" : "First message"}</label><textarea id="conversation-input" rows={5} value={input} onChange={(event) => setInput(event.target.value)} aria-describedby="conversation-input-limit" /><small id="conversation-input-limit">{bytes(input)} / {MAX_INPUT} UTF-8 bytes. Ordinary textual questions can be answered with a follow-up.</small>
+      <section className="panel"><label htmlFor="conversation-input">{selected ? "Follow-up or steering message" : "First message"}</label><textarea id="conversation-input" rows={5} value={input} onChange={(event) => editDraft(selected, event.target.value)} aria-describedby="conversation-input-limit" /><small id="conversation-input-limit">{bytes(input)} / {MAX_INPUT} UTF-8 bytes. Ordinary textual questions can be answered with a follow-up.</small>
         <KnowledgeSelector key={`${selected}:${knowledgeGeneration}`} projectId={projectId} consumer={knowledgeConsumer} disabled={busy || !!journal || !!recoveryJournal || !!journalError} invalidationKey={knowledgeLive.current} onSelectionChange={setKnowledgeSelection} onConfirm={setKnowledgeConfirmation} />
         {knowledgeSelection.length > 0 && <div className="button-row"><button type="button" disabled={blocked || !inputValid || (selected ? !liveIdle : !selectedAdmission)} onClick={() => void prepareKnowledgeOperation(selected ? "submit" : "start")}>Prepare {selected ? "follow-up" : "start"} with knowledge</button>{selected && <button type="button" disabled={blocked || !running || !inputValid} onClick={() => void prepareKnowledgeOperation("steer")}>Prepare steer with knowledge</button>}<p>Prepare reserves the original operation identity for preview only. Preview and confirm before sending. Resume alone adds no attachment.</p></div>}
         <div className="button-row"><button className="primary" disabled={blocked || !inputValid || (selected ? !liveIdle : !selectedAdmission)} onClick={() => void sendInput(selected ? "submit" : "start")}>{selected ? "Send follow-up" : "Ask / start conversation"}</button>

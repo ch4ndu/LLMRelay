@@ -1828,11 +1828,147 @@ exit 23
             .unwrap(),
         0
     );
+    completed_local_ptys_are_released(&store, &database, &supervisor, &launch).await;
     drop(supervisor);
     drop(store);
     drop(database);
     std::fs::remove_dir_all(root).unwrap();
     service_requested_stop_crosses_settling_deadline().await;
+}
+
+async fn completed_local_ptys_are_released(
+    store: &Store,
+    database: &rusqlite::Connection,
+    supervisor: &Supervisor,
+    launch: &PreparedLaunch,
+) {
+    let mut launch = launch.clone();
+    launch.executable = "/bin/sh".into();
+    launch.config.executable = launch.executable.clone();
+    launch.environment.clear();
+    for ordinal in 1..=6 {
+        let id = || uuid::Uuid::new_v4().to_string();
+        let (session, epoch, owner_id) = (id(), id(), id());
+        let release = launch.config.cwd.join(format!("{session}.release"));
+        launch.arguments = vec![
+            "-c".into(),
+            "i=0; while [ ! -f \"$1\" ]; do
+                 i=$((i + 1)); [ \"$i\" -lt 200 ] || exit 27; sleep 0.02
+             done
+             printf 'FINAL_PTY_OUTPUT\\n'; exit 23"
+                .into(),
+            "fixture".into(),
+            release.to_string_lossy().into_owned(),
+        ];
+        let owner = if ordinal % 2 == 0 {
+            database.execute(
+                "INSERT INTO provider_validation_batches(id,operation_id,request_hash,preview_hash,selection_json,
+                     max_fresh_calls,native_calls_authorized,state,created_at,updated_at)
+                 VALUES(?1,?1,'fixture','fixture','[]',1,1,'running','now','now')",
+                [&owner_id],
+            ).unwrap();
+            database.execute(
+                "INSERT INTO provider_validation_invocations(id,batch_id,ordinal,provider,model,effort,evidence_key,state,created_at,updated_at)
+                 VALUES(?1,?1,0,'codex','inert-local','none',?1,'reserved','now','now')",
+                [&owner_id],
+            ).unwrap();
+            SessionOwner::ProviderValidationInvocation(owner_id.clone())
+        } else {
+            database.execute(
+                "INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,created_at,updated_at)
+                 VALUES(?1,'a','manager','codex',?2,1,'launch_reserved',?1,'now','now')",
+                rusqlite::params![owner_id, ordinal + 1],
+            ).unwrap();
+            SessionOwner::RoleGeneration(owner_id.clone())
+        };
+        database.execute(
+            "INSERT INTO sessions(id,role_generation_id,provider_validation_invocation_id,provider,status,
+                 launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
+             VALUES(?1,?2,?3,'codex','launch_reserved','{}','fixture',?4,'now','now')",
+            rusqlite::params![
+                session, owner.role_generation_id(),
+                matches!(&owner, SessionOwner::ProviderValidationInvocation(_)).then_some(&owner_id),
+                epoch,
+            ],
+        ).unwrap();
+        let identity = supervisor.spawn(&session, &owner, &epoch, &launch).unwrap();
+        store
+            .update_session_running(&session, &epoch, &serde_json::to_string(&identity).unwrap())
+            .unwrap();
+        let binding = owner
+            .role_generation_id()
+            .map(|_| supervisor.establish_attachment(&session).unwrap());
+        std::fs::write(&release, b"release").unwrap();
+        for _ in 0..200 {
+            supervisor.reconcile().unwrap();
+            let settled: bool = database
+                .query_row(
+                    "SELECT status='exited' AND capture_state='complete' FROM sessions WHERE id=?1",
+                    [&session],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if settled {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Reconciliation may have recorded exit just before capture completed.
+        supervisor.reconcile().unwrap();
+        let exit: String = database.query_row(
+            "SELECT exit_json FROM sessions WHERE id=?1 AND status='exited' AND capture_state='complete'",
+            [&session], |row| row.get(0),
+        ).unwrap();
+        let exit: serde_json::Value = serde_json::from_str(&exit).unwrap();
+        assert_eq!(exit["code"], 23);
+        assert_eq!(exit["process_group_quiescent"], true);
+        assert!(exit["output_tail"]
+            .as_str()
+            .unwrap()
+            .contains("FINAL_PTY_OUTPUT"));
+        assert!(supervisor
+            .process_group_members(&session)
+            .unwrap()
+            .is_empty());
+        assert!(supervisor
+            .interrupt(&session)
+            .unwrap_err()
+            .to_string()
+            .contains("not attached to this service boot"));
+        if let Some(binding) = binding {
+            assert!(supervisor.establish_attachment(&session).is_err());
+            let page = supervisor
+                .attachment_transcript(&binding, None, 0, 64 * 1024)
+                .unwrap();
+            let bytes = page
+                .frames
+                .iter()
+                .flat_map(|frame| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(&frame.data)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert!(String::from_utf8(bytes)
+                .unwrap()
+                .contains("FINAL_PTY_OUTPUT"));
+            let final_page = supervisor
+                .attachment_transcript(
+                    &binding,
+                    page.next_epoch.as_deref(),
+                    page.next_sequence,
+                    64 * 1024,
+                )
+                .unwrap();
+            assert!(final_page.frames.is_empty());
+            assert!(!final_page.has_more);
+            let mut stale = binding;
+            stale.transcript_epoch = id();
+            assert!(supervisor
+                .attachment_transcript(&stale, None, 0, 64 * 1024)
+                .is_err());
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

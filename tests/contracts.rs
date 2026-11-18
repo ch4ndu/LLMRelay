@@ -1343,6 +1343,155 @@ fn m4a_restore_session_check_and_claim_recovery_never_resurrects_work() {
 }
 
 #[test]
+fn m4a_restore_hold_checks_recorded_check_members_outside_a_vacant_group() {
+    let empty = m4a_paths("check-member-empty");
+    drop(Store::open(&empty.database).unwrap());
+    let empty_backup = m4a_backup_path(&database::backup(&empty, None).unwrap());
+    let pid = std::process::id();
+    let output = Command::new("/bin/ps")
+        .args(["-axo", "pid=,pgid=,lstart="])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let inventory = recovery::parse_process_inventory(&output.stdout).unwrap();
+    let (_, _, start) = inventory.iter().find(|(id, _, _)| *id == pid).unwrap();
+    let old_group = 2_000_000_000;
+    assert!(!inventory
+        .iter()
+        .any(|(id, group, _)| *id == old_group as u32 || *group == old_group));
+    let boot = agenticjira::supervisor::system_boot_identity().unwrap();
+    let anchor = serde_json::json!({
+        "pid":old_group,"process_group_id":old_group,
+        "native_start_marker":"absent-check-leader","boot_identity":&boot
+    })
+    .to_string();
+
+    for (scenario, marker, expected) in [
+        (
+            "displaced",
+            start.as_str(),
+            "process identities remain live",
+        ),
+        ("restored", start.as_str(), "process identities remain live"),
+        ("reused-pid", "older process start", ""),
+        (
+            "historical",
+            "older process start",
+            "no recorded check process list",
+        ),
+        (
+            "stale-capture",
+            "older process start",
+            "Check output may still be open",
+        ),
+    ] {
+        let source = Fixture::new(scenario);
+        seed_attempt(&source, "checks");
+        source.execute(
+            "UPDATE projects SET repository_path=?1",
+            [source.root.to_str().unwrap()],
+        );
+        let capture = if scenario == "stale-capture" {
+            serde_json::json!({
+                "capture_incomplete":true,
+                "capture_settlement":{
+                    "source":"retained_output_eof","check_id":"restore-check",
+                    "launch_boot_identity":m4a_prior_boot_identity(),
+                    "stdout_eof":true,"stderr_eof":true,"observed_at":"2026-01-01T00:00:00Z",
+                }
+            })
+        } else {
+            serde_json::json!({})
+        };
+        source.execute(
+            "INSERT INTO check_runs(id,attempt_id,candidate_hash,executable,arguments_json,cwd,status,
+               evidence_json,created_at,recovery_root_pid,recovery_process_group_id,recovery_anchor_json,
+               launch_boot_identity)
+             VALUES('restore-check','a','candidate','/usr/bin/true','[]','/tmp','running',
+               ?1,'2026-01-01T00:00:00Z',?2,?2,?3,?4)",
+            params![capture.to_string(), old_group, &anchor, &boot],
+        );
+        source.execute(
+            "INSERT INTO check_processes(check_id,pid,native_start_marker,process_group_id,parent_pid,last_seen_at)
+             VALUES('restore-check',?1,?2,?3,?3,'2026-01-01T00:00:00Z')",
+            params![pid, marker, old_group],
+        );
+        let mut source_paths = m4a_paths(scenario);
+        source_paths.database = source.database.clone();
+        source_paths.state = source.root.clone();
+        let backup = m4a_backup_path(&database::backup(&source_paths, None).unwrap());
+        let target = m4a_paths(scenario);
+
+        if scenario == "restored" {
+            database::restore(&target, &backup).unwrap();
+            let store = Store::open(&target.database).unwrap();
+            let error = recovery::verify_check_quiescent(&store, "restore-check").unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            drop(store);
+            let error = database::release_hold(&target).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("check restore-check remains"),
+                "{error:#}"
+            );
+        } else {
+            std::fs::copy(backup.join("database.sqlite3"), &target.database).unwrap();
+            database::restore(&target, &empty_backup).unwrap();
+            let mut journal = m4a_read_journal(&target);
+            let check = &mut journal["inventory"]["evidence"]["checks"][0];
+            let recorded_processes = check["recorded_processes"].clone();
+            if scenario == "historical" {
+                let check = check.as_object_mut().unwrap();
+                check.remove("recorded_processes");
+                check.remove("capture_evidence");
+                check.remove("recovery_capture_incomplete");
+                m4a_write_journal(&target, &journal);
+            }
+            if expected.is_empty() {
+                assert_eq!(
+                    database::release_hold(&target).unwrap()["restore_hold"],
+                    false
+                );
+            } else {
+                let error = database::release_hold(&target).unwrap_err();
+                assert!(format!("{error:#}").contains(expected), "{error:#}");
+            }
+            assert_eq!(
+                recorded_processes,
+                serde_json::json!([[pid, marker, old_group]])
+            );
+        }
+        if !expected.is_empty() {
+            assert_eq!(m4a_read_journal(&target)["phase"], "completed");
+            assert_eq!(
+                Connection::open(&target.database)
+                    .unwrap()
+                    .query_row(
+                        "SELECT state FROM recovery_records WHERE id='database-restore-hold'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                "attention_required"
+            );
+        }
+        if scenario == "historical" {
+            let mut journal = m4a_read_journal(&target);
+            journal["inventory"]["recorded_boot"] = m4a_prior_boot_identity().into();
+            m4a_write_journal(&target, &journal);
+            assert_eq!(
+                database::release_hold(&target).unwrap()["restore_hold"],
+                false
+            );
+        }
+        std::fs::remove_dir_all(target.root).unwrap();
+        std::fs::remove_dir_all(backup.parent().unwrap()).unwrap();
+        std::fs::remove_dir_all(source_paths.root).unwrap();
+    }
+    std::fs::remove_dir_all(empty_backup.parent().unwrap()).unwrap();
+    std::fs::remove_dir_all(empty.root).unwrap();
+}
+
+#[test]
 fn m4a_unreadable_displaced_database_requires_changed_boot_for_release() {
     let source = m4a_paths("release-source");
     Store::open(&source.database).unwrap();
@@ -7214,6 +7363,84 @@ fn m5_scheduler_capacity_audits_every_encountered_hold_without_duplicate_work() 
         ),
         6
     );
+}
+
+#[test]
+fn scheduler_dependency_claim_release_is_atomic() {
+    for interrupt in [true, false] {
+        let fixture = Fixture::new(if interrupt {
+            "dependency-release-interrupted"
+        } else {
+            "dependency-release-committed"
+        });
+        let repo = fixture.repository("repo");
+        let project = add_project(&fixture, repo.clone(), "dependency-release");
+        let task = create_task(&fixture, &project, "dependent", 1);
+        let repository = workspace::inspect(&repo).unwrap();
+        let manifest = SnapshotManifest {
+            schema: 2,
+            original_base: repository.head.clone(),
+            candidate_head: repository.head.clone(),
+            snapshot_base: repository.head.clone(),
+            repository_identity: repository.identity,
+            total_bytes: 0,
+            baseline_snapshot_id: None,
+            task_changed_paths: Vec::new(),
+            entries: Vec::new(),
+        };
+        fixture.execute(
+            "INSERT INTO tasks(id,project_id,title,lifecycle,created_at,updated_at)
+             VALUES('prerequisite',?1,'Integrated prerequisite','done','2026-01-01','2026-01-01')",
+            params![project],
+        );
+        fixture.execute(
+            "INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,
+                                  status,created_at,updated_at)
+             VALUES('accepted','prerequisite','accepted-context','checks',?1,1,
+                    'done','2026-01-01','2026-01-01')",
+            params![repository.head],
+        );
+        fixture.execute(
+            "INSERT INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,created_at)
+             VALUES('accepted-snapshot','accepted','candidate',?1,'current-manifest',?2,1,'2026-01-01')",
+            params![repository.head, serde_json::to_string(&manifest).unwrap()],
+        );
+        fixture.execute_batch(
+            "UPDATE attempts SET accepted_snapshot_id='accepted-snapshot' WHERE id='accepted';",
+        );
+        fixture.execute(
+            "INSERT INTO task_dependencies(task_id,depends_on_task_id,integration_commit,integration_manifest_hash,created_at)
+             VALUES(?1,'prerequisite',?2,'stale-manifest','2026-01-01')",
+            params![task, repository.head],
+        );
+        if interrupt {
+            fixture.execute_batch(
+                "CREATE TRIGGER abort_dependency_release BEFORE UPDATE OF attention ON tasks
+                 WHEN NEW.attention='blocked' AND OLD.lifecycle='in_progress'
+                 BEGIN SELECT RAISE(ABORT,'injected claim release failure'); END;",
+            );
+        }
+        let scheduler = scheduler(&fixture, fixture.root.join("artifacts"));
+        let error = scheduler.claim_next().unwrap_err();
+        let (reason, durable_state) = if interrupt {
+            (
+                "injected claim release failure",
+                "reserved:reserved:workspace_reserved:in_progress:none:2",
+            )
+        } else {
+            (
+                "dependency integration became stale: accepted dependency snapshot changed",
+                "failed:failed:failed:ready:blocked:3",
+            )
+        };
+        assert!(format!("{error:#}").contains(reason), "{error:#}");
+        fixture.assert_scalar(
+            "SELECT c.state||':'||w.state||':'||a.status||':'||t.lifecycle||':'||t.attention||':'||t.version
+             FROM claims c JOIN workspaces w ON w.attempt_id=c.attempt_id
+             JOIN attempts a ON a.id=c.attempt_id JOIN tasks t ON t.id=a.task_id",
+            durable_state.to_owned(),
+        );
+    }
 }
 
 #[test]
@@ -17341,6 +17568,52 @@ fn trip_migration_freezes_authorized_guidance_for_exact_recovery() {
         version,
     );
     std::fs::write(workspace.join("fixture.txt"), "edited guidance\n").unwrap();
+    fixture.execute_batch(
+        "CREATE TRIGGER refuse_migration_policy BEFORE UPDATE OF policy_json ON workspaces
+         WHEN OLD.state='recovery_required'
+         BEGIN SELECT RAISE(ABORT,'injected migration materialization failure'); END;
+         CREATE TRIGGER interrupt_migration_failure BEFORE UPDATE OF attention ON tasks
+         WHEN NEW.attention='needs_recovery' AND EXISTS(
+             SELECT 1 FROM audit_events WHERE operation_id='recover-frozen-guidance'
+               AND event_code='trip.command.progress')
+         BEGIN SELECT RAISE(ABORT,'injected migration failure settlement'); END;",
+    );
+    let recovery_action = action(version);
+    let interrupted_failure = execute_trip(
+        &fixture,
+        &paths,
+        "recover-frozen-guidance",
+        &recovery_action,
+    )
+    .unwrap_err();
+    assert!(format!("{interrupted_failure:#}").contains("injected migration failure settlement"));
+    let recovery_state = "SELECT w.state||':'||a.status||':'||t.attention||':'||
+           (w.updated_at=a.updated_at AND a.updated_at=t.updated_at)
+         FROM workspaces w JOIN attempts a ON a.id=w.attempt_id JOIN tasks t ON t.id=a.task_id";
+    fixture.assert_scalar(
+        recovery_state,
+        "recovery_required:needs_recovery:needs_recovery:1".to_owned(),
+    );
+    fixture.execute_batch("DROP TRIGGER interrupt_migration_failure;");
+    let materialization_failure = execute_trip(
+        &fixture,
+        &paths,
+        "recover-frozen-guidance",
+        &recovery_action,
+    )
+    .unwrap_err();
+    let reason = format!("{materialization_failure:#}");
+    assert!(reason.contains("legacy migration policy materialization requires recovery"));
+    assert!(reason.contains("injected migration materialization failure"));
+    fixture.assert_scalar(
+        recovery_state,
+        "recovery_required:needs_recovery:needs_recovery:1".to_owned(),
+    );
+    fixture.assert_scalar(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='recover-frozen-guidance'",
+        0_i64,
+    );
+    fixture.execute_batch("DROP TRIGGER refuse_migration_policy;");
     let recovered = execute_trip(
         &fixture,
         &paths,
@@ -19415,6 +19688,27 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
     drop(proposal_app);
     let _ = std::fs::remove_dir_all(proposal_paths.socket_dir);
 
+    exercise_reviewed_parallel_lane_integration(IntegrationDispatchCase::Normal);
+    exercise_independent_and_default_lanes();
+}
+
+enum IntegrationDispatchCase {
+    Normal,
+    Interrupted,
+    Uncertain,
+}
+
+#[test]
+fn integration_dispatch_reconciles_the_exact_started_writer_after_reopen() {
+    exercise_reviewed_parallel_lane_integration(IntegrationDispatchCase::Interrupted);
+}
+
+#[test]
+fn integration_dispatch_holds_historical_requests_and_unstarted_reservations() {
+    exercise_reviewed_parallel_lane_integration(IntegrationDispatchCase::Uncertain);
+}
+
+fn exercise_reviewed_parallel_lane_integration(dispatch_case: IntegrationDispatchCase) {
     let parallel = Fixture::new("reviewed-parallel-lane-wait");
     let (parallel_project, parallel_task, parallel_plan) =
         new_task(&parallel, "parallel", "parallel-task");
@@ -19622,21 +19916,41 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         .unwrap();
     let alpha_lane: String =
         parallel.scalar("SELECT id FROM implementation_lanes WHERE lane_key='relay_alpha'");
+    let historical_created_at = chrono::Utc::now().to_rfc3339();
     parallel.execute(
         "INSERT INTO role_generations(id,attempt_id,role,provider,generation,config_revision,status,authority_generation,lane_id,created_at,updated_at)
-         VALUES('historical-default-generation',?1,'implementer','codex',1,1,'exited','historical-default-authority','default','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z')",
-        params![parallel_plan.attempt_id],
+         VALUES('historical-default-generation',?1,'implementer','codex',1,1,'launch_reserved','historical-default-authority','default',?2,?2)",
+        params![parallel_plan.attempt_id, historical_created_at],
     );
     parallel.execute(
-        "INSERT INTO sessions(id,role_generation_id,provider,status,launch_state,launch_config_json,executable_version,transcript_epoch,lane_id,created_at,updated_at)
-         VALUES('historical-default-session','historical-default-generation','codex','exited','finished','{}','fixture','historical-default-epoch','default','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z')",
-        [],
+        "INSERT INTO sessions(id,role_generation_id,provider,status,launch_state,launch_boot_identity,launch_config_json,executable_version,transcript_epoch,lane_id,created_at,updated_at)
+         VALUES('historical-default-session','historical-default-generation','codex','launch_reserved','spawning','synthetic-dispatch-no-process','{}','fixture','historical-default-epoch','default',?1,?1)",
+        params![historical_created_at],
     );
-    parallel.execute(
-        "UPDATE role_settings SET effective_generation_id='historical-default-generation'
-         WHERE task_id=?1 AND role='implementer' AND revision=1",
-        params![parallel_plan.task_id],
-    );
+    let historical_process = ProcessIdentity {
+        pid: std::process::id(),
+        process_group_id: 0,
+        native_start_marker: "synthetic-dispatch-no-process".into(),
+        observed_started_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let historical_process_json = serde_json::to_string(&historical_process).unwrap();
+    parallel
+        .store
+        .update_session_running(
+            "historical-default-session",
+            "historical-default-epoch",
+            &historical_process_json,
+        )
+        .unwrap();
+    assert!(parallel
+        .store
+        .update_session_exit(
+            "historical-default-session",
+            "historical-default-epoch",
+            &historical_process_json,
+            r#"{"process_group_quiescent":true,"synthetic_fixture":true}"#,
+        )
+        .unwrap());
     let alpha_dispatch = parallel_app.coordinator_tick().unwrap();
     assert_eq!(alpha_dispatch["action"], "implementation_lane_dispatched");
     assert_eq!(alpha_dispatch["lane_key"], "relay_alpha");
@@ -19920,19 +20234,223 @@ fn coordinator_waits_for_reviewed_parallel_lane_admission_and_preserves_default_
         "SELECT COUNT(*) FROM guidance_messages WHERE role_generation_id='parallel-manager-generation' AND body LIKE '%exact ordered integration request%'",
         1,
     );
-    agenticjira::trip::request_integration(
-        &parallel.store,
-        &manager,
-        &serde_json::json!({"capsule":{"ordered_lanes":["relay_alpha","relay_beta"],"merge_strategy":"ordered fixture integration","verification_boundary":"existing contract suite"}}),
-    )
-    .unwrap();
-    assert_eq!(
-        parallel_app.coordinator_tick().unwrap()["action"],
-        "integration_implementer_dispatched"
-    );
-    drop(parallel_app);
-    let _ = std::fs::remove_dir_all(parallel_paths.socket_dir);
+    let create_request = |store: &Store| {
+        let request = agenticjira::trip::request_integration(
+            store,
+            &manager,
+            &serde_json::json!({"capsule":{"ordered_lanes":["relay_alpha","relay_beta"],"merge_strategy":"ordered fixture integration","verification_boundary":"existing contract suite"}}),
+        )
+        .unwrap();
+        request["integration_request_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let reopen = || {
+        Application::new_with_synthetic_dispatch_for_tests(
+            parallel_paths.clone(),
+            Store::open(&parallel.database).unwrap(),
+            std::env::current_exe().unwrap(),
+            test_hooks(&parallel),
+        )
+        .unwrap()
+    };
+    let writer_counts = || {
+        parallel
+            .connection()
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM role_generations WHERE role='implementer' AND lane_id='default'),
+                   (SELECT COUNT(*) FROM launch_permits WHERE role='implementer' AND lane_id='default'
+                      AND state IN ('issued','consumed'))",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+    };
+    let request = create_request(&parallel.store);
+    let before = writer_counts();
+    match dispatch_case {
+        IntegrationDispatchCase::Normal => {
+            parallel.execute_batch(
+                "CREATE TRIGGER fail_integration_reservation BEFORE UPDATE ON trip_integration_dispatch
+                 BEGIN SELECT RAISE(ABORT,'injected integration reservation failure'); END;",
+            );
+            let failed = parallel_app.coordinator_tick().unwrap();
+            assert_eq!(failed["action"], "coordinator_failure_held", "{failed}");
+            assert_eq!(failed["effect_certainty"], "none");
+            assert_eq!(writer_counts(), before);
+            parallel.assert_scalar::<Option<String>>(
+                "SELECT session_id FROM trip_integration_dispatch",
+                None,
+            );
+            parallel.execute_batch("DROP TRIGGER fail_integration_reservation;");
+            resolve_failed_step(
+                &parallel,
+                "retry-integration-reservation",
+                &parallel_task,
+                &parallel_plan.attempt_id,
+                failed["recovery_id"].as_str().unwrap(),
+                "retry_failed_step",
+                parallel.scalar(&format!(
+                    "SELECT version FROM tasks WHERE id='{parallel_task}'"
+                )),
+            )
+            .unwrap();
+            let dispatched = parallel_app.coordinator_tick().unwrap();
+            assert_eq!(
+                dispatched["action"], "integration_implementer_dispatched",
+                "{dispatched}"
+            );
+            assert_eq!(dispatched["integration_request_id"], request);
+            assert_exact_integration_start(
+                &parallel,
+                &request,
+                dispatched["session_id"].as_str().unwrap(),
+                "dispatched",
+            );
+            assert_eq!(writer_counts(), (before.0 + 1, before.1 + 1));
+            drop(parallel_app);
+        }
+        IntegrationDispatchCase::Interrupted => {
+            // Stop after the existing synthetic launch commits its start,
+            // before the coordinator can record dispatch on the request.
+            let launch = parallel_app
+                .dispatch_attempt_role(
+                    &parallel_plan.attempt_id,
+                    RoleKind::Implementer,
+                    "Synthetic integration launch cut before coordinator bookkeeping",
+                )
+                .unwrap();
+            assert_exact_integration_start(&parallel, &request, &launch.session_id, "requested");
+            assert_ne!(launch.role_generation_id, "historical-default-generation");
+            let writer = parallel_app
+                .synthetic_role_context_for_tests(&launch.session_id)
+                .unwrap();
+            drop(parallel_app);
+            let after_launch = writer_counts();
+            assert_eq!(after_launch, (before.0 + 1, before.1 + 1));
+            let restarted = reopen();
+            let reconciled = restarted.coordinator_tick().unwrap();
+            assert_eq!(
+                reconciled["action"], "integration_dispatch_reconciled",
+                "{reconciled}"
+            );
+            assert_eq!(reconciled["integration_request_id"], request);
+            assert_eq!(reconciled["session_id"], launch.session_id);
+            assert_exact_integration_start(&parallel, &request, &launch.session_id, "dispatched");
 
+            finish_synthetic_role(&parallel, &writer);
+            let after_exit = restarted.coordinator_tick().unwrap();
+            assert_ne!(
+                after_exit["action"], "coordinator_failure_held",
+                "{after_exit}"
+            );
+            assert_eq!(writer_counts(), after_launch);
+        }
+        IntegrationDispatchCase::Uncertain => {
+            drop(parallel_app);
+            parallel.execute_batch(
+                "DROP TABLE trip_integration_dispatch;
+                 PRAGMA user_version=50;",
+            );
+            let restarted = reopen();
+            let process_hash = agenticjira::store::json_hash(&historical_process).unwrap();
+            let historical_starts: i64 = parallel
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_execution_boundaries b
+                     JOIN sessions s ON s.id=b.session_id AND s.role_generation_id=b.role_generation_id
+                       AND s.transcript_epoch=b.transcript_epoch AND s.process_identity_json=b.process_identity_json
+                     JOIN role_generations g ON g.id=b.role_generation_id
+                     JOIN trip_integration_requests r ON r.id=?1 AND r.attempt_id=g.attempt_id
+                     WHERE s.id='historical-default-session'
+                       AND b.role_generation_id='historical-default-generation'
+                       AND b.transcript_epoch='historical-default-epoch' AND b.kind='started'
+                       AND b.process_identity_hash=?2 AND b.process_identity_json=?3
+                       AND b.observed_at=?4 AND s.status='exited' AND s.launch_state='finished'
+                       AND g.status='exited' AND g.updated_at=s.updated_at
+                       AND json_extract(s.exit_json,'$.process_group_quiescent')=1
+                       AND julianday(s.created_at)<=julianday(b.observed_at)
+                       AND julianday(b.observed_at)<=julianday(s.updated_at)
+                       AND julianday(s.updated_at)<julianday(r.created_at)",
+                    params![request, process_hash, historical_process_json, historical_process.observed_started_at],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(historical_starts, 1);
+            let held = restarted.coordinator_tick().unwrap();
+            assert_eq!(held["for"], "integration_dispatch_uncertain", "{held}");
+            assert_eq!(held["decision"]["disposition"], "held");
+            parallel.assert_scalar("SELECT COUNT(*) FROM trip_integration_dispatch", 0_i64);
+            parallel.assert_scalar(
+                "SELECT state FROM trip_integration_requests",
+                "requested".to_owned(),
+            );
+            assert_eq!(writer_counts(), before);
+
+            // Use a fresh request in the same fixture to reach the reservation
+            // boundary without starting the synthetic process.
+            parallel.execute(
+                "DELETE FROM trip_integration_requests WHERE id=?1",
+                params![request],
+            );
+            let request = create_request(&restarted.store);
+            let context = restarted
+                .store
+                .role_launch_context(&parallel_plan.attempt_id, RoleKind::Implementer)
+                .unwrap();
+            let config = prepared_launch(
+                &parallel,
+                &context,
+                RoleKind::Implementer,
+                "Unstarted integration reservation",
+            );
+            restarted
+                .store
+                .reserve_role_invocation(&context, &config)
+                .unwrap();
+            drop(restarted);
+            let after_reservation = writer_counts();
+            let restarted = reopen();
+            let held = restarted.coordinator_tick().unwrap();
+            assert_eq!(held["for"], "integration_dispatch_uncertain", "{held}");
+            parallel.assert_scalar::<String>(
+                "SELECT r.id || ':' || r.state || ':' || s.status
+                 FROM trip_integration_requests r JOIN trip_integration_dispatch d ON d.request_id=r.id
+                 JOIN sessions s ON s.id=d.session_id AND s.role_generation_id=d.role_generation_id
+                   AND s.transcript_epoch=d.transcript_epoch",
+                format!("{request}:requested:launch_reserved"),
+            );
+            assert_eq!(writer_counts(), after_reservation);
+            assert_eq!(after_reservation, (before.0 + 1, before.1 + 1));
+        }
+    }
+    let _ = std::fs::remove_dir_all(parallel_paths.socket_dir);
+}
+
+fn assert_exact_integration_start(fixture: &Fixture, request: &str, session: &str, state: &str) {
+    let (generation, actual_state, start_count): (String, String, i64) = fixture
+        .connection()
+        .query_row(
+            "SELECT d.role_generation_id,r.state,
+                    (SELECT COUNT(*) FROM workflow_execution_boundaries b
+                     WHERE b.session_id=d.session_id AND b.role_generation_id=d.role_generation_id
+                       AND b.transcript_epoch=d.transcript_epoch AND b.kind='started')
+             FROM trip_integration_requests r JOIN trip_integration_dispatch d ON d.request_id=r.id
+             JOIN sessions s ON s.id=d.session_id AND s.role_generation_id=d.role_generation_id
+               AND s.transcript_epoch=d.transcript_epoch
+             WHERE r.id=?1 AND s.id=?2 AND d.role_generation_id<>r.requested_by_generation_id",
+            params![request, session],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_ne!(generation, "historical-default-generation");
+    assert_eq!(actual_state, state);
+    assert_eq!(start_count, 1);
+}
+
+fn exercise_independent_and_default_lanes() {
     let independent = Fixture::new("reviewed-independent-lane-dispatch").with_synthetic_claude();
     let independent_project =
         add_project(&independent, independent.repository("repo"), "independent");
@@ -20356,8 +20874,8 @@ fn t02_stale_task_revision_rejects_without_mutating_durable_draft() {
     assert_eq!(submitted.0, "edited title");
 }
 
-#[test]
-fn t03_duplicate_operation_has_one_receipt_task_and_audit() {
+#[tokio::test]
+async fn t03_duplicate_operation_has_one_receipt_task_and_audit() {
     let fixture = Fixture::new("t03");
     let project = add_project(&fixture, fixture.repository("repo"), "p");
     let first = create_task(&fixture, &project, "same-operation", 1);
@@ -20376,7 +20894,13 @@ fn t03_duplicate_operation_has_one_receipt_task_and_audit() {
         1,
     );
 
-    let import_fixture = Fixture::new("t03-import");
+    let import_paths = m4a_paths("t03-import");
+    let import_fixture = Fixture {
+        root: import_paths.root.clone(),
+        database: import_paths.database.clone(),
+        store: Store::open(&import_paths.database).unwrap(),
+        synthetic_bundles: None,
+    };
     let import_project = add_project(
         &import_fixture,
         import_fixture.repository("repo"),
@@ -20423,16 +20947,193 @@ Created.
     )
     .unwrap();
     let preview = import::preview(&source).unwrap();
-    let imported = import::apply(
-        &import_fixture.store,
-        "legacy-import",
+    let alias = import_fixture.root.join("legacy-alias.md");
+    std::os::unix::fs::symlink(&source, &alias).unwrap();
+    let apply = |operation: &str, project: &str, version, path: &std::path::Path, hash: &str| {
+        import::apply(
+            &import_fixture.store,
+            operation,
+            project,
+            version,
+            path,
+            hash,
+        )
+    };
+    let bad_hash = apply("fresh-bad-hash", &import_project, 2, &source, "wrong").unwrap_err();
+    assert!(bad_hash
+        .to_string()
+        .contains("source changed after preview"));
+    let stale = apply(
+        "fresh-stale",
         &import_project,
-        2,
+        1,
         &source,
         &preview.source_hash,
     )
-    .unwrap();
+    .unwrap_err();
+    assert!(stale.to_string().contains("project version is stale"));
+    let start = Barrier::new(2);
+    let import = || {
+        start.wait();
+        apply(
+            "legacy-import",
+            &import_project,
+            2,
+            &alias,
+            &preview.source_hash,
+        )
+        .unwrap()
+    };
+    let imported = std::thread::scope(|scope| {
+        let first = scope.spawn(&import);
+        let second = import();
+        assert_eq!(first.join().unwrap(), second);
+        second
+    });
     assert_eq!(imported["task_id"], "legacy-task");
+    assert_eq!(imported["operation_id"], "legacy-import");
+    let duplicate = apply(
+        "legacy-alias-import",
+        &import_project,
+        3,
+        &preview.source,
+        &preview.source_hash,
+    )
+    .unwrap();
+    assert_eq!(duplicate["task_id"], imported["task_id"]);
+    assert_eq!(duplicate["operation_id"], "legacy-alias-import");
+    let app = Application::new(
+        import_paths.clone(),
+        Store::open(&import_paths.database).unwrap(),
+        PathBuf::from(env!("CARGO_BIN_EXE_llmrelay")),
+    )
+    .unwrap();
+    let args = |path: &std::path::Path| {
+        let mut cli = Command::new(env!("CARGO_BIN_EXE_llmrelay"));
+        cli.arg("import")
+            .arg("--data-dir")
+            .arg(&import_paths.root)
+            .args([
+                "apply",
+                "--operation-id",
+                "legacy-import",
+                "--project",
+                &import_project,
+                "--expected-project-version",
+                "2",
+                "--expected-source-hash",
+                &preview.source_hash,
+                "--source",
+            ])
+            .arg(path);
+        cli
+    };
+    let listener = agenticjira::control::bind(&app).unwrap();
+    let (shutdown, _) = tokio::sync::watch::channel(false);
+    let service = tokio::spawn(agenticjira::control::serve_bound(
+        app,
+        shutdown.clone(),
+        serde_json::json!({"instance_id": uuid::Uuid::new_v4().to_string()}),
+        listener,
+    ));
+    let replay_cli = |mut cli: Command| async move {
+        let output = tokio::task::spawn_blocking(move || cli.output().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+
+    std::fs::write(&source, "No longer valid task Markdown").unwrap();
+    let live_alias = import_fixture.root.join("another-live-alias.md");
+    std::os::unix::fs::symlink(&source, &live_alias).unwrap();
+    assert_eq!(
+        apply(
+            "legacy-import",
+            &import_project,
+            2,
+            &live_alias,
+            &preview.source_hash
+        )
+        .unwrap(),
+        imported,
+    );
+    let fresh_error =
+        apply("fresh", &import_project, 3, &source, &preview.source_hash).unwrap_err();
+    assert!(
+        fresh_error.to_string().contains("frontmatter"),
+        "{fresh_error:#}"
+    );
+    std::fs::rename(&source, import_fixture.root.join("moved.md")).unwrap();
+    assert_eq!(replay_cli(args(&alias)).await, imported);
+
+    let historical_hash = agenticjira::store::json_hash(&serde_json::json!({
+        "project_id":import_project,"expected_project_version":2,
+        "source":preview.source,"source_hash":preview.source_hash
+    }))
+    .unwrap();
+    import_fixture.execute(
+        "UPDATE operation_receipts SET request_hash=?1 WHERE operation_id='legacy-import'",
+        [&historical_hash],
+    );
+    assert_eq!(replay_cli(args(&preview.source)).await, imported);
+    for path in [&alias, &live_alias] {
+        let error = apply(
+            "legacy-import",
+            &import_project,
+            2,
+            path,
+            &preview.source_hash,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "legacy import operation ID was reused with different input or its original source path cannot be verified"
+        );
+    }
+    for (project, version, path, hash) in [
+        (
+            "other-project",
+            2,
+            &preview.source,
+            preview.source_hash.as_str(),
+        ),
+        (
+            import_project.as_str(),
+            3,
+            &preview.source,
+            preview.source_hash.as_str(),
+        ),
+        (
+            import_project.as_str(),
+            2,
+            &preview.source,
+            "different-hash",
+        ),
+    ] {
+        let error = apply("legacy-import", project, version, path, hash).unwrap_err();
+        assert!(
+            error.to_string().contains("reused with different input"),
+            "{error:#}"
+        );
+    }
+    shutdown.send_replace(true);
+    service.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&import_paths.socket_dir).unwrap();
+    import_fixture.assert_scalar("SELECT version FROM projects", 3_i64);
+    import_fixture.assert_scalar("SELECT COUNT(*) FROM tasks", 1_i64);
+    import_fixture.assert_scalar(
+        "SELECT COUNT(*) FROM operation_receipts WHERE operation_kind='legacy_import'",
+        2_i64,
+    );
+    import_fixture.assert_scalar(
+        "SELECT COUNT(*) FROM audit_events WHERE operation_id='legacy-import'",
+        1_i64,
+    );
     let import_audit: (String, String, i64, i64, String) = import_fixture
         .connection()
         .query_row(
@@ -21020,7 +21721,7 @@ fn scheduled_intake_bounds_missed_fires_and_deduplicates() {
     restore_schema_47_schedule_storage(&fixture);
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 50_i64);
+    fixture.assert_scalar("PRAGMA user_version", 51_i64);
     fixture.assert_scalar(
         "SELECT json_array(schedule_id,scheduled_for_utc,recipe_revision_id,outcome,task_id,
          reason,missed_first_utc,missed_last_utc,missed_count,created_at) FROM recipe_schedule_fires",
@@ -22503,9 +23204,37 @@ fn t05_unknown_claim_cannot_be_replaced_or_cleared_by_human_text() {
         },
     )
     .unwrap();
+    let rejection_state =
+        "SELECT json_array(c.state,c.payload_json,c.updated_at,a.status,a.updated_at,
+           t.attention,t.version,t.updated_at,r.state,r.result_json,r.updated_at)
+         FROM controls c JOIN attempts a ON a.id=c.attempt_id JOIN tasks t ON t.id=a.task_id
+         JOIN restart_candidates r ON r.attempt_id=a.id AND r.session_id='missing-session'
+         WHERE c.requested_operation_id='unsafe-restart-continue'";
+    let before_rejection: String = missing.scalar(rejection_state);
+    missing.execute_batch(
+        "CREATE TRIGGER abort_restart_rejection BEFORE UPDATE OF attention ON tasks
+         WHEN NEW.attention='restart_parked'
+         BEGIN SELECT RAISE(ABORT,'injected restart rejection failure'); END;
+         CREATE TRIGGER abort_restart_rejection_fallback BEFORE INSERT ON audit_events
+         WHEN NEW.event_code='control.dispositioned_after_failure'
+         BEGIN SELECT RAISE(ABORT,'injected fallback disposition failure'); END;",
+    );
+    // Disable the generic disposition so the failed rejection can be retried on the same control.
+    let error = missing_app.coordinator_tick().unwrap_err();
+    assert!(format!("{error:#}").contains("injected fallback disposition failure"));
+    missing.assert_scalar(rejection_state, before_rejection);
+    missing.execute_batch(
+        "DROP TRIGGER abort_restart_rejection; DROP TRIGGER abort_restart_rejection_fallback;",
+    );
     let rejected_continue = missing_app.coordinator_tick().unwrap();
     assert_eq!(rejected_continue["action"], "continue_rejected");
     assert_eq!(rejected_continue["restart_hold_retained"], true);
+    missing.assert_scalar(
+        "SELECT c.state||':'||json_extract(c.payload_json,'$.restart_hold_retained')||':'||r.state
+         FROM controls c JOIN restart_candidates r ON r.attempt_id=c.attempt_id
+         WHERE c.requested_operation_id='unsafe-restart-continue' AND r.session_id='missing-session'",
+        "rejected:1:skipped".to_owned(),
+    );
     assert_eq!(
         missing.connection().query_row(
             "SELECT a.status,t.attention FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id=?1",
@@ -26715,9 +27444,42 @@ fn t06_checkpoint_switch_fences_old_generation_and_preserves_later_request() {
         ),
         "paused".into(),
     );
+    fixture.execute(
+        "INSERT INTO guidance_messages(id,attempt_id,role_generation_id,body,state,created_at)
+         VALUES('switch-guidance',?1,'old','Carry this forward','queued','2026-01-01T00:00:00Z')",
+        params![plan.attempt_id],
+    );
+    let switch_state = "SELECT json_array(si.state,si.new_generation_id,rs.effective_generation_id,
+           gm.role_generation_id,(SELECT revision FROM state_revision))
+         FROM switch_intents si JOIN attempts a ON a.id=si.attempt_id
+         JOIN role_settings rs ON rs.task_id=a.task_id AND rs.role=si.role
+           AND rs.revision=si.requested_settings_revision
+         JOIN guidance_messages gm ON gm.attempt_id=a.id AND gm.id='switch-guidance'";
+    let before: String = fixture.scalar(switch_state);
+    fixture.execute_batch(
+        "CREATE TRIGGER abort_switch_guidance BEFORE UPDATE OF role_generation_id ON guidance_messages
+         WHEN NEW.id='switch-guidance'
+         BEGIN SELECT RAISE(ABORT,'injected switch dispatch failure'); END;",
+    );
+    let error = reopened
+        .mark_switch_dispatched(&intent, &captured.role_generation_id)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("injected switch dispatch failure"));
+    fixture.assert_scalar(switch_state, before);
+    fixture.execute_batch("DROP TRIGGER abort_switch_guidance;");
     reopened
         .mark_switch_dispatched(&intent, &captured.role_generation_id)
         .unwrap();
+    let state: serde_json::Value =
+        serde_json::from_str(&fixture.scalar::<String>(switch_state)).unwrap();
+    assert_eq!(state[0], "dispatched");
+    for index in [1, 2, 3] {
+        assert_eq!(
+            state[index].as_str(),
+            Some(captured.role_generation_id.as_str())
+        );
+    }
+    fixture.execute_batch("DELETE FROM guidance_messages WHERE id='switch-guidance';");
     assert!(reopened
         .release_unconsumed_launch_permits(
             Some(&captured.permit_id),
@@ -50031,7 +50793,7 @@ const STATE_PROJECTED_TABLES: [&str; 99] = [
     "workspaces",
 ];
 
-const STATE_UNPROJECTED_TABLES: [&str; 11] = [
+const STATE_UNPROJECTED_TABLES: [&str; 12] = [
     "check_processes",
     "cmux_attachment_routes",
     "cmux_task_workspaces",
@@ -50041,6 +50803,9 @@ const STATE_UNPROJECTED_TABLES: [&str; 11] = [
     "operation_receipts",
     "reviews",
     "trip_apply_journal",
+    // Derived dispatch decisions share the revision bumps from request creation
+    // and the session and generation inserts in launch reservation.
+    "trip_integration_dispatch",
     "trip_legacy_migrations",
     "trip_setup_reads",
 ];
@@ -50331,9 +51096,10 @@ fn state_revision_triggers_cover_exactly_the_projection_tables() {
         }
 
         let before = committed_state_revision(&connection);
-        connection
+        let deleted = connection
             .execute(&format!("DELETE FROM {table} WHERE rowid=?1"), [rowid])
             .unwrap();
+        assert_eq!(deleted, 1, "{table}");
         assert_step(before, delete_advances, "delete");
     }
 
@@ -50533,7 +51299,7 @@ fn state_revision_migration_registers_schema_29_and_readonly_open_refuses_schema
         .contains("unsupported database schema version 28"));
 
     let migrated = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 50_i64);
+    fixture.assert_scalar("PRAGMA user_version", 51_i64);
     let migrated_triggers = connection
         .prepare(
             "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'state_revision_%' ORDER BY name",
@@ -50575,7 +51341,7 @@ fn recipe_migration_upgrades_genuine_schema_29_and_readonly_refuses_it() {
         .unwrap();
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 50_i64);
+    fixture.assert_scalar("PRAGMA user_version", 51_i64);
     assert_eq!(workflow::state(&upgraded).unwrap().schema, 8);
     fixture.assert_scalar::<i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='recipe_schedule_fires'",
@@ -55490,6 +56256,76 @@ fn startup_freeze_abandonment_rolls_back_with_its_audit_and_retries_once() {
 }
 
 #[test]
+fn launch_failure_settlement_is_atomic_for_both_session_owners() {
+    let fixture = Fixture::new("launch-failure-settlement");
+    seed_attempt(&fixture, "planning");
+    seed_session(&fixture, "a", "manager", "g", "s", "launch_reserved");
+    fixture.execute_batch(
+        "UPDATE role_generations SET status='launch_reserved' WHERE id='g';
+         UPDATE sessions SET launch_state='reserved' WHERE id='s';
+         INSERT INTO resume_invocations(id,session_id,resume_ordinal,transcript_epoch,
+           launch_config_json,capability_key,capability_identity_json,state,created_at,updated_at)
+         VALUES('resume','s',1,'e','{}','key','{}','reserved','2026-01-01','2026-01-01');
+         INSERT INTO provider_validation_batches(id,operation_id,request_hash,preview_hash,selection_json,
+           max_fresh_calls,native_calls_authorized,state,created_at,updated_at)
+         VALUES('batch','batch-op','request','preview','[]',1,1,'running','2026-01-01','2026-01-01');
+         INSERT INTO provider_validation_invocations(id,batch_id,ordinal,provider,model,effort,evidence_key,
+           state,created_at,updated_at)
+         VALUES('validation','batch',0,'codex','model','low','key','cancel_requested','2026-01-01','2026-01-01');
+         INSERT INTO sessions(id,provider_validation_invocation_id,provider,status,launch_config_json,
+           executable_version,transcript_epoch,launch_state,created_at,updated_at)
+         VALUES('validation-session','validation','codex','launch_reserved','{}',
+                'fixture','validation-epoch','reserved','2026-01-01','2026-01-01');
+         CREATE TRIGGER abort_role_launch_failure BEFORE UPDATE OF status ON role_generations
+         WHEN NEW.id='g' AND NEW.status='launch_failed'
+         BEGIN SELECT RAISE(ABORT,'injected launch failure settlement'); END;
+         CREATE TRIGGER abort_validation_launch_failure BEFORE UPDATE OF state ON provider_validation_invocations
+         WHEN NEW.id='validation' AND NEW.state='cancelled'
+         BEGIN SELECT RAISE(ABORT,'injected launch failure settlement'); END;",
+    );
+    let role_state =
+        "SELECT json_array(s.status,s.launch_state,s.launch_error,g.status,r.state,r.error)
+         FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+         JOIN resume_invocations r ON r.session_id=s.id WHERE s.id='s'";
+    let validation_state = "SELECT json_array(s.status,s.launch_state,s.launch_error,v.state,v.failure_reason,
+           v.finished_at IS NOT NULL)
+         FROM sessions s JOIN provider_validation_invocations v ON v.id=s.provider_validation_invocation_id
+         WHERE s.id='validation-session'";
+    let before_role: String = fixture.scalar(role_state);
+    let before_validation: String = fixture.scalar(validation_state);
+    let revision: i64 = fixture.scalar("SELECT revision FROM state_revision");
+    for session in ["s", "validation-session"] {
+        let error = fixture
+            .store
+            .update_session_launch_failed(session, "provider refused")
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("injected launch failure settlement"));
+    }
+    fixture.assert_scalar(role_state, before_role);
+    fixture.assert_scalar(validation_state, before_validation);
+    fixture.assert_scalar("SELECT revision FROM state_revision", revision);
+
+    fixture.execute_batch(
+        "DROP TRIGGER abort_role_launch_failure; DROP TRIGGER abort_validation_launch_failure;",
+    );
+    let reopened = Store::open(&fixture.database).unwrap();
+    for session in ["s", "validation-session"] {
+        reopened
+            .update_session_launch_failed(session, "provider refused")
+            .unwrap();
+    }
+    fixture.assert_scalar(
+        role_state,
+        r#"["launch_failed","failed","provider refused","launch_failed","proven_nondelivery","provider refused"]"#.to_owned(),
+    );
+    fixture.assert_scalar(
+        validation_state,
+        r#"["launch_failed","failed","provider refused","cancelled","provider refused",1]"#
+            .to_owned(),
+    );
+}
+
+#[test]
 fn startup_reserved_resume_restoration_rolls_back_and_retries_exact_prior_epoch() {
     let fixture = Fixture::new("startup-prior-epoch-restoration");
     let repository_path = fixture.repository("repo");
@@ -59159,7 +59995,7 @@ fn final_repair_recheck_reviewer_exit_without_result_closes_through_the_coordina
 #[test]
 fn final_repair_recheck_migration_keeps_the_historical_sixth_ordinary_review() {
     let fixture = final_repair_recheck_fixture("final-repair-recheck-migration");
-    fixture.assert_scalar("PRAGMA user_version", 50_i64);
+    fixture.assert_scalar("PRAGMA user_version", 51_i64);
     let ledger = fixture.scalar::<String>(FINAL_REPAIR_LEDGER);
     restore_schema_47_schedule_storage(&fixture);
     fixture.execute_batch(&format!(
@@ -59168,7 +60004,7 @@ fn final_repair_recheck_migration_keeps_the_historical_sixth_ordinary_review() {
     restore_schema_30_recipe_tables(&fixture);
     assert!(Store::open_current_readonly(&fixture.database).is_err());
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 50_i64);
+    fixture.assert_scalar("PRAGMA user_version", 51_i64);
     fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM final_repair_rechecks", 0);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(FINAL_REPAIR_CODE_BUDGET, "6:6".into());
@@ -59961,7 +60797,10 @@ fn restore_schema_47_schedule_storage(fixture: &Fixture) {
             .unwrap();
     }
     connection
-        .execute_batch("DROP TABLE recipe_schedule_stop_targets;")
+        .execute_batch(
+            "DROP TABLE trip_integration_dispatch;
+             DROP TABLE recipe_schedule_stop_targets;",
+        )
         .unwrap();
     for table in ["sessions", "resume_invocations"] {
         connection
@@ -60284,7 +61123,7 @@ fn normal_final_repair_migration_keeps_every_receipt_and_rolls_back_whole() {
     fixture.assert_scalar("PRAGMA user_version", 31_i64);
 
     let upgraded = Store::open(&fixture.database).unwrap();
-    fixture.assert_scalar("PRAGMA user_version", 50_i64);
+    fixture.assert_scalar("PRAGMA user_version", 51_i64);
     assert_eq!(fixture.scalar::<String>(SCHEMA_31_RECEIPT_ROWS), rows);
     assert_eq!(fixture.scalar::<String>(FINAL_REPAIR_LEDGER), ledger);
     fixture.assert_scalar::<String>(
@@ -65028,11 +65867,15 @@ fn prepare_single_agent_does_not_refresh_a_stale_admission() {
 
 #[test]
 fn prepare_task_survives_manager_capacity_wait_without_another_command() {
+    use agenticjira::domain::{HistorySearchQuery, HistorySourceKind};
+
     let fixture = Fixture::new("prepare-capacity-wait");
     let active_project = add_project(&fixture, fixture.repository("active"), "active");
     let paused_project = add_project(&fixture, fixture.repository("paused"), "paused");
     let active_task = create_task(&fixture, &active_project, "active-task", 10);
     let waiting_task = create_task(&fixture, &paused_project, "waiting-task", 1);
+    let queued_project = add_project(&fixture, fixture.repository("queued"), "queued");
+    let queued_task = create_task(&fixture, &queued_project, "queued-task", 0);
     fixture.execute(
         "UPDATE projects SET queue_paused=1 WHERE id=?1",
         params![paused_project],
@@ -65062,16 +65905,54 @@ fn prepare_task_survives_manager_capacity_wait_without_another_command() {
         },
     )
     .unwrap();
+    fixture.execute(
+        "WITH RECURSIVE rows(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM rows WHERE n<41)
+         INSERT INTO tasks(id,project_id,title,lifecycle,created_at,updated_at)
+         SELECT printf('capacity-history-%02d',n),?1,'Capacity history','backlog',
+                '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z' FROM rows",
+        params![queued_project],
+    );
+    let search = |query| workflow::history_search(&fixture.store, query, "capacity-history");
+    let history = HistorySearchQuery {
+        query: "Capacity history".into(),
+        kind: Some(HistorySourceKind::Task),
+        ..HistorySearchQuery::default()
+    };
+    let mut page_two = history.clone();
+    page_two.cursor = Some(search(history.clone()).unwrap().next_cursor.unwrap());
+
     assert!(scheduler.claim_next().unwrap().is_none());
+    assert!(search(page_two.clone())
+        .unwrap_err()
+        .to_string()
+        .contains("Results changed"));
+    let assert_attention = || {
+        fixture.assert_scalar(
+            &format!("SELECT attention FROM tasks WHERE id='{waiting_task}'"),
+            "run_next_requested".to_owned(),
+        );
+        fixture.assert_scalar(
+            &format!("SELECT attention FROM tasks WHERE id='{queued_task}'"),
+            "queued_capacity".to_owned(),
+        );
+    };
+    assert_attention();
+    let first = search(history).unwrap();
+    assert_eq!(first.results.len(), 40);
+    page_two.cursor = Some(first.next_cursor.unwrap());
+    let revision: i64 = fixture.scalar("SELECT revision FROM state_revision");
+    assert!(scheduler.claim_next().unwrap().is_none());
+    fixture.assert_scalar("SELECT revision FROM state_revision", revision);
+    assert_attention();
+    let second = search(page_two.clone()).unwrap();
+    assert_eq!(second.results.len(), 1);
+    assert_eq!(second.results[0].source.id, "capacity-history-41");
+    assert!(second.next_cursor.is_none());
     let state = workflow::state(&fixture.store).unwrap();
     assert!(state.decisions.iter().any(|decision| {
         decision.subject.task_id.as_deref() == Some(waiting_task.as_str())
             && decision.reason_code == "scheduler.manager_capacity_full"
     }));
-    fixture.assert_scalar(
-        &format!("SELECT attention FROM tasks WHERE id='{waiting_task}'"),
-        "run_next_requested".to_owned(),
-    );
     fixture.execute(
         "UPDATE sessions SET status='exited',exit_json='{\"process_group_quiescent\":true}'
          WHERE id='occupied-manager-session'",
@@ -65080,6 +65961,10 @@ fn prepare_task_survives_manager_capacity_wait_without_another_command() {
     let prepared = scheduler.claim_next().unwrap().unwrap();
     assert_eq!(prepared.task_id, waiting_task);
     assert_eq!(prepared.state, "ready_held");
+    assert!(search(page_two)
+        .unwrap_err()
+        .to_string()
+        .contains("Results changed"));
     fixture.assert_scalar(
         &format!("SELECT queue_paused FROM projects WHERE id='{paused_project}'"),
         1_i64,
@@ -65727,7 +66612,20 @@ fn trip_command_database_failures_roll_back_and_replay_exactly() {
         review_kind: "plan".into(),
         additional: 1,
     };
-    let before: String = fixture.scalar("SELECT json_array(t.version,b.extension_allowance,b.version) FROM tasks t JOIN attempts a ON a.task_id=t.id JOIN review_budgets b ON b.attempt_id=a.id WHERE b.review_kind='plan'");
+    let budget_state = || -> (i64, i64, i64) {
+        fixture
+            .connection()
+            .query_row(
+                "SELECT t.version,b.extension_allowance,b.version
+                 FROM tasks t JOIN attempts a ON a.task_id=t.id
+                 JOIN review_budgets b ON b.attempt_id=a.id
+                 WHERE a.id=?1 AND b.review_kind='plan'",
+                params![plan.attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    };
+    let before = budget_state();
     for (table, predicate) in [
         ("audit_events", "NEW.event_code='trip.command.applied'"),
         ("operation_receipts", "NEW.operation_kind='trip_command'"),
@@ -65736,7 +66634,7 @@ fn trip_command_database_failures_roll_back_and_replay_exactly() {
         let error = execute_trip(&fixture, &paths, "atomic-budget", &action).unwrap_err();
         assert!(format!("{error:#}").contains("injected command persistence failure"));
         assert!(!error.to_string().contains("durable progress"));
-        assert_eq!(fixture.scalar::<String>("SELECT json_array(t.version,b.extension_allowance,b.version) FROM tasks t JOIN attempts a ON a.task_id=t.id JOIN review_budgets b ON b.attempt_id=a.id WHERE b.review_kind='plan'"), before);
+        assert_eq!(budget_state(), before);
         fixture.assert_scalar(
             "SELECT COUNT(*) FROM audit_events WHERE operation_id='atomic-budget'",
             0_i64,
@@ -65750,24 +66648,28 @@ fn trip_command_database_failures_roll_back_and_replay_exactly() {
     let saved = execute_trip(&fixture, &paths, "atomic-budget", &action).unwrap();
     assert_eq!(saved.version, Some(3));
     assert_eq!(saved.detail["total_allowance"], 3);
+    let applied = (before.0 + 1, before.1 + 1, before.2 + 1);
+    assert_eq!(budget_state(), applied);
     let replay = execute_trip(&fixture, &paths, "atomic-budget", &action).unwrap();
     assert_eq!(
         serde_json::to_value(replay).unwrap(),
         serde_json::to_value(&saved).unwrap()
     );
+    assert_eq!(budget_state(), applied);
     let conflicting = TripHumanAction::ExtendReviewBudget {
         task_id: task,
-        attempt_id: plan.attempt_id,
+        attempt_id: plan.attempt_id.clone(),
         expected_task_version: 2,
         review_kind: "plan".into(),
         additional: 2,
     };
-    assert!(
+    assert_eq!(
         execute_trip(&fixture, &paths, "atomic-budget", &conflicting)
             .unwrap_err()
-            .to_string()
-            .contains("operation ID was already used with different input")
+            .to_string(),
+        "operation_id was already used for another request"
     );
+    assert_eq!(budget_state(), applied);
     fixture.assert_scalar("SELECT COUNT(*) FROM audit_events WHERE operation_id='atomic-budget' AND event_code='trip.command.applied'", 1_i64);
     fixture.assert_scalar(
         "SELECT COUNT(*) FROM operation_receipts WHERE operation_id='atomic-budget'",
@@ -65857,20 +66759,53 @@ fn trip_command_setup_readiness_waits_for_receipt_and_recovers_exact_reservation
         1_i64,
     );
     record_synthetic_setup_observation(&fixture, &setup, RoleKind::Manager);
-    let draft = execute_trip(
-        &fixture,
-        &paths,
-        "setup-draft",
-        &TripHumanAction::SaveSetupDraft {
-            setup_operation_id: setup.clone(),
-            expected_project_version: 1,
-            proposal: setup_proposal(&manager),
-        },
-    )
-    .unwrap();
+    let save_draft = |id, proposal| {
+        execute_trip(
+            &fixture,
+            &paths,
+            id,
+            &TripHumanAction::SaveSetupDraft {
+                setup_operation_id: setup.clone(),
+                expected_project_version: 1,
+                proposal,
+            },
+        )
+        .unwrap()
+    };
+    let proposal_a = setup_proposal(&manager);
+    let draft_a = save_draft("setup-draft-a", proposal_a.clone());
+    let probes_a = TripHumanAction::AuthorizeSetupProbes {
+        setup_operation_id: setup.clone(),
+        proposal_hash: draft_a.detail["proposal_hash"].as_str().unwrap().into(),
+    };
+    let mut proposal_b = proposal_a.clone();
+    proposal_b["project_name"] = serde_json::json!("Replacement setup proposal");
+    let draft_b = save_draft("setup-draft-b", proposal_b.clone());
+    let refused = execute_trip(&fixture, &paths, "setup-probes-a", &probes_a)
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("its proposal was replaced"));
+    assert_eq!(
+        save_draft("setup-draft-a-restored", proposal_a).detail["proposal_hash"],
+        draft_a.detail["proposal_hash"]
+    );
+    assert_eq!(
+        execute_trip(&fixture, &paths, "setup-probes-a", &probes_a)
+            .unwrap_err()
+            .to_string(),
+        refused
+    );
+    fixture.assert_scalar(
+        &format!("SELECT COUNT(*) FROM trip_setup_permits WHERE setup_operation_id='{setup}' AND purpose='profile_probe'"),
+        0_i64,
+    );
+    assert_eq!(
+        save_draft("setup-draft-b-restored", proposal_b).detail["proposal_hash"],
+        draft_b.detail["proposal_hash"]
+    );
     let probes = TripHumanAction::AuthorizeSetupProbes {
         setup_operation_id: setup.clone(),
-        proposal_hash: draft.detail["proposal_hash"].as_str().unwrap().into(),
+        proposal_hash: draft_b.detail["proposal_hash"].as_str().unwrap().into(),
     };
     fixture.execute_batch("CREATE TRIGGER setup_receipt_fault BEFORE INSERT ON operation_receipts WHEN NEW.operation_id='setup-probes' AND NEW.operation_kind='trip_command' BEGIN SELECT RAISE(ABORT,'setup terminal receipt failure'); END;");
     assert!(execute_trip(&fixture, &paths, "setup-probes", &probes)
@@ -65880,6 +66815,10 @@ fn trip_command_setup_readiness_waits_for_receipt_and_recovers_exact_reservation
     let probe_attempt: String = fixture.scalar(&format!(
         "SELECT probe_attempt_id FROM trip_setup_operations WHERE id='{setup}'"
     ));
+    assert!(execute_trip(&fixture, &paths, "setup-probes", &probes_a)
+        .unwrap_err()
+        .to_string()
+        .contains("outcome could not be confirmed"));
     fixture.assert_scalar(
         &format!("SELECT state FROM workspaces WHERE attempt_id='{probe_attempt}'"),
         "reserved".to_owned(),
@@ -65897,6 +66836,20 @@ fn trip_command_setup_readiness_waits_for_receipt_and_recovers_exact_reservation
         serde_json::to_value(execute_trip(&fixture, &paths, "setup-probes", &probes).unwrap())
             .unwrap(),
         serde_json::to_value(recovered).unwrap()
+    );
+    assert_eq!(
+        execute_trip(&fixture, &paths, "setup-probes-a", &probes_a)
+            .unwrap_err()
+            .to_string(),
+        refused
+    );
+    fixture.assert_scalar(
+        &format!("SELECT COUNT(DISTINCT attempt_id) FROM trip_setup_permits WHERE setup_operation_id='{setup}' AND purpose='profile_probe'"),
+        1_i64,
+    );
+    fixture.assert_scalar(
+        &format!("SELECT COUNT(*) FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id WHERE g.attempt_id='{probe_attempt}'"),
+        0_i64,
     );
 }
 

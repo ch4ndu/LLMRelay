@@ -1457,7 +1457,18 @@ fn capture_inventory(connection: &Connection) -> Result<serde_json::Value> {
     )?;
     let checks = collect_json_rows(
         connection,
-        "SELECT json_object('kind','check','id',id,'status',status,'recovery_root_pid',recovery_root_pid,'recovery_process_group_id',recovery_process_group_id,'recovery_anchor',recovery_anchor_json,'launch_boot_identity',launch_boot_identity,'cwd',cwd) FROM check_runs WHERE status IN ('launch_reserved','running','recovery_required','launch_ambiguous')",
+        "SELECT json_object('kind','check','id',c.id,'status',c.status,
+            'recovery_root_pid',c.recovery_root_pid,'recovery_process_group_id',c.recovery_process_group_id,
+            'recovery_anchor',c.recovery_anchor_json,'launch_boot_identity',c.launch_boot_identity,'cwd',c.cwd,
+            'recorded_processes',json((SELECT json_group_array(json_array(pid,native_start_marker,process_group_id))
+                FROM check_processes WHERE check_id=c.id)),
+            'capture_evidence',CASE WHEN json_valid(c.evidence_json) THEN json_object(
+                'capture_incomplete',c.evidence_json -> '$.capture_incomplete',
+                'capture_settlement',c.evidence_json -> '$.capture_settlement') END,
+            'recovery_capture_incomplete', EXISTS(SELECT 1 FROM recovery_records r WHERE r.state='attention_required'
+                AND json_extract(r.detail_json,'$.check_id')=c.id
+                AND json_extract(r.detail_json,'$.evidence.capture_incomplete')=1))
+         FROM check_runs c WHERE c.status IN ('launch_reserved','running','recovery_required','launch_ambiguous')",
     )?;
     let claims = collect_json_rows(
         connection,
@@ -1540,30 +1551,65 @@ fn verify_displaced_inventory(
                 .map(serde_json::from_str::<crate::domain::ProcessGenerationAnchor>)
                 .transpose()
                 .with_context(|| format!("parse displaced {kind} generation anchor {id}"))?;
-            let recorded = process
-                .as_ref()
-                .map(|process| {
-                    vec![(
-                        process.pid,
-                        process.native_start_marker.clone(),
-                        process.process_group_id,
-                    )]
-                })
-                .unwrap_or_default();
+            let check_processes = entry
+                .get("recorded_processes")
+                .filter(|_| category == "checks")
+                .map(Vec::<(u32, String, i32)>::deserialize)
+                .transpose()
+                .with_context(|| format!("parse displaced check process identities {id}"))?;
+            let check_processes_missing = category == "checks" && check_processes.is_none();
+            let recorded = check_processes.unwrap_or_else(|| {
+                process
+                    .as_ref()
+                    .map(|process| {
+                        vec![(
+                            process.pid,
+                            process.native_start_marker.clone(),
+                            process.process_group_id,
+                        )]
+                    })
+                    .unwrap_or_default()
+            });
             let group = entry["recovery_process_group_id"]
                 .as_i64()
                 .and_then(|value| i32::try_from(value).ok())
                 .or_else(|| process.as_ref().map(|value| value.process_group_id));
+            let launch_boot = entry["launch_boot_identity"].as_str();
             let verification = crate::recovery::verify_generation_absent_evidence(
                 kind,
                 id,
                 &recorded,
                 group,
                 anchor.as_ref(),
-                entry["launch_boot_identity"].as_str(),
+                launch_boot,
                 &current_boot,
                 &inventory,
-            );
+            )
+            .and_then(|generation| {
+                if category == "checks" && generation["source"] != "operating_system_boot_changed" {
+                    if check_processes_missing {
+                        bail!("the historical restore inventory has no recorded check process list; same-boot absence is unknown")
+                    }
+                    let capture_evidence = entry
+                        .get("capture_evidence")
+                        .filter(|value| value.is_object())
+                        .context("displaced check capture evidence is missing or malformed")?;
+                    let recovery_capture_incomplete =
+                        match entry["recovery_capture_incomplete"].as_i64() {
+                            Some(0) => false,
+                            Some(1) => true,
+                            _ => bail!("displaced check recovery capture marker is missing or malformed"),
+                        };
+                    crate::recovery::verify_capture_settlement(
+                        id,
+                        launch_boot,
+                        capture_evidence,
+                        recovery_capture_incomplete,
+                        &generation,
+                    )?;
+                }
+                Ok(())
+            });
             if let Err(error) = verification {
                 if !recorded_boot.is_some_and(|boot| {
                     crate::supervisor::boot_identity_proves_reboot(boot, &current_boot)

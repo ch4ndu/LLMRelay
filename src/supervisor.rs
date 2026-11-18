@@ -14,6 +14,7 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::fs::MetadataExt;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 const SERVICE_STOP_SETTLING_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -123,7 +124,15 @@ struct SessionHandle {
     first_stop_requested_at: Mutex<Option<std::time::Instant>>,
     codex_helper_image: Option<Mutex<Option<ExecutableFingerprint>>>,
     codex_helper_identity: Mutex<Option<NativeHelperIdentity>>,
+    reader_pending: Arc<AtomicBool>,
     _master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+}
+
+impl SessionHandle {
+    fn conversation_reader_pending(&self) -> bool {
+        matches!(&self.owner, SessionOwner::Conversation(_))
+            && self.reader_pending.load(Ordering::Acquire)
+    }
 }
 
 fn write_conversation_frame(handle: &SessionHandle, value: &serde_json::Value) -> Result<()> {
@@ -910,6 +919,7 @@ impl Supervisor {
                 .map_err(|_| anyhow!("Supervisor session map unavailable"))?;
             Ok((leader, provider, process, input, stdout, stderr, sessions))
         })();
+        let reader_pending = Arc::new(AtomicBool::new(false));
         let make_handle = |child: std::process::Child,
                            leader: ProcessGenerationAnchor,
                            process: ProcessIdentity,
@@ -928,6 +938,7 @@ impl Supervisor {
                 first_stop_requested_at: Mutex::new(None),
                 codex_helper_image: None,
                 codex_helper_identity: Mutex::new(None),
+                reader_pending: Arc::clone(&reader_pending),
                 _master: Mutex::new(None),
             })
         };
@@ -938,6 +949,7 @@ impl Supervisor {
                     (provider.pid, provider.native_start_marker.clone()),
                 ]);
                 let handle = make_handle(child, leader, process, Box::new(input), known);
+                reader_pending.store(true, Ordering::Release);
                 sessions.insert(session.into(), handle);
                 (stdout, stderr)
             }
@@ -1030,6 +1042,7 @@ impl Supervisor {
                 conversation,
                 "Conversation diagnostics could not be drained.",
             );
+            reader_pending.store(false, Ordering::Release);
             let _ = self.force_stop_exact_managed_process(session);
             let _ = self.reconcile();
             bail!("Conversation diagnostic reader could not start")
@@ -1037,10 +1050,11 @@ impl Supervisor {
         let tracked_session = session.to_owned();
         let tracked_generation = generation.to_owned();
         let tracked_operation = operation.to_owned();
+        let reader_completion = Arc::clone(&reader_pending);
         let start = std::thread::Builder::new()
             .name(format!("conversation-stdout-{session}"))
             .spawn(move || {
-                let outcome = supervisor.read_conversation(
+                supervisor.run_conversation_reader(
                     stdout,
                     &tracked_session,
                     &conversation_id,
@@ -1049,19 +1063,13 @@ impl Supervisor {
                     &prepared,
                     resume_thread.as_deref(),
                 );
-                if outcome.is_err() {
-                    let _ = supervisor.store.conversation_hold_generation(
-                        &conversation_id,
-                        &tracked_generation,
-                        "The native conversation outcome is unknown. Refresh and inspect it; the request will not be replayed.",
-                    );
-                    let _ = supervisor.interrupt_once(&tracked_session);
-                }
+                reader_completion.store(false, Ordering::Release);
             });
         if start.is_err() {
             let _ = self
                 .store
                 .conversation_hold(conversation, "Conversation output reader could not start.");
+            reader_pending.store(false, Ordering::Release);
             let _ = self.force_stop_exact_managed_process(session);
             let _ = self.reconcile();
             bail!("Conversation output reader could not start")
@@ -1338,6 +1346,37 @@ impl Supervisor {
             .collect())
     }
 
+    fn run_conversation_reader(
+        &self,
+        stdout: std::process::ChildStdout,
+        session: &str,
+        conversation: &str,
+        generation: &str,
+        operation: &str,
+        prepared: &crate::providers::codex_app_server::PreparedConversation,
+        resume_thread: Option<&str>,
+    ) {
+        if self
+            .read_conversation(
+                stdout,
+                session,
+                conversation,
+                generation,
+                operation,
+                prepared,
+                resume_thread,
+            )
+            .is_err()
+        {
+            let _ = self.store.conversation_hold_generation(
+                conversation,
+                generation,
+                "The native conversation outcome is unknown. Refresh and inspect it; the request will not be replayed.",
+            );
+            let _ = self.interrupt_once(session);
+        }
+    }
+
     fn read_conversation(
         &self,
         mut stdout: std::process::ChildStdout,
@@ -1368,8 +1407,9 @@ impl Supervisor {
         let mut initialized = false;
         let mut bound = false;
         let mut validated_history = Vec::new();
-        let mut awaiting_ack: Vec<(String, Option<String>, &'static str, serde_json::Value)> =
-            Vec::new();
+        type PendingEvent = (String, Option<String>, &'static str, serde_json::Value);
+        let mut awaiting_ack: HashMap<String, Vec<PendingEvent>> = HashMap::new();
+        let mut buffered_count = 0;
         loop {
             if std::time::Instant::now() >= deadline {
                 bail!("Conversation runtime limit reached")
@@ -1388,8 +1428,13 @@ impl Supervisor {
             }
             match stdout.read(&mut buffer) {
                 Ok(0) => {
-                    self.store
-                        .conversation_transport_closed(conversation, generation)?;
+                    if pending.is_empty() {
+                        self.store
+                            .conversation_transport_closed(conversation, generation)?;
+                    } else {
+                        self.store
+                            .conversation_transport_truncated(conversation, generation)?;
+                    }
                     let _ = self.interrupt_once(session);
                     return Ok(());
                 }
@@ -1496,15 +1541,18 @@ impl Supervisor {
                             &result,
                             failed,
                         )?;
-                        for (thread, turn, kind, payload) in awaiting_ack.drain(..) {
-                            self.store.conversation_event(
-                                conversation,
-                                generation,
-                                &thread,
-                                turn.as_deref(),
-                                kind,
-                                &payload,
-                            )?;
+                        if let Some(events) = awaiting_ack.remove(&id) {
+                            buffered_count -= events.len();
+                            for (thread, turn, kind, payload) in events {
+                                self.store.conversation_event(
+                                    conversation,
+                                    generation,
+                                    &thread,
+                                    turn.as_deref(),
+                                    kind,
+                                    &payload,
+                                )?;
+                            }
                         }
                     }
                     Projection::Response { .. } => bail!("Unexpected native response rejected"),
@@ -1524,16 +1572,20 @@ impl Supervisor {
                         )? {
                             continue;
                         }
-                        if self.store.conversation_event_waits_for_ack(
+                        if let Some(operation) = self.store.conversation_pending_turn_send(
                             conversation,
                             generation,
                             &thread,
                             turn.as_deref(),
                         )? {
-                            if awaiting_ack.len() >= 32 {
+                            if buffered_count >= 32 {
                                 bail!("Native pre-acknowledgement event limit exceeded")
                             }
-                            awaiting_ack.push((thread, turn, kind, payload));
+                            awaiting_ack
+                                .entry(operation)
+                                .or_default()
+                                .push((thread, turn, kind, payload));
+                            buffered_count += 1;
                         } else {
                             self.store.conversation_event(
                                 conversation,
@@ -1569,7 +1621,12 @@ impl Supervisor {
                 bail!("Native conversation frame exceeds its limit")
             }
             if bound && self.store.conversation_ready_to_stop(conversation)? {
-                self.interrupt_once(session)?;
+                if let Err(error) = self.interrupt_once(session) {
+                    // An exited provider may still have complete frames in the pipe.
+                    if self.verify_process(&handle).is_ok() {
+                        return Err(error);
+                    }
+                }
             }
         }
     }
@@ -2101,6 +2158,7 @@ impl Supervisor {
             first_stop_requested_at: Mutex::new(None),
             codex_helper_image,
             codex_helper_identity: Mutex::new(None),
+            reader_pending: Arc::new(AtomicBool::new(true)),
             _master: Mutex::new(Some(pair.master)),
         });
         match self.sessions.write() {
@@ -2146,6 +2204,7 @@ impl Supervisor {
         let tracked_epoch = transcript_epoch.to_owned();
         let tracked_process = process_json.clone();
         let transcript_root = self.transcripts_root.clone();
+        let capture_handle = Arc::clone(&handle);
         startup_capture.drain_available();
         if let Err(error) = std::thread::Builder::new().name(format!("pty-{session_id}")).spawn(move || {
             let mut buffer = vec![0_u8; 16 * 1024];
@@ -2180,6 +2239,12 @@ impl Supervisor {
                     }
                 }
             }
+            drop(reader);
+            drop(transcript);
+            let Ok(_boundary) = capture_handle.io_boundary.lock() else {
+                tracing::error!(session_id = %tracked_session, "PTY capture boundary unavailable");
+                return;
+            };
             if capture_complete && !sink_failed {
                 let output_tail = crate::transcript::recent_output_summary(
                     &transcript_root,
@@ -2200,6 +2265,7 @@ impl Supervisor {
                     Err(error) => tracing::error!(session_id = %tracked_session, error = %error, "capture completion persistence failed"),
                 }
             }
+            capture_handle.reader_pending.store(false, Ordering::Release);
         }) {
             if let Ok(mut sessions) = self.sessions.write() {
                 sessions.remove(session_id);
@@ -2408,6 +2474,20 @@ impl Supervisor {
         }
     }
 
+    pub(crate) fn require_conversation_reader_settled(&self, conversation: &str) -> Result<()> {
+        let sessions = self
+            .sessions
+            .read()
+            .map_err(|_| anyhow!("Supervisor session map unavailable"))?;
+        if sessions.values().any(|handle| {
+            matches!(&handle.owner, SessionOwner::Conversation(id) if id == conversation)
+                && handle.conversation_reader_pending()
+        }) {
+            bail!("This conversation is still processing its final output. Refresh and try again after it settles.")
+        }
+        Ok(())
+    }
+
     /// Persists the same exits and ambiguity as `reconcile`. With nothing
     /// attached it reads the table once, since no attached read proved it readable.
     pub(crate) fn reconcile_inventory(&self) -> Result<ProcessInventory> {
@@ -2526,12 +2606,17 @@ impl Supervisor {
                 .lock()
                 .map_err(|_| anyhow!("provider child lock poisoned"))?
                 .try_wait()?;
+            let conversation = matches!(&handle.owner, SessionOwner::Conversation(_));
             let inventory = match self.process_inventory() {
                 Ok(inventory) => inventory,
                 Err(error) => {
                     let Some(status) = child_exit.as_ref() else {
                         return Ok(AttachedReconciliation::LiveRootUnverified(error));
                     };
+                    if handle.conversation_reader_pending() {
+                        unavailable = Some(error);
+                        continue;
+                    }
                     if !service_stop_is_settling(
                         *handle
                             .first_stop_requested_at
@@ -2554,6 +2639,10 @@ impl Supervisor {
             };
             self.observe_members(&handle, &inventory)?;
             if let Some(status) = child_exit {
+                // The last stdout frame can settle a request even after the wrapper exits.
+                if handle.conversation_reader_pending() {
+                    continue;
+                }
                 let remaining = self.remaining_members(&handle, &inventory)?;
                 if remaining.is_empty() {
                     let _boundary = handle
@@ -2585,11 +2674,20 @@ impl Supervisor {
                         })
                         .to_string(),
                     )?;
-                    if recorded && matches!(&handle.owner, SessionOwner::Conversation(_)) {
-                        self.sessions
+                    if (recorded && conversation)
+                        || (!handle.reader_pending.load(Ordering::Acquire)
+                            && self.session_capture_settled(&handle, &process_json)?)
+                    {
+                        let mut sessions = self
+                            .sessions
                             .write()
-                            .map_err(|_| anyhow!("Supervisor session map unavailable"))?
-                            .remove(&handle.session_id);
+                            .map_err(|_| anyhow!("Supervisor session map unavailable"))?;
+                        if sessions
+                            .get(&handle.session_id)
+                            .is_some_and(|current| Arc::ptr_eq(current, &handle))
+                        {
+                            sessions.remove(&handle.session_id);
+                        }
                     }
                 } else if service_stop_is_settling(
                     *handle
@@ -2617,6 +2715,17 @@ impl Supervisor {
             attached,
             unavailable,
         })
+    }
+
+    fn session_capture_settled(&self, handle: &SessionHandle, process_json: &str) -> Result<bool> {
+        Ok(self.store.lock()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions
+             WHERE id=?1 AND transcript_epoch=?2 AND process_identity_json=?3
+             AND status='exited' AND json_extract(exit_json,'$.process_group_quiescent')=1
+             AND capture_state IN ('complete','failed'))",
+            rusqlite::params![handle.session_id, handle.transcript_epoch, process_json],
+            |row| row.get(0),
+        )?)
     }
 
     fn reconcile_interrupt_deadlines(&self) -> Result<()> {
@@ -2959,16 +3068,39 @@ impl Supervisor {
         after_sequence: u64,
         limit_bytes: usize,
     ) -> Result<crate::domain::TranscriptPage> {
-        let handle = self.attachment_handle(binding, None)?;
+        let handle = self.attached_handle(&binding.session_id)?;
         let _boundary = handle
-            .io_boundary
-            .lock()
-            .map_err(|_| anyhow!("session I/O boundary poisoned"))?;
+            .as_ref()
+            .map(|handle| {
+                handle
+                    .io_boundary
+                    .lock()
+                    .map_err(|_| anyhow!("session I/O boundary poisoned"))
+            })
+            .transpose()?;
         let mut access = self.store.attachment_transcript_access(binding)?;
+        // An established connection may read its exact completed binding
+        // after retirement. Live and draining access still need the handle.
+        if let Some(handle) = &handle {
+            if !attachment_matches_handle(binding, handle) {
+                bail!("terminal attachment binding no longer matches this service session")
+            }
+        } else if !matches!(
+            access,
+            crate::store::AttachmentTranscriptAccess::CaptureComplete { .. }
+        ) {
+            bail!(
+                "session {} is not attached to this service boot",
+                binding.session_id
+            )
+        }
         if matches!(access, crate::store::AttachmentTranscriptAccess::Live) {
-            if let Err(live_error) = self.verify_process(&handle) {
+            let handle = handle
+                .as_ref()
+                .context("live terminal attachment is unavailable")?;
+            if let Err(live_error) = self.verify_process(handle) {
                 for attempt in 0..5 {
-                    self.reconcile_attachment_exit_locked(&handle)?;
+                    self.reconcile_attachment_exit_locked(handle)?;
                     access = self.store.attachment_transcript_access(binding)?;
                     if !matches!(access, crate::store::AttachmentTranscriptAccess::Live) {
                         break;
@@ -3824,7 +3956,21 @@ impl Supervisor {
     }
 
     pub fn process_group_members(&self, session_id: &str) -> Result<Vec<serde_json::Value>> {
-        let handle = self.handle(session_id)?;
+        let Some(handle) = self.attached_handle(session_id)? else {
+            // Capability inspection remains available after a PTY's exit is
+            // recorded and its handle is dropped.
+            let exited: bool = self.store.lock()?.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1 AND conversation_id IS NULL
+                 AND status='exited' AND json_extract(exit_json,'$.process_group_quiescent')=1
+                 AND capture_state IN ('complete','failed'))",
+                [session_id],
+                |row| row.get(0),
+            )?;
+            if exited {
+                return Ok(Vec::new());
+            }
+            bail!("session {session_id} is not attached to this service boot")
+        };
         let inventory = process_inventory()?;
         self.observe_members(&handle, &inventory)?;
         Ok(self
@@ -3850,12 +3996,17 @@ impl Supervisor {
     }
 
     fn handle(&self, session_id: &str) -> Result<Arc<SessionHandle>> {
-        self.sessions
+        self.attached_handle(session_id)?
+            .ok_or_else(|| anyhow!("session {session_id} is not attached to this service boot"))
+    }
+
+    fn attached_handle(&self, session_id: &str) -> Result<Option<Arc<SessionHandle>>> {
+        Ok(self
+            .sessions
             .read()
             .map_err(|_| anyhow!("supervisor session map poisoned"))?
             .get(session_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("session {session_id} is not attached to this service boot"))
+            .cloned())
     }
 
     fn attachment_handle(
@@ -3864,10 +4015,7 @@ impl Supervisor {
         guidance_id: Option<&str>,
     ) -> Result<Arc<SessionHandle>> {
         let handle = self.handle(&binding.session_id)?;
-        if !handle.owner.is_role_generation(&binding.role_generation_id)
-            || handle.transcript_epoch != binding.transcript_epoch
-            || handle.process != binding.process
-        {
+        if !attachment_matches_handle(binding, &handle) {
             if let Some(guidance) = guidance_id {
                 let connection = self.store.lock()?;
                 if crate::store::is_report_reminder(&connection, guidance)? {
@@ -4083,6 +4231,12 @@ impl Supervisor {
             .cloned()
             .collect())
     }
+}
+
+fn attachment_matches_handle(binding: &AttachmentBinding, handle: &SessionHandle) -> bool {
+    handle.owner.is_role_generation(&binding.role_generation_id)
+        && handle.transcript_epoch == binding.transcript_epoch
+        && handle.process == binding.process
 }
 
 fn deliver_setup_retained_first_turn_signal<F>(
@@ -4831,6 +4985,287 @@ exit 23
         }
     }
 
+    #[test]
+    fn conversation_reader_distinguishes_complete_and_truncated_eof() {
+        use crate::providers::codex_app_server::{
+            ConversationNativeIdentity, ConversationOperation, ConversationProfileRevision,
+            PreparedConversation,
+        };
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+
+        for (mode, delivery, terminal) in [
+            ("complete", "completed", true),
+            ("partial", "unknown", false),
+            ("partial-tail", "completed", true),
+        ] {
+            let root =
+                std::env::temp_dir().join(format!("llmrelay-transport-{}", uuid::Uuid::new_v4()));
+            let paths = crate::config::InstancePaths::resolve(Some(root.clone())).unwrap();
+            paths.create().unwrap();
+            let store = Store::open(&paths.database).unwrap();
+            let app = crate::operations::Application::new(
+                paths,
+                store.clone(),
+                std::env::current_exe().unwrap(),
+            )
+            .unwrap();
+            let supervisor = &app.supervisor;
+            store.lock().unwrap().execute_batch(
+                "INSERT INTO projects(id,display_name,repository_path,repository_identity,base_revision,created_at,updated_at)
+                   VALUES('p','p','/fixture','repo','base','now','now');
+                 INSERT INTO execution_config_revisions(id,project_id,revision,config_json,content_hash,approved_at,created_at)
+                   VALUES('e','p',1,'{}','config','now','now');
+                 INSERT INTO conversation_profiles(id,project_id,execution_config_revision_id,profile_json,profile_hash,created_at)
+                   VALUES('pr','p','e','{}','profile','now');
+                 INSERT INTO conversation_admissions(id,profile_revision_id,identity_json,identity_hash,state,created_at,updated_at)
+                   VALUES('a','pr','{}','identity','active','now','now');
+                 INSERT INTO conversations(id,project_id,admission_id,identity_json,identity_hash,generation,state,created_at,updated_at)
+                   VALUES('c','p','a','{}','identity','g','reserved','now','now');
+                 INSERT INTO sessions(id,conversation_id,provider,status,launch_config_json,executable_version,transcript_epoch,created_at,updated_at)
+                   VALUES('s','c','codex','running','{}','fixture','g','now','now');
+                 INSERT INTO conversation_reservations(conversation_id,session_id,repository_identity,state,created_at,updated_at)
+                   VALUES('c','s','repo','running','now','now');
+                 INSERT INTO conversation_operations(operation_id,actor_key,request_hash,kind,conversation_id,
+                     generation,native_thread_id,native_turn_id,state,input_json,created_at,updated_at)
+                   VALUES('old','human_control','old','start','c','old-g','thread','turn','completed','{}','earlier','earlier'),
+                         ('input','human_control','input','start','c','g',NULL,NULL,'reserved','{\"message\":\"fixture\"}','now','now'),
+                         ('other','human_control','other','interrupt','c','g','thread',NULL,'sending','{}','now','now');",
+            ).unwrap();
+            let prepared = PreparedConversation {
+                identity: ConversationNativeIdentity {
+                    executable: image("/bin/sh"),
+                    executable_version: "fixture".into(),
+                    schema_hash: "fixture".into(),
+                    adapter_revision: "fixture".into(),
+                    adapter_hash: "fixture".into(),
+                    profile: ConversationProfileRevision {
+                        id: "pr".into(),
+                        project_id: "p".into(),
+                        execution_config_revision_id: "e".into(),
+                        model: "fixture".into(),
+                        effort: "none".into(),
+                        instructions: String::new(),
+                        instructions_hash: "fixture".into(),
+                        profile_hash: "profile".into(),
+                    },
+                    repository_identity: "repo".into(),
+                    repository_root: root.clone(),
+                    guidance_hash: "fixture".into(),
+                    execution_config_hash: "config".into(),
+                    policy_hash: "fixture".into(),
+                    credential_contract: "fixture".into(),
+                    configuration_hash: "fixture".into(),
+                    release_binding: "fixture".into(),
+                    instance_id: "fixture".into(),
+                    restore_epoch: "fixture".into(),
+                },
+                arguments: Vec::new(),
+                config: Default::default(),
+                guidance: String::new(),
+            };
+            // The seeded independent reply exercises demultiplexing through
+            // the production reader without a native provider.
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", r#"
+read_id() {
+    IFS= read -r frame || exit 29
+    reply_id=$(printf '%s\n' "$frame" | /usr/bin/sed -n 's/^{"id":"\([^"]*\)".*/\1/p')
+}
+read_id
+printf '{"id":"%s","result":{}}\n' "$reply_id"
+IFS= read -r initialized || exit 29
+read_id
+printf '{"id":"%s","result":{"model":"fixture","modelProvider":"openai","reasoningEffort":"none","cwd":%s,"approvalPolicy":"never","sandbox":{"type":"readOnly"},"thread":{"id":"thread"}}}\n' "$reply_id" "$2"
+read_id
+terminal='{"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed"}}}'
+if [ "$1" != partial ]; then printf '%s\n' "$terminal"; fi
+printf '{"id":"other","result":{}}\n'
+printf '{"id":"%s","result":{"turn":{"id":"turn"}}}\n' "$reply_id"
+if [ "$1" = partial ]; then
+    printf '%s' "$terminal"
+elif [ "$1" = partial-tail ]; then
+    printf '{"method":'
+fi
+exec 1>&-
+exec /bin/sleep 5
+"#, "fixture", mode])
+                .arg(serde_json::to_string(&root).unwrap())
+                .process_group(0)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let process = ProcessIdentity {
+                pid,
+                process_group_id: pid as i32,
+                native_start_marker: native_start_marker(pid).unwrap(),
+                observed_started_at: Utc::now().to_rfc3339(),
+            };
+            let group_leader = ProcessGenerationAnchor {
+                pid,
+                process_group_id: process.process_group_id,
+                native_start_marker: process.native_start_marker.clone(),
+                boot_identity: system_boot_identity().unwrap(),
+            };
+            store
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE sessions SET process_identity_json=?1,recovery_anchor_json=?2 WHERE id='s'",
+                    [
+                        serde_json::to_string(&process).unwrap(),
+                        serde_json::to_string(&group_leader).unwrap(),
+                    ],
+                )
+                .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let input = child.stdin.take().unwrap();
+            let handle = Arc::new(SessionHandle {
+                session_id: "s".into(),
+                owner: SessionOwner::Conversation("c".into()),
+                transcript_epoch: "g".into(),
+                known_members: Mutex::new(HashMap::from([(
+                    pid,
+                    process.native_start_marker.clone(),
+                )])),
+                process,
+                group_leader,
+                child: Mutex::new(Box::new(child)),
+                input: Mutex::new(Box::new(input)),
+                io_boundary: Mutex::new(()),
+                first_stop_requested_at: Mutex::new(None),
+                codex_helper_image: None,
+                codex_helper_identity: Mutex::new(None),
+                reader_pending: Arc::new(AtomicBool::new(true)),
+                _master: Mutex::new(None),
+            });
+            supervisor
+                .sessions
+                .write()
+                .unwrap()
+                .insert("s".into(), Arc::clone(&handle));
+            supervisor.run_conversation_reader(stdout, "s", "c", "g", "input", &prepared, None);
+            assert!(
+                handle.first_stop_requested_at.lock().unwrap().is_some(),
+                "{mode}"
+            );
+            assert_eq!(
+                supervisor.interrupt_once("s").unwrap(),
+                InterruptOutcome::AlreadyRequested
+            );
+            handle.child.lock().unwrap().wait().unwrap();
+            crate::recovery::verify_session_quiescent(&store, "s").unwrap();
+            let manual_recovery = || {
+                [
+                    ConversationOperation::Reconcile {
+                        operation_id: "reconcile-pending".into(),
+                        conversation_id: "c".into(),
+                    },
+                    ConversationOperation::Resume {
+                        operation_id: "resume-pending".into(),
+                        conversation_id: "c".into(),
+                    },
+                ]
+            };
+            for operation in manual_recovery() {
+                let error = app.conversation_operation(operation).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("still processing its final output"),
+                    "{mode}: {error}"
+                );
+            }
+            supervisor.reconcile().unwrap();
+            assert_eq!(
+                store.session_json("s").unwrap()["status"],
+                "interrupt_requested"
+            );
+            assert_eq!(
+                store.conversation_active_sessions().unwrap(),
+                vec!["s".to_owned()]
+            );
+            handle.reader_pending.store(false, Ordering::Release);
+            supervisor.reconcile().unwrap();
+            assert!(supervisor.handles().unwrap().is_empty());
+            let session = store.session_json("s").unwrap();
+            assert_eq!(session["status"], "exited");
+            assert_eq!(session["exit"]["app_stop_requested"], true);
+            assert_eq!(session["exit"]["process_group_quiescent"], true);
+            {
+                let connection = store.lock().unwrap();
+                let (state, bound, reservation, input, other): (String, bool, String, String, String) =
+                    connection.query_row(
+                        "SELECT c.state,c.binding_valid,r.state,i.state,o.state
+                         FROM conversations c JOIN conversation_reservations r ON r.conversation_id=c.id
+                         JOIN conversation_operations i ON i.operation_id='input'
+                         JOIN conversation_operations o ON o.operation_id='other' WHERE c.id='c'",
+                        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                    ).unwrap();
+                assert_eq!(input, delivery, "{mode}");
+                assert_eq!(other, "completed", "{mode}");
+                assert_eq!(reservation, "released", "{mode}");
+                assert_eq!(bound, mode == "complete", "{mode}");
+                assert_eq!(
+                    state,
+                    if bound { "idle" } else { "recovery_required" },
+                    "{mode}"
+                );
+                let projected: Vec<(String, String, String)> = connection
+                    .prepare("SELECT generation,native_turn_id,operation_id FROM conversation_events WHERE kind='turn_completed'")
+                    .unwrap()
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                    .unwrap().collect::<rusqlite::Result<_>>().unwrap();
+                let expected: Vec<(String, String, String)> = if terminal {
+                    vec![("g".into(), "turn".into(), "input".into())]
+                } else {
+                    vec![]
+                };
+                assert_eq!(projected, expected, "{mode}");
+            }
+            if mode != "complete" {
+                assert!(session["launch_error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("middle of a frame"));
+            }
+            for operation in manual_recovery() {
+                let error = app.conversation_operation(operation).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("still processing its final output"),
+                    "{mode}: {error}"
+                );
+            }
+            let reconcile = ConversationOperation::Reconcile {
+                operation_id: "reconcile-settled".into(),
+                conversation_id: "c".into(),
+            };
+            let reconciled = app.conversation_operation(reconcile.clone()).unwrap();
+            assert_eq!(reconciled["reservation"], "released");
+            assert_eq!(reconciled["unknown_delivery_preserved"], mode == "partial");
+            assert_eq!(
+                app.conversation_operation(reconcile).unwrap()["delivery_state"],
+                "completed"
+            );
+
+            app.request_drain();
+            let error = app
+                .conversation_operation(ConversationOperation::Resume {
+                    operation_id: "resume-settled".into(),
+                    conversation_id: "c".into(),
+                })
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("dispatch is stopped, draining, or synthetic"));
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
     fn process(pid: u32, ppid: u32, start: &str) -> ProcessInfo {
         ProcessInfo {
             pid,
@@ -5177,6 +5612,7 @@ exit 23
                 )),
                 codex_helper_image: None,
                 codex_helper_identity: Mutex::new(None),
+                reader_pending: Arc::new(AtomicBool::new(false)),
                 _master: Mutex::new(Some(pty.master)),
             }),
         );
@@ -5208,6 +5644,7 @@ exit 23
                 first_stop_requested_at: Mutex::new(None),
                 codex_helper_image: None,
                 codex_helper_identity: Mutex::new(None),
+                reader_pending: Arc::new(AtomicBool::new(false)),
                 _master: Mutex::new(Some(unrelated_pty.master)),
             }),
         );
@@ -5416,6 +5853,7 @@ exit 23
             first_stop_requested_at: Mutex::new(None),
             codex_helper_image: None,
             codex_helper_identity: Mutex::new(None),
+            reader_pending: Arc::new(AtomicBool::new(false)),
             _master: Mutex::new(Some(pty.master)),
         });
         app.supervisor
@@ -5630,6 +6068,7 @@ exit 23
                         first_stop_requested_at: Mutex::new(None),
                         codex_helper_image: None,
                         codex_helper_identity: Mutex::new(None),
+                        reader_pending: Arc::new(AtomicBool::new(false)),
                         _master: Mutex::new(Some(pty.master)),
                     }),
                 );
@@ -7203,6 +7642,7 @@ exit 23
                     first_stop_requested_at: Mutex::new(None),
                     codex_helper_image: None,
                     codex_helper_identity: Mutex::new(None),
+                    reader_pending: Arc::new(AtomicBool::new(false)),
                     _master: Mutex::new(Some(pty.master)),
                 }),
             );
@@ -7901,6 +8341,7 @@ exit 23
                 first_stop_requested_at: Mutex::new(None),
                 codex_helper_image: None,
                 codex_helper_identity: Mutex::new(None),
+                reader_pending: Arc::new(AtomicBool::new(false)),
                 _master: Mutex::new(Some(pty.master)),
             }),
         );

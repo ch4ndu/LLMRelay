@@ -1,4 +1,4 @@
-use crate::domain::{HookEnvelope, RoleResultReport};
+use crate::domain::{ExecutionContext, HookEnvelope, RolePeerProvenance, RoleResultReport};
 use crate::operations::Application;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -356,6 +356,68 @@ async fn handle(
     Ok(())
 }
 
+fn role_invocation(context: &ExecutionContext) -> (&str, &str, &str, &str) {
+    match context {
+        ExecutionContext::Trip(context) => (
+            &context.session_id,
+            &context.role_generation_id,
+            &context.credential_id,
+            &context.transcript_epoch,
+        ),
+        ExecutionContext::SingleAgent(context) => (
+            &context.session_id,
+            &context.role_generation_id,
+            &context.credential_id,
+            &context.transcript_epoch,
+        ),
+    }
+}
+
+async fn validate_request_peer(
+    app: &Application,
+    credential: &str,
+    peer_pid: u32,
+) -> Result<(ExecutionContext, RolePeerProvenance)> {
+    let initial = app.store.execution_context(credential)?;
+    let (session_id, generation_id, _, _) = role_invocation(&initial);
+    app.supervisor
+        .await_role_attachment(session_id, generation_id)
+        .await?;
+
+    let permit = Arc::clone(&app.blocking_operations)
+        .acquire_owned()
+        .await
+        .context("blocking operation admission is unavailable")?;
+    let app = app.clone();
+    let credential = credential.to_owned();
+    tokio::task::spawn_blocking(move || {
+        // A disconnected client can drop the waiter while peer inventory runs.
+        let _permit = permit;
+        let context = match &initial {
+            ExecutionContext::Trip(_) => {
+                ExecutionContext::Trip(app.store.role_context(&credential)?)
+            }
+            ExecutionContext::SingleAgent(_) => {
+                let context = app.store.execution_context(&credential)?;
+                if !matches!(&context, ExecutionContext::SingleAgent(_)) {
+                    bail!("role credential changed execution branch during supervisor attachment")
+                }
+                context
+            }
+        };
+        let invocation = role_invocation(&context);
+        if invocation != role_invocation(&initial) {
+            bail!("role credential changed session, generation, or invocation during supervisor attachment")
+        }
+        let provenance = app
+            .supervisor
+            .validate_role_peer(invocation.0, invocation.1, peer_pid)?;
+        Ok((context, provenance))
+    })
+    .await
+    .context("join role peer validation")?
+}
+
 /// A Single agent credential reaches its own context, result report, native
 /// hooks and permission requests, which wait for a person's decision. TRIP
 /// manager, setup, lane and check operations and every human control are not
@@ -363,30 +425,10 @@ async fn handle(
 async fn dispatch_single_agent(
     request: RoleRequest,
     app: &Application,
-    peer_pid: u32,
-    initial: crate::domain::SingleAgentContext,
+    context: crate::domain::SingleAgentContext,
+    provenance: RolePeerProvenance,
     connection_nonce: &str,
 ) -> Result<serde_json::Value> {
-    app.supervisor
-        .await_role_attachment(&initial.session_id, &initial.role_generation_id)
-        .await?;
-    let crate::domain::ExecutionContext::SingleAgent(context) =
-        app.store.execution_context(&request.credential)?
-    else {
-        bail!("role credential changed execution branch during supervisor attachment")
-    };
-    if context.session_id != initial.session_id
-        || context.role_generation_id != initial.role_generation_id
-        || context.credential_id != initial.credential_id
-        || context.transcript_epoch != initial.transcript_epoch
-    {
-        bail!("role credential changed session, generation, or invocation during supervisor attachment")
-    }
-    let provenance = app.supervisor.validate_role_peer(
-        &context.session_id,
-        &context.role_generation_id,
-        peer_pid,
-    )?;
     match request.operation {
         RoleOperation::Context => app.store.single_agent_context_payload(&context),
         RoleOperation::Report { report } => app.store.save_single_agent_result(&context, &report),
@@ -423,31 +465,14 @@ async fn dispatch(
     peer_pid: u32,
     connection_nonce: &str,
 ) -> Result<serde_json::Value> {
-    if let crate::domain::ExecutionContext::SingleAgent(initial) =
-        app.store.execution_context(&request.credential)?
-    {
-        return dispatch_single_agent(request, app, peer_pid, initial, connection_nonce).await;
-    }
-    let initial_context = app.store.role_context(&request.credential)?;
-    app.supervisor
-        .await_role_attachment(
-            &initial_context.session_id,
-            &initial_context.role_generation_id,
-        )
-        .await?;
-    let context = app.store.role_context(&request.credential)?;
-    if context.session_id != initial_context.session_id
-        || context.role_generation_id != initial_context.role_generation_id
-        || context.credential_id != initial_context.credential_id
-        || context.transcript_epoch != initial_context.transcript_epoch
-    {
-        bail!("role credential changed session, generation, or invocation during supervisor attachment")
-    }
-    let provenance = app.supervisor.validate_role_peer(
-        &context.session_id,
-        &context.role_generation_id,
-        peer_pid,
-    )?;
+    let (context, provenance) = validate_request_peer(app, &request.credential, peer_pid).await?;
+    let context = match context {
+        ExecutionContext::Trip(context) => context,
+        ExecutionContext::SingleAgent(context) => {
+            return dispatch_single_agent(request, app, context, provenance, connection_nonce)
+                .await;
+        }
+    };
     match request.operation {
         RoleOperation::Context => app.role_context_payload(&context),
         RoleOperation::ContextIndex => app.role_context_delivery_payload(&context, None),

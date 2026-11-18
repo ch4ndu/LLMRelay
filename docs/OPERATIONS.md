@@ -446,6 +446,8 @@ llmrelay logs --data-dir "$PWD/.local/my-agenticjira"
 llmrelay diagnostics export --data-dir "$PWD/.local/my-agenticjira" --output "$PWD/.local/agenticjira-export.zip"
 ```
 
+Choose a ZIP destination separate from the instance database and its SQLite sidecars. An existing diagnostics ZIP can be replaced.
+
 The export is a standards-compatible ZIP containing `manifest.json`, sanitized application state, and bounded sanitized diagnostics. It excludes the raw database, credentials, native provider history, transcript payloads, repository source, hook payload bodies, and runtime sockets.
 
 Setup previews, runtime proof challenges, local workspace and service paths, and freeform failure details are omitted. Correlation IDs, states, timestamps, hashes, capability keys, and normalized failure categories remain available for debugging.

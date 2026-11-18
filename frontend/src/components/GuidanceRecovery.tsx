@@ -1,11 +1,15 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ApiError,
   command,
   getGuidanceReauthorization,
   operationId,
+  recoveryJournalChanged,
 } from "../api";
+import { guidanceApprovalIsFor } from "../apiValidation";
+import { withStorageLock } from "../storageCoordination";
 import type {
+  Command,
   GuidanceDiffLine,
   GuidancePreviewFile,
   GuidanceReauthorizationPreview,
@@ -14,6 +18,25 @@ import type {
 import { ErrorNotice, TechnicalDetails } from "./ErrorNotice";
 
 const diffPrefix = { context: "  ", removed: "- ", added: "+ " } as const;
+
+const approvalsInFlight = new Set<string>();
+type ApprovalJournal =
+  | { request: Command; saved: string; error?: never }
+  | { request?: never; saved?: never; error?: string };
+
+function readApproval(key: string, taskId: string): ApprovalJournal {
+  try {
+    const saved = localStorage.getItem(key);
+    if (saved === null) return {};
+    const request: unknown = JSON.parse(saved);
+    if (guidanceApprovalIsFor(request, taskId) && JSON.stringify(request) === saved) {
+      return { request, saved };
+    }
+  } catch {
+    // Unreadable storage cannot establish whether an earlier approval is pending.
+  }
+  return { error: "The saved instruction approval could not be checked in browser storage. Reload the dashboard and check the task activity before approving." };
+}
 
 function DiffLines({ lines }: { lines: GuidanceDiffLine[] }) {
   return (
@@ -83,25 +106,92 @@ function FileComparison({ file }: { file: GuidancePreviewFile }) {
 }
 
 export function GuidanceRecovery(
-  { task, onChanged }: { task: Task; onChanged: () => void },
+  { task, onChanged, allowFreshApproval = true }: {
+    task: Task;
+    onChanged: () => Promise<void> | void;
+    allowFreshApproval?: boolean;
+  },
+) {
+  // Keep one unresolved approval per task, even after its active attempt changes.
+  const storageKey = `llmrelay.guidance.approval.${encodeURIComponent(task.project_id)}:${encodeURIComponent(task.id)}`;
+  return <GuidanceRecoveryPanel key={storageKey} task={task} storageKey={storageKey} allowFreshApproval={allowFreshApproval} onChanged={onChanged} />;
+}
+
+function GuidanceRecoveryPanel(
+  { task, storageKey, allowFreshApproval, onChanged }: {
+    task: Task;
+    storageKey: string;
+    allowFreshApproval: boolean;
+    onChanged: () => Promise<void> | void;
+  },
 ) {
   const [preview, setPreview] = useState<GuidanceReauthorizationPreview>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [uncertain, setUncertain] = useState(false);
-  const identity = useRef<{ body: string; id: string } | undefined>(undefined);
+  const [journal, setJournal] = useState(() => readApproval(storageKey, task.id));
+  const [checked, setChecked] = useState<string>();
+  const previewInFlight = useRef(false);
+  const approvalContext = useRef(new AbortController());
+  const lifetime = useRef(new AbortController());
+  const attempt = task.active_attempt;
+  useEffect(() => {
+    const scope = new AbortController();
+    lifetime.current = scope;
+    return () => scope.abort();
+  }, []);
+  useEffect(() => {
+    const context = new AbortController();
+    approvalContext.current = context;
+    if (!allowFreshApproval) setPreview(undefined);
+    return () => context.abort();
+  }, [task.version, attempt?.id, attempt?.plan_hash, allowFreshApproval]);
+  useEffect(() => {
+    const sync = () => {
+      const latest = readApproval(storageKey, task.id);
+      setJournal(latest);
+      setChecked((reviewed) => reviewed === latest.saved ? reviewed : undefined);
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === storageKey || event.key === null) {
+        sync();
+      }
+    };
+    const onLocalWrite = (event: Event) => {
+      if (event instanceof window.CustomEvent && event.detail === storageKey) sync();
+    };
+    window.addEventListener("storage", onStorage);
+    window.addEventListener(recoveryJournalChanged, onLocalWrite);
+    sync();
+    return () => {
+      window.removeEventListener("storage", onStorage);
+      window.removeEventListener(recoveryJournalChanged, onLocalWrite);
+    };
+  }, [storageKey, task.id]);
+  const notifyJournal = () => window.dispatchEvent(
+    new window.CustomEvent(recoveryJournalChanged, { detail: storageKey }),
+  );
+
   const load = async () => {
+    if (!allowFreshApproval || previewInFlight.current || approvalsInFlight.has(storageKey)) return;
+    const signal = approvalContext.current.signal;
+    const mounted = lifetime.current.signal;
+    const current = readApproval(storageKey, task.id);
+    setJournal(current);
+    if (current.request || current.error) return;
+    previewInFlight.current = true;
     setBusy(true);
     setError("");
+    setPreview(undefined);
     try {
-      setPreview(await getGuidanceReauthorization(task.id));
+      const next = await getGuidanceReauthorization(task.id);
+      if (!signal.aborted) setPreview(next);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      if (!signal.aborted) setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      setBusy(false);
+      previewInFlight.current = false;
+      if (!mounted.aborted) setBusy(false);
     }
   };
-  const attempt = task.active_attempt;
   // A preview reviewed for another task version, attempt or plan is stale and
   // can never approve the content now in the worktree.
   const stale = !!preview && (
@@ -109,66 +199,150 @@ export function GuidanceRecovery(
     preview.attempt_id !== attempt?.id ||
     (attempt?.plan_hash !== undefined && preview.plan_hash !== attempt.plan_hash)
   );
-  const approve = async () => {
-    if (
-      !preview || busy || uncertain || stale || preview.files.length === 0
-    ) return;
-    const request = {
-      kind: "reauthorize_attempt_guidance",
-      task_id: task.id,
-      attempt_id: preview.attempt_id,
-      expected_version: preview.expected_version,
-      plan_hash: preview.plan_hash,
-      config_revision_id: preview.config_revision_id,
-      policy_hash: preview.policy_hash,
-      files: preview.files.map(({ path, previous_sha256, sha256 }) => ({
-        path,
-        previous_sha256,
-        sha256,
-      })),
-    };
-    const body = JSON.stringify(request);
-    const id = identity.current?.body === body
-      ? identity.current.id
-      : operationId();
-    identity.current = { body, id };
+  const approve = async (replay: boolean) => {
+    if (busy || previewInFlight.current || approvalsInFlight.has(storageKey)) return;
+    const current = readApproval(storageKey, task.id);
+    setJournal(current);
+    if (current.error) return;
+    let { request, saved } = current;
+    const signal = approvalContext.current.signal;
+    const mounted = lifetime.current.signal;
+    if (replay) {
+      if (!request || checked !== saved) return;
+    } else {
+      if (!allowFreshApproval || request || !preview || stale || preview.files.length === 0) return;
+      request = {
+        kind: "reauthorize_attempt_guidance",
+        operation_id: operationId(),
+        task_id: task.id,
+        attempt_id: preview.attempt_id,
+        expected_version: preview.expected_version,
+        plan_hash: preview.plan_hash,
+        config_revision_id: preview.config_revision_id,
+        policy_hash: preview.policy_hash,
+        files: preview.files.map(({ path, previous_sha256, sha256 }) => ({
+          path,
+          previous_sha256,
+          sha256,
+        })),
+      };
+      if (!guidanceApprovalIsFor(request, task.id)) {
+        setError("The instruction approval could not be bound to this review. Review the planned documentation update again.");
+        return;
+      }
+      const approval = request;
+      saved = JSON.stringify(approval);
+      const serialized = saved;
+      approvalsInFlight.add(storageKey);
+      setBusy(true);
+      setError("");
+      try {
+        const published = await withStorageLock(storageKey, () => {
+          const latest = readApproval(storageKey, task.id);
+          if (latest.request || latest.error) return latest;
+          localStorage.setItem(storageKey, serialized);
+          return { request: approval, saved: serialized };
+        }, signal);
+        if (published && !signal.aborted) setJournal(published);
+        if (published?.saved !== serialized) return;
+        if (signal.aborted) {
+          await withStorageLock(storageKey, () => {
+            if (localStorage.getItem(storageKey) === serialized) localStorage.removeItem(storageKey);
+          });
+          return;
+        }
+      } catch {
+        if (!signal.aborted) setError("Browser storage could not save this instruction approval for recovery. The approval was not sent.");
+        return;
+      } finally {
+        approvalsInFlight.delete(storageKey);
+        if (signal.aborted) notifyJournal();
+        if (!mounted.aborted) setBusy(false);
+      }
+    }
+    approvalsInFlight.add(storageKey);
+    notifyJournal();
     setBusy(true);
     setError("");
+    setChecked(undefined);
+    let clearSaved = false;
+    let confirmed = false;
+    let replaced = false;
+    let failure = "";
     try {
-      await command({ ...request, operation_id: id });
-      identity.current = undefined;
-      setPreview(undefined);
-      onChanged();
+      await command(request);
+      confirmed = true;
+      clearSaved = true;
     } catch (cause) {
-      const ambiguous = cause instanceof ApiError && cause.ambiguous;
-      setUncertain(ambiguous);
-      setError(
-        `${cause instanceof Error ? cause.message : String(cause)}${
-          ambiguous
-            ? " Refresh and inspect the task audit before approving again; the outcome is unknown."
-            : ""
-        }`,
-      );
-      onChanged();
+      clearSaved = !replay && !(cause instanceof ApiError && cause.ambiguous);
+      failure = cause instanceof Error ? cause.message : String(cause);
+    }
+    try {
+      if (clearSaved) {
+        await withStorageLock(storageKey, () => {
+          if (localStorage.getItem(storageKey) === saved) {
+            localStorage.removeItem(storageKey);
+          } else {
+            replaced = true;
+          }
+        });
+      }
+    } catch {
+      failure = "Browser storage could not clear the saved instruction approval. Check the task activity and the saved approval before continuing.";
     } finally {
-      setBusy(false);
+      approvalsInFlight.delete(storageKey);
+      notifyJournal();
+      if (!mounted.aborted) setBusy(false);
+    }
+    if (signal.aborted || replaced) return;
+    if (confirmed || !clearSaved) setPreview(undefined);
+    setError(failure);
+    try {
+      await onChanged();
+    } catch {
+      if (!signal.aborted) setError("The task could not be refreshed. Reload the dashboard and check the task activity.");
     }
   };
+  if (!allowFreshApproval && !journal.request && !journal.error && !error) return null;
   return (
     <section className="panel recovery guidance-recovery">
-      <h3>Review changed instruction files</h3>
-      <p>
+      <h3>{journal.request ? "Reconcile saved instruction approval" : "Review changed instruction files"}</h3>
+      {allowFreshApproval && !journal.request && <p>
         This task changed a file that also supplies agent instructions. If the
         approved plan includes this documentation edit, review its content
         below and approve it for the remaining task steps. Otherwise restore
         the file yourself. LLMRelay never restores or discards the edit for
         you.
-      </p>
-      <button disabled={busy || uncertain} onClick={() => void load()}>
-        Review planned documentation update
-      </button>
+      </p>}
+      {journal.request
+        ? (
+          <div>
+            <p role="status">
+              {busy || approvalsInFlight.has(storageKey) ? "Checking the saved instruction approval…" :
+                "The outcome of the saved instruction approval is uncertain. Refresh and inspect the task activity before checking the original request."}
+            </p>
+            <label>
+              <input
+                type="checkbox"
+                checked={checked === journal.saved}
+                disabled={busy || approvalsInFlight.has(storageKey)}
+                onChange={(event) => setChecked(event.target.checked ? journal.saved : undefined)}
+              />
+              I checked the task activity for this approval.
+            </label>
+            <button disabled={busy || approvalsInFlight.has(storageKey) || checked !== journal.saved} onClick={() => void approve(true)}>
+              Check saved instruction approval
+            </button>
+          </div>
+        )
+        : allowFreshApproval && (
+          <button disabled={busy || !!journal.error} onClick={() => void load()}>
+            Review planned documentation update
+          </button>
+        )}
+      {journal.error && <ErrorNotice error={journal.error} />}
       {error && <ErrorNotice error={error} />}
-      {preview && (preview.files.length === 0
+      {allowFreshApproval && preview && !journal.request && !journal.error && (preview.files.length === 0
         ? (
           <p>
             No changed instruction files qualify under this approved plan. Other
@@ -201,8 +375,8 @@ export function GuidanceRecovery(
               </p>
             )}
             <button
-              disabled={busy || uncertain || stale}
-              onClick={() => void approve()}
+              disabled={busy || stale}
+              onClick={() => void approve(false)}
             >
               Approve planned documentation update
             </button>

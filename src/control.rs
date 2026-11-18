@@ -893,6 +893,32 @@ fn admit_human_control<T>(
     after_admission(peer_identity)
 }
 
+async fn run_attachment_operation<T: Send + 'static>(
+    app: &Application,
+    connection: &mut ConnectionState,
+    operation: impl FnOnce(&Application, &mut ConnectionState) -> T + Send + 'static,
+) -> Result<T> {
+    let permit = Arc::clone(&app.blocking_operations)
+        .acquire_owned()
+        .await
+        .context("blocking operation admission is unavailable")?;
+    let app = app.clone();
+    let mut attachment_connection = ConnectionState {
+        admission: connection.admission.clone(),
+        peer_identity: connection.peer_identity.clone(),
+        attachment: connection.attachment.take(),
+    };
+    let (outcome, attachment) = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let outcome = operation(&app, &mut attachment_connection);
+        (outcome, attachment_connection.attachment)
+    })
+    .await
+    .context("join control attachment operation")?;
+    connection.attachment = attachment;
+    Ok(outcome)
+}
+
 async fn serve_connection(
     reader: &mut BufReader<OwnedReadHalf>,
     writer: &mut OwnedWriteHalf,
@@ -1008,7 +1034,12 @@ async fn serve_connection(
                     )),
                 }
             } else {
-                match dispatch(request, &app, &shutdown, &instance, &mut connection) {
+                let shutdown = shutdown.clone();
+                let instance = instance.clone();
+                let outcome = run_attachment_operation(&app, &mut connection, move |app, connection| {
+                    dispatch(request, app, &shutdown, &instance, connection)
+                }).await;
+                match outcome.and_then(|outcome| outcome) {
                     Ok(response) => response,
                     Err(error) => ControlResponse::failure(error),
                 }
@@ -1018,7 +1049,12 @@ async fn serve_connection(
         Ok(())
     }
     .await;
-    connection.release_attachment(&app);
+    if connection.attachment.is_some() {
+        run_attachment_operation(&app, &mut connection, |app, connection| {
+            connection.release_attachment(app);
+        })
+        .await?;
+    }
     result
 }
 
@@ -2202,6 +2238,48 @@ mod tests {
             .iter()
             .all(|request| !blocking_control_request(request)));
         assert!(blocking_control_request(&ControlRequest::Status));
+    }
+
+    #[tokio::test]
+    async fn cancelled_attachment_wait_retains_the_running_workers_permit() {
+        let (root, app, _) = control_test_application();
+        let capacity = app.blocking_operations.available_permits();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (release, finish) = std::sync::mpsc::channel();
+        let task = tokio::spawn({
+            let app = app.clone();
+            async move {
+                let mut connection = ConnectionState {
+                    admission: None,
+                    peer_identity: PeerProcessIdentity {
+                        pid: std::process::id(),
+                        native_start_marker: "test".into(),
+                    },
+                    attachment: None,
+                };
+                run_attachment_operation(&app, &mut connection, move |_, _| {
+                    started.send(()).unwrap();
+                    finish
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                })
+                .await
+            }
+        });
+        running.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(app.blocking_operations.available_permits(), capacity - 1);
+        release.send(()).unwrap();
+        let all_permits = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.blocking_operations.acquire_many(capacity as u32),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(all_permits);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn open_persistent_surface(

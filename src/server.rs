@@ -6,7 +6,7 @@ use crate::database::{
 };
 use crate::domain::{
     AppStateDto, CapabilityProofInput, CmuxKeyboardControlAction, FunctionalCapabilityProofInput,
-    HumanCommand, ProviderValidationSelection, RoleKind, WorkflowCommand,
+    HumanCommand, KnowledgeObservation, ProviderValidationSelection, RoleKind, WorkflowCommand,
 };
 use crate::operations::Application;
 use crate::protocol::{self, ClientKind};
@@ -48,6 +48,7 @@ const MAX_INCARNATION_BYTES: usize = 128;
 const DEFAULT_STATE_WAIT_MILLIS: u64 = 25_000;
 const STATE_WAIT_MILLIS: RangeInclusive<u64> = 1_000..=25_000;
 const MAX_SESSION_COOKIE_VALUE_BYTES: usize = 256;
+const MAX_RUNTIME_BINDINGS_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
 struct WebState {
@@ -380,6 +381,17 @@ enum WebOperation {
 }
 
 impl WebOperation {
+    fn checked_operation_id(&self) -> Option<&str> {
+        match self {
+            Self::TripSetupDispatch { operation_id, .. }
+            | Self::RuntimeProbeLaunch { operation_id, .. }
+            | Self::RuntimeProbeResume { operation_id, .. }
+            | Self::RoleResume { operation_id, .. }
+            | Self::LegacyImport { operation_id, .. } => Some(operation_id),
+            _ => None,
+        }
+    }
+
     fn required_feature(&self) -> Option<&'static str> {
         match self {
             Self::RecipeScheduleExecutionPreview { .. } => {
@@ -1123,6 +1135,10 @@ fn web_router(web_state: WebState) -> Router {
         .route("/api/command", post(api_command))
         .route("/api/operation", post(api_operation))
         .route("/api/diagnostics", get(api_diagnostics))
+        .route(
+            "/api/diagnostics/runtime-bindings",
+            get(api_diagnostics_runtime_bindings),
+        )
         .route_layer(middleware::from_fn_with_state(
             web_state.clone(),
             guard_operational_protocol,
@@ -1500,7 +1516,19 @@ async fn api_model_catalog(
         )
             .into_response();
     }
-    Json(crate::model_catalog::read(&query.provider)).into_response()
+    let permits = Arc::clone(&state.app.blocking_operations);
+    match admitted_blocking_work(permits, move || {
+        Json(crate::model_catalog::read(&query.provider)).into_response()
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":"The model catalog could not be read. Try again."})),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug)]
@@ -1643,6 +1671,28 @@ async fn api_command(
                     Some(command.operation_id()),
                     serde_json::json!({"cause":format!("{error:#}")}),
                 );
+                if matches!(
+                    command,
+                    HumanCommand::SetTaskKnowledge { .. }
+                        | HumanCommand::PrepareNextRunKnowledge { .. }
+                ) {
+                    // Rework preparation can fail after the workflow transaction commits.
+                    let receipt = (|| -> Result<bool> {
+                        let hash = crate::store::json_hash(command)?;
+                        Ok(app.store.lock()?.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM operation_receipts WHERE operation_id=?1
+                             AND actor_key='human_control' AND operation_kind='human_command'
+                             AND request_hash=?2)",
+                            rusqlite::params![command.operation_id(), hash],
+                            |row| row.get(0),
+                        )?)
+                    })();
+                    return knowledge_mutation_error(
+                        StatusCode::CONFLICT,
+                        command.operation_id(),
+                        !matches!(receipt, Ok(false)),
+                    );
+                }
                 human_command_error_response(command.operation_id(), &error)
             }
         }
@@ -1651,10 +1701,15 @@ async fn api_command(
 }
 
 fn human_command_error_response(operation_id: &str, error: &anyhow::Error) -> Response {
-    let outcome_unknown = error.is::<crate::trip::TripOutcomeUnknown>();
-    (StatusCode::CONFLICT, Json(serde_json::json!({
-        "error":format!("{error:#}"), "operation_id":operation_id, "outcome_unknown":outcome_unknown
-    }))).into_response()
+    let refusal = error.downcast_ref::<crate::trip::SetupProbeAuthorizationRefused>();
+    let terminal_refusal = refusal.is_some_and(|refusal| refusal.matches_operation(operation_id));
+    checked_operation_error_response(
+        StatusCode::CONFLICT,
+        operation_id,
+        error.is::<crate::trip::TripOutcomeUnknown>() || (refusal.is_some() && !terminal_refusal),
+        terminal_refusal,
+        &format!("{error:#}"),
+    )
 }
 
 async fn api_command_with_executor(
@@ -1696,16 +1751,22 @@ async fn api_command_with_executor(
         )
             .into_response();
     }
-    if matches!(
+    let task_knowledge_command = matches!(
         command,
         HumanCommand::SetTaskKnowledge { .. } | HumanCommand::PrepareNextRunKnowledge { .. }
-    ) && !declared_features(&headers)
-        .iter()
-        .any(|feature| feature == crate::knowledge::TASK_KNOWLEDGE_FEATURE)
+    );
+    if task_knowledge_command
+        && !declared_features(&headers)
+            .iter()
+            .any(|feature| feature == crate::knowledge::TASK_KNOWLEDGE_FEATURE)
     {
         return (
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error":"Reload the dashboard to prepare task knowledge."})),
+            Json(serde_json::json!({
+                "error":"Reload the dashboard to prepare task knowledge.",
+                "operation_id":command.operation_id(),
+                "outcome_unknown":false
+            })),
         )
             .into_response();
     }
@@ -1741,6 +1802,13 @@ async fn api_command_with_executor(
         Ok(response) => response,
         Err(error) => {
             let outcome_unknown = matches!(error, BlockingWorkError::Interrupted(_));
+            if task_knowledge_command {
+                return knowledge_mutation_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &operation_id,
+                    outcome_unknown,
+                );
+            }
             let message = if outcome_unknown {
                 "The request outcome is unknown. Refresh and check before retrying."
             } else {
@@ -1757,11 +1825,68 @@ async fn api_diagnostics(State(state): State<WebState>, headers: HeaderMap) -> R
     if let Err(response) = require_browser(&state, &headers) {
         return response;
     }
-    match state.app.diagnostics.read_sanitized(500) {
-        Ok(events) => Json(serde_json::json!({"events":events})).into_response(),
-        Err(error) => (
+    let permits = Arc::clone(&state.app.blocking_operations);
+    match admitted_blocking_work(permits, move || {
+        state
+            .app
+            .diagnostics
+            .read_sanitized(500)
+            .map(|events| Json(serde_json::json!({"events":events})).into_response())
+    })
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error":format!("{error:#}")})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":"Diagnostics could not be read. Try again."})),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_diagnostics_runtime_bindings(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = require_browser(&state, &headers) {
+        return response;
+    }
+    let permits = Arc::clone(&state.app.blocking_operations);
+    match admitted_blocking_work(permits, move || -> Result<_> {
+        let app = state.app;
+        let runtime = crate::trip::CapabilityRuntime::from_store(
+            &app.store,
+            app.hooks.clone(),
+            app.paths.role_socket.clone(),
+            app.executable_path().to_owned(),
+        );
+        #[derive(Serialize)]
+        struct RuntimeBindings {
+            bindings: Vec<crate::trip::DiagnosticsRuntimeBinding>,
+        }
+        let bindings = crate::trip::diagnostics_runtime_bindings(&app.store, &runtime)?;
+        let body = serde_json::to_vec(&RuntimeBindings { bindings })?;
+        if body.len() > MAX_RUNTIME_BINDINGS_RESPONSE_BYTES {
+            bail!("Runtime bindings exceed the diagnostics response size limit");
+        }
+        Ok(body)
+    })
+    .await
+    {
+        Ok(Ok(body)) => ([(header::CONTENT_TYPE, "application/json")], body).into_response(),
+        Ok(Err(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":format!("{error:#}")})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":"Runtime bindings could not be read. Try again."})),
         )
             .into_response(),
     }
@@ -1776,7 +1901,8 @@ fn require_knowledge(state: &WebState, headers: &HeaderMap) -> Result<(), Respon
         return Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({
-                "error":"Reload the dashboard to use project knowledge."
+                "error":"Reload the dashboard to use project knowledge.",
+                "outcome_unknown":false
             })),
         )
             .into_response());
@@ -1841,6 +1967,13 @@ enum KnowledgeCommand {
     },
 }
 
+#[derive(Serialize)]
+struct KnowledgeCommandResult<'a, T> {
+    operation_id: &'a str,
+    #[serde(flatten)]
+    result: T,
+}
+
 async fn knowledge_body<T: serde::de::DeserializeOwned>(
     state: &WebState,
     request: Request,
@@ -1852,54 +1985,98 @@ async fn knowledge_body<T: serde::de::DeserializeOwned>(
         .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, Json(serde_json::json!({
             "error":"Shorten the input or select fewer entries; knowledge requests allow at most 32 KiB."
         }))).into_response())?;
-    serde_json::from_slice(&body).map_err(|error| {
+    serde_json::from_slice(&body).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error":format!("Review the knowledge request and try again. {error}")
+                "error":"Review the knowledge request and try again."
             })),
         )
             .into_response()
     })
 }
 
-async fn knowledge_work(
+fn knowledge_mutation_error(
+    status: StatusCode,
+    operation_id: &str,
+    outcome_unknown: bool,
+) -> Response {
+    let error = if outcome_unknown {
+        "The knowledge request outcome is unavailable. Refresh and check its outcome before retrying."
+    } else if status == StatusCode::SERVICE_UNAVAILABLE {
+        "The knowledge request was not started. Try again when the service can accept work."
+    } else {
+        "The knowledge request was refused. Refresh and review the exact knowledge selection before saving again."
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "error":error, "operation_id":operation_id, "outcome_unknown":outcome_unknown
+        })),
+    )
+        .into_response()
+}
+
+async fn knowledge_work<T: Serialize>(
     state: WebState,
     limit: usize,
-    work: impl FnOnce(&Store) -> Result<serde_json::Value> + Send + 'static,
+    operation_id: Option<String>,
+    work: impl FnOnce(&Store) -> Result<T> + Send + 'static,
 ) -> Response {
-    let permit = match Arc::clone(&state.app.blocking_operations)
-        .acquire_owned()
-        .await
-    {
-        Ok(permit) => permit,
-        Err(_) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Refresh and try again when the service is available",
-            )
-                .into_response()
-        }
-    };
-    let result = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let value = work(&state.app.store)?;
-        if serde_json::to_vec(&value)?.len() > limit {
-            bail!(
+    knowledge_response_work(state, limit, operation_id, move |store| {
+        let value = work(store).map_err(|error| (error, false))?;
+        serde_json::to_vec(&value).map_err(|error| (error.into(), true))
+    })
+    .await
+}
+
+async fn knowledge_response_work(
+    state: WebState,
+    limit: usize,
+    operation_id: Option<String>,
+    work: impl FnOnce(&Store) -> Result<Vec<u8>, (anyhow::Error, bool)> + Send + 'static,
+) -> Response {
+    let permits = Arc::clone(&state.app.blocking_operations);
+    let result = admitted_blocking_work(permits, move || {
+        let bytes = work(&state.app.store)?;
+        if bytes.len() > limit {
+            return Err((
+                anyhow::anyhow!(
                 "The knowledge response is too large; narrow the search or open one exact revision"
-            )
+            ),
+                true,
+            ));
         }
-        Ok::<_, anyhow::Error>(value)
+        Ok(bytes)
     })
     .await;
-    match result {
-        Ok(Ok(value)) => Json(value).into_response(),
-        Ok(Err(error)) => (StatusCode::CONFLICT, Json(serde_json::json!({
+    match (result, operation_id.as_deref()) {
+        (Ok(Ok(bytes)), _) => ([(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
+        (Ok(Err((error, after_work))), Some(id)) => {
+            // Validation and ownership errors precede commit. A failed commit or
+            // unreadable receipt can leave the exact operation unconfirmed.
+            let outcome_unknown = after_work || error.is::<serde_json::Error>()
+                || matches!(error.downcast_ref::<rusqlite::Error>(), Some(sqlite)
+                    if !matches!(sqlite, rusqlite::Error::QueryReturnedNoRows));
+            knowledge_mutation_error(StatusCode::CONFLICT, id, outcome_unknown)
+        }
+        (Ok(Err((error, _))), None) => (StatusCode::CONFLICT, Json(serde_json::json!({
             "error":format!("Review the project knowledge selection, refresh its preview and try again. {error:#}")
         }))).into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error":format!("The knowledge request outcome is unavailable. Refresh and check its outcome before retrying. {error}")
-        }))).into_response(),
+        (Err(BlockingWorkError::Admission), Some(id)) => {
+            knowledge_mutation_error(StatusCode::SERVICE_UNAVAILABLE, id, false)
+        }
+        (Err(BlockingWorkError::Interrupted(_)), Some(id)) => {
+            knowledge_mutation_error(StatusCode::INTERNAL_SERVER_ERROR, id, true)
+        }
+        (Err(BlockingWorkError::Admission), None) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Refresh and try again when the service is available",
+        ).into_response(),
+        (Err(BlockingWorkError::Interrupted(_)), None) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":"The knowledge read was interrupted. Refresh and try again."})),
+        ).into_response(),
     }
 }
 
@@ -1912,6 +2089,7 @@ async fn api_knowledge_preview(State(state): State<WebState>, request: Request) 
     knowledge_work(
         state,
         crate::knowledge::PREVIEW_RESPONSE_BYTES,
+        None,
         move |store| Ok(serde_json::to_value(store.knowledge_preview(&request)?)?),
     )
     .await
@@ -1929,54 +2107,79 @@ async fn api_knowledge_read(State(state): State<WebState>, request: Request) -> 
         }
         _ => crate::knowledge::PREVIEW_RESPONSE_BYTES,
     };
-    knowledge_work(state, limit, move |store| {
-        let project = &request.project_id;
-        Ok(match request.read {
-            KnowledgeRead::Search { search } => {
-                serde_json::to_value(store.knowledge_search(project, &search)?)?
-            }
-            KnowledgeRead::Entry { entry_id } => {
-                serde_json::to_value(store.knowledge_entry(project, &entry_id)?)?
-            }
-            KnowledgeRead::Revision {
-                entry_id,
-                revision_id,
-            } => {
-                serde_json::to_value(store.knowledge_revision(project, &entry_id, &revision_id)?)?
-            }
-            KnowledgeRead::Source {
-                entry_id,
-                revision_id,
-                index,
-            } => serde_json::to_value(store.knowledge_source(
-                project,
-                &entry_id,
-                &revision_id,
-                index,
-            )?)?,
-            KnowledgeRead::History {
-                entry_id,
-                after_version,
-            } => {
-                serde_json::to_value(store.knowledge_history(project, &entry_id, after_version)?)?
-            }
-            KnowledgeRead::Freshness {
-                entry_id,
-                revision_id,
-            } => serde_json::to_value(store.knowledge_freshness(
-                project,
-                &entry_id,
-                &revision_id,
-            )?)?,
-            KnowledgeRead::Manifest { manifest_id } => {
-                serde_json::to_value(store.knowledge_manifest(project, &manifest_id)?)?
-            }
-            KnowledgeRead::ConversationConsumer { conversation_id } => {
-                store.knowledge_conversation_consumer(project, &conversation_id)?
-            }
-        })
+    knowledge_response_work(state, limit, None, move |store| {
+        knowledge_read_bytes(store, &request.project_id, request.read, limit)
+            .map_err(|error| (error, false))
     })
     .await
+}
+
+fn knowledge_read_bytes(
+    store: &Store,
+    project: &str,
+    read: KnowledgeRead,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    Ok(match read {
+        KnowledgeRead::Search { search } => {
+            serde_json::to_vec(&store.knowledge_search(project, &search)?)?
+        }
+        KnowledgeRead::Entry { entry_id } => {
+            serde_json::to_vec(&store.knowledge_entry(project, &entry_id)?)?
+        }
+        KnowledgeRead::Revision {
+            entry_id,
+            revision_id,
+        } => serde_json::to_vec(&store.knowledge_revision(project, &entry_id, &revision_id)?)?,
+        KnowledgeRead::Source {
+            entry_id,
+            revision_id,
+            index,
+        } => {
+            serde_json::to_vec(&store.knowledge_source(project, &entry_id, &revision_id, index)?)?
+        }
+        KnowledgeRead::History {
+            entry_id,
+            after_version,
+        } => serde_json::to_vec(&store.knowledge_history(project, &entry_id, after_version)?)?,
+        KnowledgeRead::Freshness {
+            entry_id,
+            revision_id,
+        } => bounded_freshness(
+            store.knowledge_freshness(project, &entry_id, &revision_id)?,
+            limit,
+        )?,
+        KnowledgeRead::Manifest { manifest_id } => {
+            serde_json::to_vec(&store.knowledge_manifest(project, &manifest_id)?)?
+        }
+        KnowledgeRead::ConversationConsumer { conversation_id } => {
+            serde_json::to_vec(&store.knowledge_conversation_consumer(project, &conversation_id)?)?
+        }
+    })
+}
+
+fn bounded_freshness(
+    mut observation: KnowledgeObservation,
+    limit: usize,
+) -> serde_json::Result<Vec<u8>> {
+    let full = serde_json::to_vec(&observation)?;
+    if full.len() <= limit || observation.sources.is_empty() {
+        return Ok(full);
+    }
+    drop(full);
+    let sources_omitted = observation.sources.len();
+    // The fingerprint still identifies the complete observation.
+    observation.sources.clear();
+    #[derive(Serialize)]
+    struct CompactFreshness {
+        #[serde(flatten)]
+        observation: KnowledgeObservation,
+        sources_omitted: usize,
+    }
+    serde_json::to_vec(&CompactFreshness {
+        observation,
+        sources_omitted,
+    })
 }
 
 async fn api_knowledge_command(State(state): State<WebState>, request: Request) -> Response {
@@ -1988,31 +2191,68 @@ async fn api_knowledge_command(State(state): State<WebState>, request: Request) 
     let actor = crate::domain::KnowledgeUserActor {
         user_id: "human_control".into(),
     };
-    knowledge_work(
+    let operation_id = match &request {
+        KnowledgeCommand::Mutate { request } => request.operation_id.clone(),
+        KnowledgeCommand::Revalidate { operation_id, .. } => operation_id.clone(),
+    };
+    knowledge_response_work(
         state,
         crate::knowledge::PREVIEW_RESPONSE_BYTES,
-        move |store| {
-            Ok(match request {
-                KnowledgeCommand::Mutate { request } => {
-                    serde_json::to_value(store.knowledge_mutate(&actor, &request)?)?
+        Some(operation_id),
+        move |store| match request {
+            KnowledgeCommand::Mutate { request } => {
+                let entry = store
+                    .knowledge_mutate(&actor, &request)
+                    .map_err(|error| (error, false))?;
+                serde_json::to_vec(&KnowledgeCommandResult {
+                    operation_id: &request.operation_id,
+                    result: entry,
+                })
+                .map_err(|error| (error.into(), true))
+            }
+            KnowledgeCommand::Revalidate {
+                project_id,
+                operation_id,
+                entry_id,
+                revision_id,
+                expected_version,
+                expected_observation,
+            } => {
+                let observation = store
+                    .knowledge_revalidate(
+                        &actor,
+                        &project_id,
+                        &operation_id,
+                        &entry_id,
+                        &revision_id,
+                        expected_version,
+                        &expected_observation,
+                    )
+                    .map_err(|error| (error, false))?;
+                if observation.revision_id != revision_id {
+                    return Err((
+                        anyhow!("The committed observation does not match the requested revision"),
+                        true,
+                    ));
                 }
-                KnowledgeCommand::Revalidate {
-                    project_id,
-                    operation_id,
-                    entry_id,
-                    revision_id,
-                    expected_version,
-                    expected_observation,
-                } => serde_json::to_value(store.knowledge_revalidate(
-                    &actor,
-                    &project_id,
-                    &operation_id,
-                    &entry_id,
-                    &revision_id,
-                    expected_version,
-                    &expected_observation,
-                )?)?,
-            })
+                let full = serde_json::to_vec(&KnowledgeCommandResult {
+                    operation_id: &operation_id,
+                    result: &observation,
+                })
+                .map_err(|error| (error.into(), true))?;
+                if full.len() <= crate::knowledge::PREVIEW_RESPONSE_BYTES {
+                    return Ok(full);
+                }
+                serde_json::to_vec(&serde_json::json!({
+                    "kind":"revalidation_confirmed",
+                    "operation_id":operation_id,
+                    "project_id":project_id,
+                    "entry_id":entry_id,
+                    "revision_id":observation.revision_id,
+                    "fingerprint":observation.fingerprint,
+                }))
+                .map_err(|error| (error.into(), true))
+            }
         },
     )
     .await
@@ -2052,17 +2292,27 @@ async fn api_operation(
             return response;
         }
     }
+    let checked_operation_id = operation.checked_operation_id().map(str::to_owned);
     let permit = match Arc::clone(&state.app.blocking_operations)
         .acquire_owned()
         .await
     {
         Ok(permit) => permit,
         Err(_) => {
+            if let Some(id) = checked_operation_id.as_deref() {
+                return checked_operation_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    id,
+                    false,
+                    false,
+                    "The request was not started. Try again after refreshing.",
+                );
+            }
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"error":"blocking operation admission is unavailable"})),
             )
-                .into_response()
+                .into_response();
         }
     };
     let blocking_state = state.clone();
@@ -2107,34 +2357,52 @@ async fn api_operation(
                 attempt_id,
                 role,
                 fresh_resume_rejection,
-            } => Ok(serde_json::to_value(
-                state.app.dispatch_trip_setup_role_with_operation(
+            } => {
+                let result = state
+                    .app
+                    .dispatch_trip_setup_role_with_operation(
+                        &operation_id,
+                        &attempt_id,
+                        role,
+                        fresh_resume_rejection.as_ref(),
+                    )?;
+                checked_launch_result(
+                    &result,
                     &operation_id,
-                    &attempt_id,
-                    role,
-                    fresh_resume_rejection.as_ref(),
-                )?,
-            )?),
+                    None,
+                    result.attempt_id == attempt_id && result.launch.role == role,
+                )
+            }
             WebOperation::RuntimeProbeLaunch {
                 operation_id,
                 admission_id,
                 role,
-            } => Ok(serde_json::to_value(state.app.dispatch_runtime_probe(
-                &operation_id,
-                &admission_id,
-                role,
-            )?)?),
+            } => {
+                let result = state
+                    .app
+                    .dispatch_runtime_probe(&operation_id, &admission_id, role)?;
+                checked_launch_result(
+                    &result,
+                    &operation_id,
+                    Some(&admission_id),
+                    result.launch.role == role,
+                )
+            }
             WebOperation::RuntimeProbeResume {
                 operation_id,
                 admission_id,
                 role,
-            } => Ok(serde_json::to_value(
-                state.app.resume_runtime_probe_with_operation(
+            } => {
+                let result = state
+                    .app
+                    .resume_runtime_probe_with_operation(&operation_id, &admission_id, role)?;
+                checked_launch_result(
+                    &result,
                     &operation_id,
-                    &admission_id,
-                    role,
-                )?,
-            )?),
+                    Some(&admission_id),
+                    result.launch.role == role,
+                )
+            }
             WebOperation::GuidanceDeliver { guidance_id } => {
                 state.app.roles.deliver_guidance(&guidance_id)
             }
@@ -2156,13 +2424,17 @@ async fn api_operation(
                 operation_id,
                 session_id,
                 prompt,
-            } => Ok(serde_json::to_value(
-                state.app.resume_role_session_with_operation(
+            } => {
+                let result = state
+                    .app
+                    .resume_role_session_with_operation(&operation_id, &session_id, &prompt)?;
+                checked_launch_result(
+                    &result,
                     &operation_id,
-                    &session_id,
-                    &prompt,
-                )?,
-            )?),
+                    None,
+                    result.session_id == session_id,
+                )
+            }
             WebOperation::RestartResume {
                 operation_id,
                 session_ids,
@@ -2373,20 +2645,60 @@ async fn api_operation(
         }
     })
     .await;
-    web_operation_response(&state, result)
+    web_operation_response(&state, checked_operation_id.as_deref(), result)
+}
+
+fn checked_launch_result(
+    result: &crate::domain::ValidationLaunchResult,
+    operation_id: &str,
+    admission_id: Option<&str>,
+    target_matches: bool,
+) -> Result<serde_json::Value> {
+    if !target_matches {
+        return Err(crate::trip::outcome_unknown(anyhow!(
+            "The launch result does not match the requested target"
+        )));
+    }
+    // The operation owner verifies the request before returning a successful
+    // launch or replay. These fields belong to HTTP, outside the stored result.
+    #[derive(Serialize)]
+    struct BoundLaunch<'a> {
+        #[serde(flatten)]
+        launch: &'a crate::domain::ValidationLaunchResult,
+        operation_id: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        admission_id: Option<&'a str>,
+    }
+    serde_json::to_value(BoundLaunch {
+        launch: result,
+        operation_id,
+        admission_id,
+    })
+    .map_err(|error| crate::trip::outcome_unknown(error.into()))
 }
 
 fn web_operation_response(
     state: &WebState,
+    checked_operation_id: Option<&str>,
     result: std::result::Result<Result<serde_json::Value>, tokio::task::JoinError>,
 ) -> Response {
     let result = match result {
         Ok(result) => result,
         Err(error) => {
+            let message = format!("The request may already have been applied. Refresh and check before retrying. Operation worker interrupted: {error}");
+            if let Some(id) = checked_operation_id {
+                return checked_operation_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    id,
+                    true,
+                    false,
+                    &message,
+                );
+            }
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
-                    "error": format!("The request may already have been applied. Refresh and check before retrying. Operation worker interrupted: {error}"),
+                    "error": message,
                     "outcome_unknown": true,
                 })),
             )
@@ -2404,13 +2716,45 @@ fn web_operation_response(
                 None,
                 serde_json::json!({"cause":format!("{error:#}")}),
             );
-            (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error":format!("{error:#}")})),
-            )
-                .into_response()
+            if let Some(id) = checked_operation_id {
+                let refusal = error.downcast_ref::<crate::operations::CheckedOperationRefused>();
+                let refused = refusal.is_some();
+                let message = if refused || error.is::<crate::trip::TripOutcomeUnknown>() {
+                    format!("{error:#}")
+                } else {
+                    format!("The request outcome could not be confirmed. Refresh and check before retrying. Technical details: {error:#}")
+                };
+                return checked_operation_error_response(
+                    StatusCode::CONFLICT,
+                    id,
+                    !refused,
+                    refusal.is_some_and(|refusal| refusal.confirms_terminal_refusal(id)),
+                    &message,
+                );
+            }
+            let mut body = serde_json::json!({"error":format!("{error:#}")});
+            if error.is::<crate::trip::TripOutcomeUnknown>() {
+                body["outcome_unknown"] = serde_json::Value::Bool(true);
+            }
+            (StatusCode::CONFLICT, Json(body)).into_response()
         }
     }
+}
+
+fn checked_operation_error_response(
+    status: StatusCode,
+    operation_id: &str,
+    outcome_unknown: bool,
+    terminal_refusal: bool,
+    message: &str,
+) -> Response {
+    let mut body = serde_json::json!({
+        "error":message, "operation_id":operation_id, "outcome_unknown":outcome_unknown
+    });
+    if terminal_refusal {
+        body["terminal_refusal"] = serde_json::Value::Bool(true);
+    }
+    (status, Json(body)).into_response()
 }
 
 fn require_browser(state: &WebState, headers: &HeaderMap) -> std::result::Result<(), Response> {
@@ -2936,6 +3280,44 @@ mod web_operation_tests {
         (root, app, target, other)
     }
 
+    fn server_test_repository(
+        root: &std::path::Path,
+        files: usize,
+    ) -> crate::workspace::RepositoryInfo {
+        let path = root.join("fixture-repository");
+        std::fs::create_dir(&path).unwrap();
+        for index in 0..files {
+            std::fs::write(
+                path.join(format!("file-{index}")),
+                "Exact source evidence\n",
+            )
+            .unwrap();
+        }
+        for arguments in [
+            "init -q",
+            "add -- .",
+            "-c user.name=Fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -qm fixture",
+        ] {
+            let mut command = std::process::Command::new("git");
+            command.current_dir(&path).args(arguments.split_whitespace());
+            for variable in [
+                "GIT_AUTHOR_NAME",
+                "GIT_AUTHOR_EMAIL",
+                "GIT_COMMITTER_NAME",
+                "GIT_COMMITTER_EMAIL",
+            ] {
+                command.env_remove(variable);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        crate::workspace::inspect(&path).unwrap()
+    }
+
     fn seed_binding(
         app: &Application,
         role: &str,
@@ -3046,6 +3428,604 @@ mod web_operation_tests {
             HeaderValue::from_str(&format!("{}={browser_secret}", state.session_cookie)).unwrap(),
         );
         (state, headers, shutdown_tx)
+    }
+
+    async fn knowledge_response_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(
+            response.into_body(),
+            crate::knowledge::PREVIEW_RESPONSE_BYTES,
+        )
+        .await
+        .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn checked_project_setup_launch_replays_historical_receipts_with_http_bindings() {
+        use crate::domain::{CapabilityStatus, LaunchConfig, Provider, ValidationLaunchResult};
+        use crate::store::{json_hash, reserve_browser_launch_receipt_in, BrowserLaunchReceipt};
+        use serde_json::json;
+
+        let (root, app, setup_session, _) = server_test_application();
+        let ordinary_session = seed_binding(&app, "manager", 3, "ordinary-resume");
+        let probe_a = seed_binding(&app, "manager", 4, "runtime-probe-a");
+        let probe_b = seed_binding(&app, "manager", 5, "runtime-probe-b");
+        let pending_probe = seed_binding(&app, "manager", 6, "runtime-pending");
+        let legacy_probe = seed_binding(&app, "manager", 7, "runtime-legacy");
+        let (state, headers, _shutdown) = browser_state(app);
+        let launch = LaunchConfig {
+            provider: Provider::Codex,
+            role: RoleKind::Manager,
+            executable: "/usr/bin/true".into(),
+            executable_version: "fixture".into(),
+            model: "fixture".into(),
+            effort: "high".into(),
+            cwd: root.clone(),
+            argv: vec![],
+            environment_keys: vec![],
+            permission_policy: "fixture".into(),
+            security_policy: json!({}),
+            hook_revision: "fixture".into(),
+            capability_status: CapabilityStatus::Supported,
+            compatibility: None,
+        };
+        let send = |request: serde_json::Value, headers: HeaderMap| {
+            api_operation(
+                State(state.clone()),
+                headers,
+                Json(serde_json::from_value(request).unwrap()),
+            )
+        };
+        let reserve = |operation_id: &str, kind: &str, target: &str, hash: &str, authority| {
+            let mut connection = state.app.store.lock().unwrap();
+            let tx = connection.transaction().unwrap();
+            reserve_browser_launch_receipt_in(
+                &tx,
+                BrowserLaunchReceipt {
+                    operation_id,
+                    operation_kind: kind,
+                    input_hash: hash,
+                    entity_id: target,
+                },
+                authority,
+                "2026-01-01T00:00:00Z",
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        };
+        let runtime_authority = |session: &AttachmentBinding| {
+            json!({
+                "attempt_id":"attempt", "task_id":"task", "role":"manager",
+                "settings_revision":1, "permit_id":format!("permit-{}", session.session_id),
+                "setup_permit_id":format!("setup-permit-{}", session.session_id),
+                "validation_dispatch":true, "validation_cell":"trip_runtime_probe",
+                "switch_intent_id":null, "lane_id":"default", "phase":"planning",
+                "attempt_status":"running", "lifecycle":"validation", "attention":"none",
+                "capability_key":"fixture", "launch":launch,
+            })
+        };
+        // Use the production receipt writers to exercise replay with no provider.
+        for (kind, operation_id, target, admission, mut input, status, session) in [
+            (
+                "trip_setup_dispatch",
+                "dispatch-op",
+                "attempt",
+                None,
+                json!({"attempt_id":"attempt","role":"manager","fresh_resume_rejection":null}),
+                "running",
+                &setup_session,
+            ),
+            (
+                "role_resume",
+                "setup-resume-op",
+                setup_session.session_id.as_str(),
+                None,
+                json!({"session_id":setup_session.session_id,"prompt":""}),
+                "running_resumed_unverified",
+                &setup_session,
+            ),
+            (
+                "role_resume",
+                "ordinary-resume-op",
+                ordinary_session.session_id.as_str(),
+                None,
+                json!({"session_id":ordinary_session.session_id,"prompt":"retained prompt"}),
+                "running_resumed",
+                &ordinary_session,
+            ),
+            (
+                "runtime_probe_launch",
+                "runtime-launch-a",
+                "admission-a",
+                Some("admission-a"),
+                json!({"admission_id":"admission-a","role":"manager"}),
+                "running",
+                &probe_a,
+            ),
+            (
+                "runtime_probe_launch",
+                "runtime-launch-b",
+                "admission-b",
+                Some("admission-b"),
+                json!({"admission_id":"admission-b","role":"manager"}),
+                "running",
+                &probe_b,
+            ),
+            (
+                "runtime_probe_resume",
+                "runtime-resume-a",
+                "admission-a",
+                Some("admission-a"),
+                json!({"admission_id":"admission-a","role":"manager"}),
+                "running_resumed_unverified",
+                &probe_a,
+            ),
+            (
+                "runtime_probe_resume",
+                "runtime-resume-b",
+                "admission-b",
+                Some("admission-b"),
+                json!({"admission_id":"admission-b","role":"manager"}),
+                "running_resumed_unverified",
+                &probe_b,
+            ),
+        ] {
+            let hash = json_hash(&input).unwrap();
+            let historical = serde_json::to_value(ValidationLaunchResult {
+                session_id: session.session_id.clone(),
+                task_id: "task".into(),
+                attempt_id: "attempt".into(),
+                role_generation_id: session.role_generation_id.clone(),
+                launch: launch.clone(),
+                process: session.process.clone(),
+                status: status.into(),
+            })
+            .unwrap();
+            let authority = if kind == "runtime_probe_launch" {
+                runtime_authority(session)
+            } else {
+                json!({"session_id":session.session_id,"role_generation_id":session.role_generation_id})
+            };
+            reserve(operation_id, kind, target, &hash, authority);
+            state
+                .app
+                .store
+                .finalize_browser_launch_receipt(
+                    operation_id,
+                    kind,
+                    &hash,
+                    Some(historical.clone()),
+                    None,
+                )
+                .unwrap();
+            input["kind"] = kind.into();
+            input["operation_id"] = operation_id.into();
+            let mut anonymous = headers.clone();
+            anonymous.remove(header::COOKIE);
+            assert_eq!(
+                send(input.clone(), anonymous).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+            for _ in 0..2 {
+                let response = send(input.clone(), headers.clone()).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let mut result = knowledge_response_json(response).await["result"].clone();
+                assert_eq!(
+                    result.as_object_mut().unwrap().remove("operation_id"),
+                    Some(json!(operation_id))
+                );
+                assert_eq!(
+                    result.as_object_mut().unwrap().remove("admission_id"),
+                    admission.map(|id| json!(id))
+                );
+                assert_eq!(result, historical);
+            }
+            if kind == "runtime_probe_launch" {
+                let mut changed_role = input.clone();
+                changed_role["role"] = "explorer".into();
+                let response = send(changed_role, headers.clone()).await;
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                let refusal = knowledge_response_json(response).await;
+                assert!(refusal["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("different input"));
+                assert_eq!(refusal["operation_id"], operation_id);
+                assert_eq!(refusal["outcome_unknown"], true);
+            }
+            let field = match kind {
+                "trip_setup_dispatch" => "attempt_id",
+                "role_resume" => "session_id",
+                _ => "admission_id",
+            };
+            input[field] = match (kind, target) {
+                ("runtime_probe_launch", "admission-a") => "admission-b",
+                ("runtime_probe_launch", "admission-b") => "admission-a",
+                _ => "different-target",
+            }
+            .into();
+            let response = send(input, headers.clone()).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let refusal = knowledge_response_json(response).await;
+            assert!(refusal["error"]
+                .as_str()
+                .unwrap()
+                .contains("different input"));
+            assert!(refusal.get("result").is_none());
+            assert_eq!(refusal["operation_id"], operation_id);
+            assert_eq!(
+                state
+                    .app
+                    .store
+                    .browser_launch_receipt(operation_id, kind, &hash)
+                    .unwrap(),
+                Some(historical)
+            );
+        }
+
+        let pending_input = json!({"admission_id":"admission-pending","role":"manager"});
+        let pending_hash = json_hash(&pending_input).unwrap();
+        reserve(
+            "runtime-pending",
+            "runtime_probe_launch",
+            "admission-pending",
+            &pending_hash,
+            runtime_authority(&pending_probe),
+        );
+        let mut pending = pending_input;
+        pending["kind"] = "runtime_probe_launch".into();
+        pending["operation_id"] = "runtime-pending".into();
+        let (first, second) = tokio::join!(
+            send(pending.clone(), headers.clone()),
+            send(pending.clone(), headers.clone()),
+        );
+        for response in [first, second] {
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = knowledge_response_json(response).await;
+            assert_eq!(body["operation_id"], "runtime-pending");
+            assert_eq!(body["outcome_unknown"], true);
+            assert!(body.get("terminal_refusal").is_none());
+            assert!(body.get("result").is_none());
+        }
+        pending["role"] = "explorer".into();
+        let response = send(pending, headers.clone()).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let refusal = knowledge_response_json(response).await;
+        assert!(refusal["error"]
+            .as_str()
+            .unwrap()
+            .contains("different input"));
+        assert_eq!(refusal["operation_id"], "runtime-pending");
+        assert_eq!(refusal["outcome_unknown"], true);
+        let reopened = Store::open(&state.app.paths.database).unwrap();
+        let pending_receipt = reopened
+            .browser_launch_receipt("runtime-pending", "runtime_probe_launch", &pending_hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending_receipt["state"], "reserved");
+        let restarted = Application::new(
+            state.app.paths.clone(),
+            reopened,
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        assert!(restarted
+            .dispatch_runtime_probe("runtime-pending", "admission-pending", RoleKind::Manager)
+            .unwrap_err()
+            .is::<crate::trip::TripOutcomeUnknown>());
+        let replayed = restarted
+            .dispatch_runtime_probe("runtime-launch-a", "admission-a", RoleKind::Manager)
+            .unwrap();
+        assert_eq!(replayed.session_id, probe_a.session_id);
+
+        {
+            let connection = state.app.store.lock().unwrap();
+            connection.execute(
+                "UPDATE sessions SET launch_state='started', validation_cell='trip_runtime_probe'
+                 WHERE id=?1",
+                [&legacy_probe.session_id],
+            ).unwrap();
+            connection.execute_batch(
+                "INSERT INTO trip_config_revisions(id,project_id,revision,state,config_json,adapters_json,
+                   preflight_json,verification_json,source_hash,overlay_hash,configuration_hash,created_at)
+                 VALUES('legacy-config','project',1,'active','{}','{}','{}','{}','source','overlay','config','now');
+                 INSERT INTO trip_runtime_admissions(id,project_id,task_id,scope_hash,state,fresh_call_count,created_at,updated_at)
+                 VALUES('admission-legacy','project','task','scope','authorized',1,'now','now');",
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO trip_runtime_probes(admission_id,role,settings_revision,launch_config_json,
+                   profile_json,profile_hash,project_config_revision_id,project_configuration_hash,adapter_name,
+                   adapter_hash,capability_key,capability_identity_json,fixture_project_id,fixture_repository_identity,
+                   fixture_root,attempt_id,nonce,state,session_id,created_at,updated_at)
+                 VALUES('admission-legacy','manager',1,?1,'{}','profile','legacy-config','config','codex',
+                   'adapter','fixture','{}','project','server-boundary-project',?2,'attempt','nonce','authorized',?3,'now','now')",
+                params![serde_json::to_string(&launch).unwrap(), root.to_string_lossy(), legacy_probe.session_id],
+            ).unwrap();
+        }
+        let legacy = json!({
+            "kind":"runtime_probe_launch","operation_id":"legacy-launch",
+            "admission_id":"admission-legacy","role":"manager"
+        });
+        let response = send(legacy.clone(), headers.clone()).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            knowledge_response_json(response).await["outcome_unknown"],
+            true
+        );
+        {
+            let connection = state.app.store.lock().unwrap();
+            connection.execute_batch(
+                "UPDATE trip_runtime_probes SET state='running' WHERE admission_id='admission-legacy';
+                 UPDATE trip_runtime_admissions SET state='running' WHERE id='admission-legacy';",
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+                 VALUES('legacy-launch-audit','legacy-launch','human','runtime_probe.launch','runtime_admission','admission-legacy',?1,'2026-01-01T00:00:00Z')",
+                [json!({"role":"manager","session_id":legacy_probe.session_id,"attempt_id":"attempt"}).to_string()],
+            ).unwrap();
+        }
+        let mut wrong_legacy = legacy.clone();
+        wrong_legacy["admission_id"] = "admission-b".into();
+        let response = send(wrong_legacy, headers.clone()).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(knowledge_response_json(response).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("different input"));
+        let response = send(legacy, headers.clone()).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = knowledge_response_json(response).await;
+        assert_eq!(body["outcome_unknown"], true);
+        assert!(body.get("result").is_none());
+
+        let unadmitted = json!({
+            "kind":"runtime_probe_launch","operation_id":"unadmitted-op",
+            "admission_id":"missing-admission","role":"manager"
+        });
+        let hash =
+            json_hash(&json!({"admission_id":"missing-admission","role":"manager"})).unwrap();
+        let load_refusal = || {
+            state
+                .app
+                .store
+                .browser_launch_receipt("unadmitted-op", "runtime_probe_launch", &hash)
+                .unwrap()
+                .unwrap()
+        };
+        let mut saved = None;
+        for _ in 0..2 {
+            let response = send(unadmitted.clone(), headers.clone()).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let refusal = knowledge_response_json(response).await;
+            assert!(refusal["error"]
+                .as_str()
+                .unwrap()
+                .contains("not explicitly authorized"));
+            assert_eq!(refusal["operation_id"], "unadmitted-op");
+            assert_eq!(refusal["outcome_unknown"], false);
+            assert_eq!(refusal["terminal_refusal"], true);
+            let receipt = load_refusal();
+            assert_eq!(receipt["state"], "rejected");
+            assert_eq!(*saved.get_or_insert_with(|| receipt.clone()), receipt);
+        }
+        let mut anonymous = headers.clone();
+        anonymous.remove(header::COOKIE);
+        assert_eq!(
+            send(unadmitted.clone(), anonymous).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut changed = unadmitted.clone();
+        changed["admission_id"] = "admission-a".into();
+        let response = send(changed, headers.clone()).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let mismatch = knowledge_response_json(response).await;
+        assert_eq!(mismatch["operation_id"], "unadmitted-op");
+        assert_eq!(mismatch["outcome_unknown"], true);
+        assert!(mismatch.get("terminal_refusal").is_none());
+        assert!(mismatch["error"]
+            .as_str()
+            .unwrap()
+            .contains("different input"));
+
+        let setup_input = json!({
+            "attempt_id":"missing-attempt","role":"manager","fresh_resume_rejection":null
+        });
+        let mut setup = setup_input.clone();
+        setup["kind"] = "trip_setup_dispatch".into();
+        setup["operation_id"] = "setup-refused".into();
+        for _ in 0..2 {
+            let response = send(setup.clone(), headers.clone()).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = knowledge_response_json(response).await;
+            assert_eq!(body["operation_id"], "setup-refused");
+            assert_eq!(body["outcome_unknown"], false);
+            assert_eq!(body["terminal_refusal"], true);
+            assert!(body["error"]
+                .as_str()
+                .unwrap()
+                .contains("no issued typed permit"));
+        }
+        state
+            .app
+            .store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_setup_receipt BEFORE INSERT ON operation_receipts
+             WHEN NEW.operation_id='setup-store-error'
+             BEGIN SELECT RAISE(ABORT,'fixture receipt write failed'); END;",
+            )
+            .unwrap();
+        setup["operation_id"] = "setup-store-error".into();
+        let response = send(setup.clone(), headers.clone()).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = knowledge_response_json(response).await;
+        assert_eq!(body["operation_id"], "setup-store-error");
+        assert_eq!(body["outcome_unknown"], true);
+        assert!(body.get("terminal_refusal").is_none());
+
+        // A historical rejection written after reservation does not prove
+        // nondelivery. It must keep the same request recoverable.
+        let hash = json_hash(&setup_input).unwrap();
+        reserve(
+            "setup-uncertain",
+            "trip_setup_dispatch",
+            "missing-attempt",
+            &hash,
+            json!({"session_id":setup_session.session_id}),
+        );
+        state
+            .app
+            .store
+            .finalize_browser_launch_receipt(
+                "setup-uncertain",
+                "trip_setup_dispatch",
+                &hash,
+                None,
+                Some("fixture post-reservation write failed".into()),
+            )
+            .unwrap();
+        setup["operation_id"] = "setup-uncertain".into();
+        let response = send(setup, headers.clone()).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = knowledge_response_json(response).await;
+        assert_eq!(body["operation_id"], "setup-uncertain");
+        assert_eq!(body["outcome_unknown"], true);
+        assert!(body.get("terminal_refusal").is_none());
+
+        // The same exact request cannot settle from a refused HTTP attempt.
+        state.app.blocking_operations.close();
+        let response = send(unadmitted, headers).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = knowledge_response_json(response).await;
+        assert_eq!(body["operation_id"], "unadmitted-op");
+        assert_eq!(body["outcome_unknown"], false);
+        assert!(body.get("terminal_refusal").is_none());
+        assert_eq!(Some(load_refusal()), saved);
+
+        let connection = state.app.store.lock().unwrap();
+        let inventory: (i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM launch_permits)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(inventory, (7, 0));
+        drop(connection);
+        drop(restarted);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn checked_legacy_import_distinguishes_stale_preview_and_unreadable_committed_receipt() {
+        use serde_json::json;
+
+        let (root, app, _, _) = server_test_application();
+        let source = root.join("legacy-task.md");
+        std::fs::write(
+            &source,
+            r#"---
+id: legacy-task
+title: Legacy task
+status: todo
+owner: nobody
+priority: normal
+attention: none
+phase: backlog
+validation_status: not_started
+created: 2026-01-01T00:00:00Z
+updated: 2026-01-01T00:00:00Z
+---
+# Legacy task
+## Context
+## Acceptance Criteria
+## Progress
+## Validation
+### Runs
+### Bugs
+## Questions / Decisions
+## Activity
+"#,
+        )
+        .unwrap();
+        let preview = crate::import::preview(&source).unwrap();
+        let version: i64 = app
+            .store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT version FROM projects WHERE id='project'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (state, headers, _shutdown) = browser_state(app);
+        let send = |request: serde_json::Value| {
+            api_operation(
+                State(state.clone()),
+                headers.clone(),
+                Json(serde_json::from_value(request).unwrap()),
+            )
+        };
+        let request = json!({
+            "kind":"legacy_import", "operation_id":"legacy-op", "project_id":"project",
+            "expected_project_version":version, "source":source,
+            "expected_source_hash":preview.source_hash,
+        });
+        let mut stale = request.clone();
+        stale["operation_id"] = "legacy-stale".into();
+        stale["expected_source_hash"] = "stale".into();
+        let response = send(stale).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = knowledge_response_json(response).await;
+        assert_eq!(body["operation_id"], "legacy-stale");
+        assert_eq!(body["outcome_unknown"], false);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("source changed after preview"));
+
+        let response = send(request.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            knowledge_response_json(response).await["result"]["operation_id"],
+            "legacy-op"
+        );
+        state
+            .app
+            .store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE operation_receipts SET result_json='[]' WHERE operation_id='legacy-op'",
+                [],
+            )
+            .unwrap();
+        let response = send(request).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = knowledge_response_json(response).await;
+        assert_eq!(body["operation_id"], "legacy-op");
+        assert_eq!(body["outcome_unknown"], true);
+        let (project_version, imported_tasks, refusal_receipts): (i64, i64, i64) = state
+            .app
+            .store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT version, (SELECT COUNT(*) FROM tasks WHERE id='legacy-task'),
+                    (SELECT COUNT(*) FROM operation_receipts WHERE operation_id='legacy-stale')
+                 FROM projects WHERE id='project'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (project_version, imported_tasks, refusal_receipts),
+            (version + 1, 1, 0)
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -3177,11 +4157,20 @@ mod web_operation_tests {
         overbound.id = "overbound-manifest".into();
         overbound.created_at = "x".repeat(crate::knowledge::MANIFEST_BYTES);
         let oversized_response = serde_json::to_value(&overbound).unwrap();
-        let response = knowledge_work(state.clone(), crate::knowledge::MANIFEST_BYTES, move |_| {
-            Ok(oversized_response)
-        })
+        let response = knowledge_work(
+            state.clone(),
+            crate::knowledge::MANIFEST_BYTES,
+            None,
+            move |_| Ok(oversized_response),
+        )
         .await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = knowledge_response_json(response).await;
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("response is too large"));
+        assert!(body.get("outcome_unknown").is_none());
         {
             let mut connection = state.app.store.lock().unwrap();
             let tx = connection.transaction().unwrap();
@@ -3233,6 +4222,10 @@ mod web_operation_tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            knowledge_response_json(response).await["outcome_unknown"],
+            false
+        );
         let mut headers = headers;
         headers.insert(HeaderName::from_static(protocol::HTTP_HEADER), HeaderValue::from_static(
             r#"{"generation":1,"client_kind":"browser","required_features":["http_operational_v1","project_knowledge_v1"]}"#));
@@ -3271,6 +4264,7 @@ mod web_operation_tests {
             .await
             .unwrap();
         let entry: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(entry["operation_id"], "knowledge-draft");
         let (author, events): (String,i64) = state.app.store.lock().unwrap().query_row(
             "SELECT json_extract(r.body_json,'$.author'),(SELECT COUNT(*) FROM knowledge_events WHERE actor='human_control')
              FROM knowledge_revisions r WHERE r.entry_id=?1", [entry["id"].as_str().unwrap()], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
@@ -3279,10 +4273,496 @@ mod web_operation_tests {
         let foreign = serde_json::json!({"project_id":"missing","read":{"kind":"entry","entry_id":entry["id"]}});
         let response = api_knowledge_read(
             State(state.clone()),
-            make_request(headers, foreign.to_string()),
+            make_request(headers.clone(), foreign.to_string()),
         )
         .await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        let mut wrong_owner = body.clone();
+        wrong_owner["request"]["project_id"] = serde_json::json!("missing");
+        let response = api_knowledge_command(
+            State(state.clone()),
+            make_request(headers.clone(), wrong_owner.to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let refusal = knowledge_response_json(response).await;
+        assert_eq!(refusal["operation_id"], "knowledge-draft");
+        assert_eq!(refusal["outcome_unknown"], false);
+        let response = api_knowledge_command(
+            State(state.clone()),
+            make_request(headers.clone(), body.to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(knowledge_response_json(response).await, entry);
+
+        let mut second_draft = body.clone();
+        second_draft["request"]["operation_id"] = "second-knowledge-draft".into();
+        let response = api_knowledge_command(
+            State(state.clone()),
+            make_request(headers.clone(), second_draft.to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let second_entry = knowledge_response_json(response).await;
+        assert_eq!(second_entry["operation_id"], "second-knowledge-draft");
+        assert_ne!(second_entry["id"], entry["id"]);
+
+        let entry_id = entry["id"].as_str().unwrap();
+        let revision_id = entry["latest_draft_id"].as_str().unwrap();
+        let prior = state
+            .app
+            .store
+            .knowledge_freshness("project", entry_id, revision_id)
+            .unwrap();
+        let revalidate = serde_json::json!({
+            "kind":"revalidate", "operation_id":"first-check", "project_id":"project",
+            "entry_id":entry_id, "revision_id":revision_id,
+            "expected_version":1, "expected_observation":prior.fingerprint
+        });
+        let send = |command: &serde_json::Value| {
+            api_knowledge_command(
+                State(state.clone()),
+                make_request(headers.clone(), command.to_string()),
+            )
+        };
+        let response = send(&revalidate).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let first = knowledge_response_json(response).await;
+        assert_eq!(first["operation_id"], "first-check");
+        assert_eq!(first["revision_id"], revision_id);
+        assert!(first["sources"].is_array());
+        let mut second_check = revalidate.clone();
+        second_check["operation_id"] = "second-check".into();
+        second_check["expected_observation"] = first["fingerprint"].clone();
+        let response = send(&second_check).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let second = knowledge_response_json(response).await;
+        assert_eq!(second["operation_id"], "second-check");
+        assert_eq!(second["revision_id"], revision_id);
+        assert_ne!(first["fingerprint"], second["fingerprint"]);
+        let response = send(&revalidate).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(knowledge_response_json(response).await, first);
+        let count: i64 = state
+            .app
+            .store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM knowledge_observations WHERE revision_id=?1",
+                [revision_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3);
+
+        let response = knowledge_work(
+            state.clone(),
+            crate::knowledge::PREVIEW_RESPONSE_BYTES,
+            Some("interrupted-knowledge".into()),
+            |_| -> Result<serde_json::Value> { panic!("private worker detail") },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let interrupted = knowledge_response_json(response).await;
+        assert_eq!(interrupted["operation_id"], "interrupted-knowledge");
+        assert_eq!(interrupted["outcome_unknown"], true);
+        assert!(!interrupted.to_string().contains("private worker detail"));
+        state.app.blocking_operations.close();
+        let response = api_knowledge_command(
+            State(state.clone()),
+            make_request(headers, body.to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let refusal = knowledge_response_json(response).await;
+        assert_eq!(refusal["outcome_unknown"], false);
+        assert!(refusal["error"]
+            .as_str()
+            .unwrap()
+            .contains("was not started"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn knowledge_revalidation_commits_oversized_observation_and_replay_does_not_write_again()
+    {
+        use crate::domain::*;
+        let (root, app, _, _) = server_test_application();
+        let repository = server_test_repository(&root, 16);
+        let project = crate::workflow::execute(
+            &app.store,
+            &HumanCommand::AddProject {
+                operation_id: "register-observation-repository".into(),
+                path: repository.root.clone(),
+                display_name: "Observations".into(),
+            },
+        )
+        .unwrap()
+        .entity_id;
+        let (state, mut headers, _shutdown) = browser_state(app);
+        headers.insert(HeaderName::from_static(protocol::HTTP_HEADER), HeaderValue::from_static(
+            r#"{"generation":1,"client_kind":"browser","required_features":["http_operational_v1","project_knowledge_v1"]}"#));
+        let store = &state.app.store;
+        let operation_id = "revalidate-oversized";
+        let draft = serde_json::json!({"kind":"mutate","request":{
+            "operation_id":"draft-oversized-source","project_id":project,"mutation":{"kind":"draft",
+            "entry_id":null,"expected_version":null,"body":{"title":"Large observation",
+            "statement":"Exact source evidence","category":"note","tags":[],
+            "sources":(0..16).map(|index| KnowledgeSourceSelector::Repository {
+                commit:repository.head.clone(), path:format!("file-{index}"),
+            }).collect::<Vec<_>>()}}}});
+        let send = |command: &serde_json::Value| {
+            let mut request = Request::new(Body::from(command.to_string()));
+            *request.headers_mut() = headers.clone();
+            api_knowledge_command(State(state.clone()), request)
+        };
+        let response = send(&draft).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let entry = knowledge_response_json(response).await;
+        let entry_id = entry["id"].as_str().unwrap();
+        let revision_id = entry["latest_draft_id"].as_str().unwrap();
+        let read = |read: serde_json::Value| {
+            let body = serde_json::json!({"project_id":project,"read":read});
+            let mut request = Request::new(Body::from(body.to_string()));
+            *request.headers_mut() = headers.clone();
+            api_knowledge_read(State(state.clone()), request)
+        };
+        let freshness = serde_json::json!({
+            "kind":"freshness","entry_id":entry_id,"revision_id":revision_id
+        });
+
+        // The linked worktree shares the physical repository. Escaping its
+        // longer path once per source contributes over 72 KiB to the response.
+        let component = "\u{1}".repeat(150);
+        let relinked = root
+            .join(&component)
+            .join(&component)
+            .join(&component)
+            .join(&component)
+            .join(&component)
+            .join("worktree");
+        crate::workspace::create_detached_worktree(&repository, &relinked, &repository.head)
+            .unwrap();
+        let relink = crate::workflow::execute(
+            store,
+            &HumanCommand::RelinkProject {
+                operation_id: "relink-observation-repository".into(),
+                project_id: project.clone(),
+                path: relinked,
+                expected_version: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(relink.state, "relinked");
+        assert_eq!(relink.version, Some(2));
+        let prior = store
+            .knowledge_freshness(&project, entry_id, revision_id)
+            .unwrap();
+        assert_eq!(prior.state, KnowledgeFreshness::NeedsRevalidation);
+        assert!(
+            serde_json::to_vec(&prior).unwrap().len() < crate::knowledge::PREVIEW_RESPONSE_BYTES
+        );
+        let response = read(freshness.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            knowledge_response_json(response).await,
+            serde_json::to_value(&prior).unwrap()
+        );
+        let command = serde_json::json!({
+            "kind":"revalidate", "operation_id":operation_id, "project_id":project,
+            "entry_id":entry_id, "revision_id":revision_id,
+            "expected_version":1, "expected_observation":prior.fingerprint
+        });
+        let persisted = || {
+            store.lock().unwrap().query_row(
+                "SELECT (SELECT COUNT(*) FROM knowledge_observations WHERE revision_id=?1), result_json
+                 FROM knowledge_operation_receipts WHERE operation_id=?2 AND project_id=?3",
+                params![revision_id, operation_id, project],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            ).unwrap()
+        };
+        let response = send(&command).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = knowledge_response_json(response).await;
+        let (count, receipt) = persisted();
+        assert_eq!(count, 2);
+        assert!(receipt.len() > crate::knowledge::PREVIEW_RESPONSE_BYTES);
+        let committed: KnowledgeObservation = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(committed.state, KnowledgeFreshness::SourceUnavailable);
+        assert_eq!(committed.revision_id, revision_id);
+        assert_ne!(committed.fingerprint, prior.fingerprint);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "kind":"revalidation_confirmed", "operation_id":operation_id, "project_id":project,
+                "entry_id":entry_id, "revision_id":revision_id, "fingerprint":committed.fingerprint
+            })
+        );
+
+        let response = send(&command).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(knowledge_response_json(response).await, body);
+        let mut conflicting = command;
+        conflicting["expected_version"] = 2.into();
+        let response = send(&conflicting).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            knowledge_response_json(response).await["outcome_unknown"],
+            false
+        );
+        assert_eq!(persisted(), (count, receipt));
+
+        let response = read(serde_json::json!({"kind":"entry","entry_id":entry_id})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let reopened_entry = knowledge_response_json(response).await;
+        assert_eq!(reopened_entry["latest_draft_id"], revision_id);
+        let response = read(serde_json::json!({
+            "kind":"revision","entry_id":entry_id,"revision_id":revision_id
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(knowledge_response_json(response).await["id"], revision_id);
+        let response = read(freshness.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let reopened_observation = knowledge_response_json(response).await;
+        let mut expected_view = serde_json::to_value(&committed).unwrap();
+        expected_view["sources_omitted"] = committed.sources.len().into();
+        expected_view["sources"] = serde_json::json!([]);
+        assert_eq!(reopened_observation, expected_view);
+        assert_eq!(
+            store
+                .knowledge_freshness(&project, entry_id, revision_id)
+                .unwrap()
+                .sources
+                .len(),
+            16
+        );
+
+        let next = serde_json::json!({
+            "kind":"revalidate", "operation_id":"revalidate-after-reopen", "project_id":project,
+            "entry_id":entry_id, "revision_id":revision_id,
+            "expected_version":reopened_entry["version"],
+            "expected_observation":reopened_observation["fingerprint"]
+        });
+        let response = send(&next).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let next_confirmation = knowledge_response_json(response).await;
+        assert_eq!(next_confirmation["kind"], "revalidation_confirmed");
+        assert_eq!(next_confirmation["operation_id"], "revalidate-after-reopen");
+        assert_eq!(persisted().0, count + 1);
+        let response = read(freshness).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let latest = knowledge_response_json(response).await;
+        assert_eq!(latest["fingerprint"], next_confirmation["fingerprint"]);
+        assert_eq!(latest["sources"], serde_json::json!([]));
+        assert_eq!(latest["sources_omitted"], 16);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn task_knowledge_command_distinguishes_ownership_refusal_from_post_receipt_failure() {
+        use crate::domain::{
+            KnowledgeConsumer, KnowledgePreparationAction, KnowledgePreviewRequest,
+            PrepareNextRunKnowledge,
+        };
+
+        let (root, app, _, _) = server_test_application();
+        let repository = server_test_repository(&root, 1);
+        let project = crate::workflow::execute(
+            &app.store,
+            &HumanCommand::AddProject {
+                operation_id: "register-rework-repository".into(),
+                path: repository.root.clone(),
+                display_name: "Rework".into(),
+            },
+        )
+        .unwrap()
+        .entity_id;
+        let task = "rework-task";
+        let parent = "rework-parent";
+        let snapshot = "rework-accepted";
+        let created_at = "2026-01-01T00:00:00Z";
+        let parent_path = root.join("parent-worktree");
+        crate::workspace::create_detached_worktree(&repository, &parent_path, &repository.head)
+            .unwrap();
+        let (manifest, manifest_hash) = crate::snapshot::capture(
+            &repository,
+            &parent_path,
+            &app.paths.artifacts.join("snapshots").join(snapshot),
+        )
+        .unwrap();
+        // Seed the reviewed parent boundary. The continuation command owns
+        // staging the child, intent, frozen Knowledge, and durable receipt.
+        let policy_hash = hex::encode(Sha256::digest(
+            std::fs::read(parent_path.join("file-0")).unwrap(),
+        ));
+        let task_profiles = ["manager", "explorer", "plan_reviewer", "implementer", "code_reviewer", "final_verifier"]
+            .map(|role| serde_json::json!({
+                "role":role,"settings_revision":1,"profile":{},"source":"project_default",
+                "profile_hash":policy_hash,"project_config_revision_id":"fixture-config",
+                "project_configuration_hash":policy_hash,"adapter":"codex","adapter_hash":policy_hash,
+                "capability_id":role,"capability_key":policy_hash,"capability_proof_hash":policy_hash
+            }));
+        let policy = serde_json::json!({
+            "kind":"activated_project","workflow_id":crate::trip::WORKFLOW_ID,
+            "upstream_source_hash":crate::trip::source_hash(),"overlay_hash":crate::trip::overlay_hash(),
+            "manifest_hash":policy_hash,"files":{"file-0":policy_hash},"task_profiles":task_profiles,
+            "base_project_configuration_distinct":true
+        });
+        let user_text = {
+            let connection = app.store.lock().unwrap();
+            connection.execute(
+                "UPDATE trip_project_state SET readiness='ready',workflow_id=?1,package_version=?2,
+                 upstream_source_hash=?3,overlay_hash=?4 WHERE project_id=?5",
+                params![crate::trip::WORKFLOW_ID, crate::trip::PACKAGE_VERSION, crate::trip::source_hash(),
+                    crate::trip::overlay_hash(), project],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO tasks(id,project_id,title,lifecycle,attention,created_at,updated_at)
+                 VALUES(?1,?2,'Reviewed parent','awaiting_review','needs_human_review',?3,?3)",
+                params![task, project, created_at],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO attempts(id,task_id,context_id,phase,base_revision,configuration_revision,status,
+                 accepted_snapshot_id,candidate_hash,workflow_version,workflow_hash,scope_hash,configuration_hash,
+                 legacy_migration_required,created_at,updated_at)
+                 VALUES(?1,?2,'rework-context','awaiting_human_review',?3,1,'running',?4,?5,?6,?7,?8,?9,0,?10,?10)",
+                params![parent, task, repository.head, snapshot, manifest_hash,
+                    crate::trip::WORKFLOW_ID, crate::workflow_resources::workflow_hash(),
+                    crate::store::json_hash(&serde_json::json!({
+                        "title":"Reviewed parent", "description":"", "acceptance_criteria":[],
+                        "base_revision":repository.head,
+                    })).unwrap(),
+                    crate::store::json_hash(&serde_json::json!([])).unwrap(), created_at],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO workspaces(id,attempt_id,repository_identity,path,base_revision,worktree_head,
+                 policy_json,state,created_at,updated_at)
+                 VALUES('rework-workspace',?1,?2,?3,?4,?4,?5,'ready',?6,?6)",
+                params![parent, repository.identity, parent_path.to_str().unwrap(), repository.head,
+                    policy.to_string(), created_at],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO claims(id,task_id,attempt_id,repository_identity,state,created_at,updated_at)
+                 VALUES('rework-claim',?1,?2,?3,'running',?4,?4)",
+                params![task, parent, repository.identity, created_at],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO snapshots(id,attempt_id,kind,snapshot_base,manifest_hash,manifest_json,complete,created_at)
+                 VALUES(?1,?2,'accepted',?3,?4,?5,1,?6)",
+                params![snapshot, parent, manifest.snapshot_base, manifest_hash,
+                    serde_json::to_string(&manifest).unwrap(), created_at],
+            ).unwrap();
+            crate::knowledge::task_knowledge_input_in(&connection, task).unwrap()
+        };
+        let preview = app
+            .store
+            .knowledge_preview(&KnowledgePreviewRequest {
+                project_id: project.clone(),
+                consumer: KnowledgeConsumer::Task {
+                    task_id: task.into(),
+                    parent_attempt_id: Some(parent.into()),
+                    continuation: Some("trip_rework".into()),
+                    parent_binding_id: Some(snapshot.into()),
+                },
+                expected_consumer_version: 1,
+                user_text,
+                selection: vec![],
+            })
+            .unwrap();
+        let request = PrepareNextRunKnowledge {
+            operation_id: "task-knowledge-operation".into(),
+            project_id: project,
+            task_id: task.into(),
+            parent_attempt_id: parent.into(),
+            continuation_kind: "trip_rework".into(),
+            expected_task_version: 1,
+            expected_preparation_version: None,
+            parent_result_binding_id: snapshot.into(),
+            parent_review_binding_id: None,
+            selection: vec![],
+            preview_fingerprint: preview.fingerprint,
+            action: KnowledgePreparationAction::SaveAndContinueRework,
+        };
+        let command = HumanCommand::PrepareNextRunKnowledge {
+            request: request.clone(),
+        };
+        let staged = crate::workflow::execute(&app.store, &command).unwrap();
+        assert_eq!(staged.state, "rework_created");
+        assert_eq!(staged.detail["child_attempt_id"], staged.entity_id);
+        assert_eq!(staged.detail["parent_attempt_id"], parent);
+        assert_eq!(staged.detail["preparation_version"], 1);
+        let blocker = app.paths.artifacts.join("worktrees");
+        std::fs::write(&blocker, "A file blocks the worktree parent directory").unwrap();
+
+        let (state, mut headers, _shutdown) = browser_state(app);
+        headers.insert(HeaderName::from_static(protocol::HTTP_HEADER), HeaderValue::from_static(
+            r#"{"generation":1,"client_kind":"browser","required_features":["http_operational_v1","project_knowledge_v1"]}"#));
+        let persisted = || {
+            state
+                .app
+                .store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM attempts WHERE parent_attempt_id=?1),
+                        (SELECT state FROM rework_intents WHERE new_attempt_id=?2), result_json
+                 FROM operation_receipts WHERE operation_id=?3 AND actor_key='human_control'
+                   AND operation_kind='human_command'",
+                    params![parent, staged.entity_id, request.operation_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let (count, intent_state, receipt) = persisted();
+        assert_eq!(count, 1);
+        assert_eq!(intent_state, "reserved");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&receipt).unwrap(),
+            serde_json::to_value(&staged).unwrap()
+        );
+
+        for _ in 0..2 {
+            let response =
+                api_command(State(state.clone()), headers.clone(), Json(command.clone())).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let unknown = knowledge_response_json(response).await;
+            assert_eq!(unknown["operation_id"], request.operation_id);
+            assert_eq!(unknown["outcome_unknown"], true);
+            assert!(!unknown.to_string().contains(staged.entity_id.as_str()));
+            assert_eq!(
+                persisted(),
+                (1, "recovery_required".into(), receipt.clone())
+            );
+        }
+        assert!(blocker.is_file());
+        let expected_failure = std::fs::create_dir_all(&blocker).unwrap_err().to_string();
+        let failure: String = state.app.store.lock().unwrap().query_row(
+            "SELECT json_extract(result_json,'$.reason') FROM rework_intents WHERE new_attempt_id=?1",
+            [&staged.entity_id],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(failure.contains(&expected_failure), "{failure}");
+
+        let conflicting = HumanCommand::PrepareNextRunKnowledge {
+            request: PrepareNextRunKnowledge {
+                project_id: "different-project".into(),
+                ..request
+            },
+        };
+        let response = api_command(State(state.clone()), headers, Json(conflicting)).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let refused = knowledge_response_json(response).await;
+        assert_eq!(refused["operation_id"], "task-knowledge-operation");
+        assert_eq!(refused["outcome_unknown"], false);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3577,7 +5057,7 @@ mod web_operation_tests {
         let checked_app = app.clone();
         // Assertion panics must not skip joining the listener and deleting its fixture.
         let checks = tokio::spawn(async move {
-            let exchange = |method: &str, path: &str, declaration: &str, body: &str| {
+            let request = |method: &str, path: &str, declaration: &str, body: &str, cookie: &str| {
                 let request = format!(
                     "{method} {path} HTTP/1.1\r\nHost: server-boundary.test\r\nCookie: {cookie}\r\n{declaration}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
                 );
@@ -3586,7 +5066,13 @@ mod web_operation_tests {
                     stream.write_all(request.as_bytes()).await.unwrap();
                     let mut response = Vec::new();
                     stream.read_to_end(&mut response).await.unwrap();
-                    let text = String::from_utf8(response).unwrap();
+                    String::from_utf8(response).unwrap()
+                }
+            };
+            let exchange = |method: &str, path: &str, declaration: &str, body: &str| {
+                let response = request(method, path, declaration, body, &cookie);
+                async move {
+                    let text = response.await;
                     let body: serde_json::Value =
                         serde_json::from_str(text.split_once("\r\n\r\n").unwrap().1).unwrap();
                     (text, body)
@@ -3601,6 +5087,7 @@ mod web_operation_tests {
                 ("GET", "/api/tasks/fixture/role-preparations"),
                 ("GET", "/api/tasks/fixture/guidance-reauthorization"),
                 ("GET", "/api/diagnostics"),
+                ("GET", "/api/diagnostics/runtime-bindings"),
                 ("POST", "/api/command"),
                 ("POST", "/api/operation"),
             ] {
@@ -3613,6 +5100,14 @@ mod web_operation_tests {
                 protocol::HTTP_HEADER,
                 serde_json::json!({"generation":1,"client_kind":"browser","required_features":["http_operational_v1"]}),
             );
+            let path = "/api/diagnostics/runtime-bindings";
+            let text = request("GET", path, "", "", "").await;
+            assert!(text.starts_with("HTTP/1.1 401"), "{text}");
+            let text = request("GET", path, &declaration, "", "").await;
+            assert!(text.starts_with("HTTP/1.1 401"), "{text}");
+            let (text, bindings) = exchange("GET", path, &declaration, "").await;
+            assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+            assert_eq!(bindings, serde_json::json!({"bindings":[]}));
             let (text, before) = exchange("GET", "/api/state", &declaration, "").await;
             assert!(text.starts_with("HTTP/1.1 200"), "{text}");
             let session = before["active_sessions"]
@@ -4301,6 +5796,109 @@ mod web_operation_tests {
     }
 
     #[tokio::test]
+    async fn setup_probe_command_confirms_only_the_exact_durable_refusal() {
+        use crate::domain::TripHumanAction;
+
+        let (root, app, _, _) = server_test_application();
+        let original = TripHumanAction::AuthorizeSetupProbes {
+            setup_operation_id: "setup".into(),
+            proposal_hash: "proposal-a".into(),
+        };
+        let hash = crate::store::json_hash(&original).unwrap();
+        let saved_draft = serde_json::json!({
+            "operation_id": "save-proposal-a",
+            "entity_kind": "trip_setup",
+            "entity_id": "setup",
+            "state": "draft_saved",
+            "detail": {"proposal_hash": "proposal-a"}
+        })
+        .to_string();
+        {
+            let connection = app.store.lock().unwrap();
+            connection.execute(
+                "INSERT INTO trip_setup_operations(id,project_id,state,target_inventory_json,proposal_json,proposal_hash,created_at,updated_at)
+                 VALUES('setup','project','draft','{}','{}','proposal-b','2026-01-01','2026-01-01')",
+                [],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO operation_receipts(operation_id,actor_key,operation_kind,request_hash,result_json,created_at)
+                 VALUES('save-proposal-a','human_control','trip_command','save-hash',?1,'2026-01-01')",
+                params![saved_draft],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO audit_events(id,operation_id,actor_kind,event_code,entity_kind,entity_id,detail_json,created_at)
+                 VALUES('saved-a','save-proposal-a','human','trip.command.applied','trip_setup','setup',?1,'2026-01-01'),
+                       ('partial-a','partial','human','trip.command.progress','trip_setup','setup',?2,'2026-01-01'),
+                       ('historical-a','historical','human','trip.command.applied','trip_setup','setup',?3,'2026-01-01')",
+                params![
+                    saved_draft,
+                    serde_json::json!({"request_hash":hash,"recovery_identity":"setup"}).to_string(),
+                    serde_json::json!({"state":"probes_authorized"}).to_string(),
+                ],
+            ).unwrap();
+        }
+        let (state, headers, _) = browser_state(app);
+        let authorize = |operation_id: &str, action| {
+            api_command(
+                State(state.clone()),
+                headers.clone(),
+                Json(HumanCommand::Trip {
+                    operation_id: operation_id.into(),
+                    action,
+                }),
+            )
+        };
+        let wrong_hash = TripHumanAction::AuthorizeSetupProbes {
+            setup_operation_id: "setup".into(),
+            proposal_hash: "wrong-proposal".into(),
+        };
+        for (id, action) in [
+            ("saved", wrong_hash.clone()),
+            ("partial", original.clone()),
+            ("historical", original.clone()),
+        ] {
+            let response = authorize(id, action).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = knowledge_response_json(response).await;
+            assert_eq!(body["operation_id"], id);
+            assert_eq!(body["outcome_unknown"], true);
+            assert!(body.get("terminal_refusal").is_none());
+        }
+        for _ in 0..2 {
+            let response = authorize("saved", original.clone()).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = knowledge_response_json(response).await;
+            assert_eq!(body["operation_id"], "saved");
+            assert_eq!(body["outcome_unknown"], false);
+            assert_eq!(body["terminal_refusal"], true);
+            assert!(body.get("result").is_none());
+        }
+        for action in [
+            wrong_hash,
+            TripHumanAction::InspectProject {
+                project_id: "project".into(),
+            },
+        ] {
+            let response = authorize("saved", action).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = knowledge_response_json(response).await;
+            assert_eq!(body["operation_id"], "saved");
+            assert_eq!(body["outcome_unknown"], true);
+            assert!(body.get("terminal_refusal").is_none());
+        }
+        let receipts: (String, String, bool) = state.app.store.lock().unwrap().query_row(
+            "SELECT actor_key,request_hash,EXISTS(
+                SELECT 1 FROM operation_receipts WHERE operation_id IN ('partial','historical')
+             ) FROM operation_receipts WHERE operation_id='saved' AND operation_kind='trip_command'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(receipts, ("human_control".to_owned(), hash, false));
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn command_handlers_distinguish_refused_admission_from_unknown_mutation_outcome() {
         for interrupted in [false, true] {
             let (root, app, _, _) = server_test_application();
@@ -4378,7 +5976,7 @@ mod web_operation_tests {
             panic!("injected interruption after committed workflow operation")
         })
         .await;
-        let response = web_operation_response(&state, result);
+        let response = web_operation_response(&state, None, result);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -4407,7 +6005,8 @@ mod web_operation_tests {
                 .unwrap(),
             1
         );
-        let refusal = web_operation_response(&state, Ok(Err(anyhow!("refused before mutation"))));
+        let refusal =
+            web_operation_response(&state, None, Ok(Err(anyhow!("refused before mutation"))));
         assert_eq!(refusal.status(), StatusCode::CONFLICT);
         let bytes = axum::body::to_bytes(refusal.into_body(), 1024 * 1024)
             .await
