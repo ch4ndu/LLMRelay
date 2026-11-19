@@ -9,6 +9,12 @@ pub const RESUME_CONTRACT_REVISION: &str = "llmrelay-claude-resume-v2";
 pub const CREDENTIAL_CONTRACT_REVISION: &str = "llmrelay-local-credential-v1";
 pub const EXACT_CLAUDE_VERSION: &str = "2.1.289 (Claude Code)";
 pub(crate) const CURRENT_SINGLE_AGENT_VERSION: &str = "2.1.325 (Claude Code)";
+pub(crate) const WRITER_VERSION_328: &str = "2.1.328 (Claude Code)";
+
+pub(crate) fn uses_isolated_writer_policy(version: &str) -> bool {
+    matches!(version, CURRENT_SINGLE_AGENT_VERSION | WRITER_VERSION_328)
+}
+
 pub(crate) const CURRENT_SINGLE_AGENT_MODEL: &str = "claude-opus-5-5";
 pub(crate) const CURRENT_SINGLE_AGENT_EFFORT: &str = "high";
 pub const OBSERVATION_LAUNCH_REVISION: &str = "llmrelay-claude-observation-launch-v1";
@@ -386,16 +392,14 @@ fn single_agent_revision_and_write_denials<'a>(
         crate::provider_compatibility::PolicyMode::SingleAgentWriter,
     )
     .map_err(|()| anyhow::anyhow!("No exact Claude Single agent writer native policy"))?;
-    if version == CURRENT_SINGLE_AGENT_VERSION {
+    if uses_isolated_writer_policy(version) {
         if request.model != CURRENT_SINGLE_AGENT_MODEL
             || request.effort != CURRENT_SINGLE_AGENT_EFFORT
         {
-            bail!("Claude Code 2.1.325 requires claude-opus-5-5 with high effort")
+            bail!("{version} requires claude-opus-5-5 with high effort")
         }
         if request.checkout_scope.is_some() {
-            bail!(
-                "Claude Code 2.1.325 requires an isolated worktree; Main checkout is not qualified"
-            )
+            bail!("{version} requires an isolated worktree; Main checkout is not qualified")
         }
         Ok((revision, Some(&scope.write_denials)))
     } else {
@@ -1557,6 +1561,10 @@ mod tests {
                 .unwrap();
         assert_eq!(revision, "claude-single-agent-writer-v3");
         assert_eq!(write_denials, Some(expected_roots.as_slice()));
+        assert_eq!(
+            single_agent_revision_and_write_denials(WRITER_VERSION_328, &request, &scope).unwrap(),
+            (revision, write_denials)
+        );
         let settings: serde_json::Value = serde_json::from_str(
             &native_sandbox_settings_argument(
                 &assets.claude_implementer_settings,
@@ -1609,12 +1617,11 @@ mod tests {
             request.model = model;
             request.effort = effort;
             request.checkout_scope = main.then_some(&main_scope);
-            assert!(single_agent_revision_and_write_denials(
-                CURRENT_SINGLE_AGENT_VERSION,
-                &request,
-                &scope
-            )
-            .is_err());
+            for version in [CURRENT_SINGLE_AGENT_VERSION, WRITER_VERSION_328] {
+                assert!(
+                    single_agent_revision_and_write_denials(version, &request, &scope).is_err()
+                );
+            }
         }
         request.model = CURRENT_SINGLE_AGENT_MODEL;
         request.effort = CURRENT_SINGLE_AGENT_EFFORT;

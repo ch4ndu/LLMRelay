@@ -25,6 +25,16 @@ struct ConversationRelease {
     evidence_digest: Option<String>,
     #[serde(default)]
     split_evidence: Option<ConversationSplitEvidence>,
+    #[serde(default)]
+    tested_scope: Option<ConversationScope>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConversationScope {
+    platform: String,
+    model: String,
+    effort: String,
 }
 
 #[derive(Deserialize)]
@@ -63,32 +73,66 @@ impl ConversationRelease {
     }
 }
 
-pub(crate) fn conversation_release(version: &str) -> anyhow::Result<String> {
-    conversation_release_inner(version, false)
+pub(crate) fn conversation_release(
+    version: &str,
+    model: &str,
+    effort: &str,
+) -> anyhow::Result<String> {
+    conversation_release_inner(version, model, effort, std::env::consts::OS, false)
 }
 
-fn conversation_release_inner(version: &str, provisional: bool) -> anyhow::Result<String> {
+fn conversation_release_inner(
+    version: &str,
+    model: &str,
+    effort: &str,
+    platform: &str,
+    provisional: bool,
+) -> anyhow::Result<String> {
     use crate::providers::codex_app_server as conversation;
-    let pack: ConversationRelease = serde_json::from_str(CONVERSATION_BYTES)?;
+    let bytes = match version {
+        conversation::EXACT_VERSION => CONVERSATION_BYTES,
+        conversation::VERSION_0170 => {
+            include_str!("../resources/provider-compatibility/conversation-codex-0.170.0.json")
+        }
+        _ => anyhow::bail!("This executable has no supported native conversation contract."),
+    };
+    let pack: ConversationRelease = serde_json::from_str(bytes)?;
     if pack.schema != 1
         || pack.provider != Provider::Codex
-        || version != conversation::EXACT_VERSION
         || pack.exact_version != version
         || pack.adapter_revision != conversation::ADAPTER_REVISION
-        || pack.schema_hash != conversation::SCHEMA_HASH
+        || Some(pack.schema_hash.as_str()) != conversation::schema_for_version(version)
         || pack.policy != conversation::POLICY
     {
         anyhow::bail!("This executable has no supported native conversation contract.")
     }
+    if version == conversation::VERSION_0170 {
+        let scope = pack
+            .tested_scope
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Missing tested Codex conversation scope"))?;
+        if scope.platform != platform || scope.model != model || scope.effort != effort {
+            anyhow::bail!(
+                "Codex 0.170.0 conversations require {} on {} with {} effort.",
+                scope.model,
+                scope.platform,
+                scope.effort
+            );
+        }
+    }
     if !provisional && !pack.independently_qualified() {
         anyhow::bail!("Native conversations are unqualified in this release. An independently reviewed native qualification is required before project probing or execution.")
     }
-    Ok(hex::encode(Sha256::digest(CONVERSATION_BYTES.as_bytes())))
+    Ok(hex::encode(Sha256::digest(bytes.as_bytes())))
 }
 
 #[cfg(test)]
-pub(crate) fn provisional_conversation_release(version: &str) -> anyhow::Result<String> {
-    conversation_release_inner(version, true)
+pub(crate) fn provisional_conversation_release(
+    version: &str,
+    model: &str,
+    effort: &str,
+) -> anyhow::Result<String> {
+    conversation_release_inner(version, model, effort, std::env::consts::OS, true)
 }
 pub const CODEX_EXACT_VERSION: &str = crate::providers::codex::EXACT_CODEX_VERSION;
 const REQUIRED_EVIDENCE: [&str; 4] = [
@@ -542,7 +586,7 @@ impl BundleSet {
     ) -> anyhow::Result<Self> {
         if exact_policy(provider, version, PolicyMode::SingleAgentWriter).is_err()
             || (provider != Provider::Codex
-                && version != crate::providers::claude::CURRENT_SINGLE_AGENT_VERSION)
+                && !crate::providers::claude::uses_isolated_writer_policy(version))
         {
             anyhow::bail!("No provisional predicate for this exact native version")
         }
@@ -628,10 +672,17 @@ impl BundleSet {
         let bytes = self.policy_bytes(provider);
         let pack: PolicyPack = serde_json::from_str(bytes).map_err(|_| invalid_manifest())?;
         validate_policy_pack(&pack, provider).map_err(|_| invalid_manifest())?;
-        let Some(selector) = pack
+        let Some((selector, contract)) = pack
             .selectors
             .iter()
-            .find(|selector| selector.exact_version == version)
+            .filter(|selector| selector.exact_version == version)
+            .find_map(|selector| {
+                selector
+                    .contracts
+                    .iter()
+                    .find(|contract| contract.mode == mode)
+                    .map(|contract| (selector, contract))
+            })
         else {
             return Err(CompatibilityError::Unsupported {
                 explanation: CompatibilityExplanation {
@@ -650,6 +701,7 @@ impl BundleSet {
                         safe_version(version).as_deref().unwrap_or("(unrecognized)"),
                         pack.selectors
                             .iter()
+                            .filter(|selector| selector.contracts.iter().any(|contract| contract.mode == mode))
                             .map(|selector| selector.exact_version.as_str())
                             .collect::<Vec<_>>()
                             .join(", ")
@@ -657,11 +709,6 @@ impl BundleSet {
                 },
             });
         };
-        let contract = selector
-            .contracts
-            .iter()
-            .find(|contract| contract.mode == mode)
-            .ok_or_else(invalid_manifest)?;
         let canonical = CanonicalPolicyAuthority {
             provider,
             schema: pack.schema,
@@ -972,7 +1019,7 @@ fn validate_policy_pack(pack: &PolicyPack, provider: Provider) -> Result<(), ()>
         let current_codex = provider == Provider::Codex
             && selector.exact_version == crate::providers::codex::CURRENT_SINGLE_AGENT_VERSION;
         let current_claude = provider == Provider::Claude
-            && selector.exact_version == crate::providers::claude::CURRENT_SINGLE_AGENT_VERSION;
+            && crate::providers::claude::uses_isolated_writer_policy(&selector.exact_version);
         if (!current_codex && !current_claude && !modes.contains(&PolicyMode::ProviderObservation))
             || !modes.contains(&PolicyMode::SingleAgentWriter)
         {
@@ -1002,7 +1049,7 @@ fn exact_policy(provider: Provider, version: &str, mode: PolicyMode) -> Result<C
         }
         Provider::Claude => {
             version == crate::providers::claude::EXACT_CLAUDE_VERSION
-                || (version == crate::providers::claude::CURRENT_SINGLE_AGENT_VERSION
+                || (crate::providers::claude::uses_isolated_writer_policy(version)
                     && mode == PolicyMode::SingleAgentWriter)
         }
     };
@@ -1010,7 +1057,7 @@ fn exact_policy(provider: Provider, version: &str, mode: PolicyMode) -> Result<C
         return Err(());
     }
     if provider == Provider::Claude
-        && version == crate::providers::claude::CURRENT_SINGLE_AGENT_VERSION
+        && crate::providers::claude::uses_isolated_writer_policy(version)
         && mode == PolicyMode::SingleAgentWriter
     {
         let mut policy = compiled_policy(provider, mode);
@@ -1372,6 +1419,41 @@ mod tests {
                 PolicyMode::SingleAgentWriter,
             )
             .unwrap();
+        let latest = BundleSet::embedded()
+            .resolve_policy(
+                Provider::Claude,
+                crate::providers::claude::WRITER_VERSION_328,
+                PolicyMode::SingleAgentWriter,
+            )
+            .unwrap();
+        assert_ne!(latest.effective_hash, production.effective_hash);
+        assert_eq!(
+            latest.native_policy_revision,
+            production.native_policy_revision
+        );
+        assert!(latest.native_calls_disabled_reason().is_some());
+        let preparation = BundleSet::provisional_native_fixture_for(
+            Provider::Claude,
+            crate::providers::claude::WRITER_VERSION_328,
+        )
+        .unwrap()
+        .resolve_policy(
+            Provider::Claude,
+            crate::providers::claude::WRITER_VERSION_328,
+            PolicyMode::SingleAgentWriter,
+        )
+        .unwrap();
+        assert_eq!(latest.effective_hash, preparation.effective_hash);
+        assert!(preparation.native_calls_disabled_reason().is_some());
+        assert!(matches!(
+            BundleSet::embedded().resolve_policy(
+                Provider::Claude,
+                crate::providers::claude::WRITER_VERSION_328,
+                PolicyMode::ProviderObservation
+            ),
+            Err(CompatibilityError::Unsupported { .. })
+        ));
+
         for binding in [&candidate, &production] {
             assert_eq!(
                 binding.effective_hash,
@@ -1581,6 +1663,22 @@ mod tests {
         assert!(restored.native_policy_revision.is_none());
         assert_eq!(restored.effective_hash, binding.effective_hash);
         assert_eq!(serde_json::to_value(&restored).unwrap(), original);
+    }
+
+    #[test]
+    fn conversation_0170_release_is_bound_to_the_tested_tuple() {
+        use crate::providers::codex_app_server::{EXACT_VERSION, VERSION_0170};
+        let resolve = |version, model, effort, platform| {
+            conversation_release_inner(version, model, effort, platform, false)
+        };
+        let current = resolve(VERSION_0170, "gpt-6.1-sol", "medium", "macos").unwrap();
+        let legacy = resolve(EXACT_VERSION, "gpt-6.1-sol", "medium", "macos").unwrap();
+        assert_eq!(legacy, digest(CONVERSATION_BYTES.as_bytes()));
+        assert_ne!(current, legacy);
+        assert!(resolve(VERSION_0170, "gpt-6.2-sol", "medium", "macos").is_err());
+        assert!(resolve(VERSION_0170, "gpt-6.1-sol", "high", "macos").is_err());
+        assert!(resolve(VERSION_0170, "gpt-6.1-sol", "medium", "linux").is_err());
+        assert!(resolve("codex-cli 0.170.1", "gpt-6.1-sol", "medium", "macos").is_err());
     }
 
     #[test]

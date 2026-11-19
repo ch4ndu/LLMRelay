@@ -214,3 +214,47 @@ including after successful proof publication, and that refresh performs no retry
 These lifecycle fixtures use synthetic evidence and do not replace native Claude
 qualification. The source checks, independent reviews and native acceptance records
 are retained in the ignored provider_sandbox_check_20261013 ledger.
+
+
+## November 19, 2026 CLI compatibility
+
+Codex CLI 0.170.0 qualifies for **structured conversations on macOS with
+`gpt-6.1-sol` at medium effort**. The app enforces the tested tuple before
+preparing an admission. A project still needs its own successful probe and
+activation. On a disposable project the production application prepared the
+matching profile, rejected a different model, recorded a successful native
+probe, and activated the admission. The older 0.167.0 release keeps its own
+manifest and release digest.
+
+The native run completed three fresh conversations, seven submissions, one
+same-thread resume after an idle process loss, and interruption of an active
+turn. Three standalone permission checks and their positive controls passed in
+the same owned app-server. Cleanup completed. Independent review accepted the
+existing experimental split-evidence contract for this tuple. It does not
+establish a denied model-tool call or attest the final compiled sandbox policy.
+The raw evidence SHA-256 is
+`d76832a12d2db8790abae30c84bf2c4f57d937ddd3e9decf5a25f238e9965b60`.
+The reviewed acceptance record SHA-256 is
+`9e6100ccad0a177666d67591d7a77009bb94fbdef4d19b1e927391f21b561567`.
+
+**Interactive Codex TRIP roles and Single agent writers** require realtime
+conversation to be disabled. In 0.170.0 the CLI reports that control as
+removed and enabled even with the explicit disable flag. Disabling
+`in_app_voice` still leaves the native terminal voice command available on
+macOS. These interactive paths retain their earlier version restrictions.
+Structured conversations expose only the operations implemented by LLMRelay.
+
+**Claude Code 2.1.328** passed all six TRIP role checks on macOS with
+`claude-opus-5-5` at high effort. After manual folder trust, LLMRelay completed
+setup on a disposable project and published six `functional-v2` runtime proofs.
+The Manager, Explorer, Plan Reviewer, Implementer and Code Reviewer each resumed
+their original session once. The Final Verifier completed a fresh session.
+The Implementer received one-time approval to copy the challenge file to its
+assigned output in the fixture. The admission reached `ready`, and the service
+confirmed that all six process groups had exited. Each additional project
+requires its own matching proofs. The result summary SHA-256 is
+`c4aebe318507e433b78c372d323668745de707677e71a81b49285c0de0e89a4c`.
+
+The separate isolated Opus 5.5 High Single agent writer
+candidate remains unqualified pending native evidence and independent review.
+The existing qualified 2.1.325 writer and its receipts remain available.

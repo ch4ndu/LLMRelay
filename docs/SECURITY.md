@@ -231,7 +231,7 @@ Codex 0.162.1 launches and resumes with `--no-daemon`, with daemon auto-start an
 
 Interactive launches use standalone `--no-daemon` execution and do not attach to a shared app-server; a shared control socket may be present. Observation exec still requires its absence. The updated local MCP coverage identity invalidates historical TRIP and Single agent proofs; it does not establish live standalone coexistence or native enforcement.
 
-The adapter accepts exact Codex CLI 0.162.1. Older and future versions are not
+The interactive TRIP adapter accepts exact Codex CLI 0.162.1. Older and future versions are not
 implicitly supported. Updating adapter compatibility does not mark a role or
 profile Supported: current role-bound native observations and a matching
 capability proof are still required. Proofs from an older executable or policy
@@ -242,7 +242,7 @@ Codex API-key model discovery, the additional Codex Apps MCP protocol, and
 realtime conversation are explicitly disabled in the qualified launch. Local
 system, user, or project configuration enabling these excluded features is
 rejected during preflight; default-off settings alone are not the boundary.
-The disabled feature list participates in the capability identity.
+The disabled feature list participates in the capability identity. Codex 0.170.0 cannot disable realtime conversation in its native terminal. Its structured conversation release has a separate protocol and admission contract. [November CLI qualification](provider-qualification-20261011.md#november-19-2026-cli-compatibility)
 
 ## Database restore confidentiality and authority
 

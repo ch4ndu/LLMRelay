@@ -11,6 +11,16 @@ pub const EXACT_VERSION: &str = "codex-cli 0.167.0";
 pub const ADAPTER_REVISION: &str = "codex-local-stdio-conversation-v1";
 pub const POLICY: &str = "conversation_read_only_v1";
 pub const SCHEMA_HASH: &str = "021462a9bacd117f4cd40c256a4888619d059cec6a65b795198d521ba660e554";
+pub(crate) const VERSION_0170: &str = "codex-cli 0.170.0";
+
+pub(crate) fn schema_for_version(version: &str) -> Option<&'static str> {
+    match version {
+        EXACT_VERSION => Some(SCHEMA_HASH),
+        VERSION_0170 => Some("ca6123bc03238217a62a32c745b45e267fdb26825a80ce6849e893fcbe6628b8"),
+        _ => None,
+    }
+}
+
 pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_INPUT_BYTES: usize = 12 * 1024;
 pub const MAX_OPERATION_BYTES: usize = 16 * 1024;

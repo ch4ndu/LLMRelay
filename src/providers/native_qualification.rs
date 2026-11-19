@@ -196,9 +196,21 @@ async fn app_server_conversation() {
     assert_eq!(inputs.provider, Provider::Codex);
     assert_eq!(inputs.model, "gpt-6.1-sol");
     assert_eq!(inputs.effort, "medium");
+    let version = inputs
+        .exact_version
+        .as_deref()
+        .expect("exact conversation version");
     assert_eq!(
-        inputs.exact_version.as_deref(),
-        Some(super::codex_app_server::EXACT_VERSION)
+        super::inspect_installation(inputs.provider)
+            .expect("installed provider version")
+            .executable_version,
+        version
+    );
+    assert!(super::codex_app_server::schema_for_version(version).is_some());
+    assert!(
+        crate::provider_compatibility::conversation_release(version, &inputs.model, &inputs.effort)
+            .is_err(),
+        "native acquisition requires an unqualified release candidate"
     );
     std::fs::create_dir(&inputs.dir).expect("qualification directory must be new");
     inputs.dir = inputs
@@ -216,8 +228,7 @@ async fn app_server_conversation() {
         "ceilings":{"fresh_conversations":3,"model_submissions":7,"resumes":1,
             "diagnostic_rpcs":3,"acquisition_seconds":1500,"cleanup_seconds":180,
             "setup_output_seconds":120,"cumulative_seconds":1800,"per_conversation_seconds":600,"automatic_retry":false},
-        "prior_spending":{"fresh_conversations":7,"model_submissions":14,"resumes":2,"wrapper_seconds":134.458},
-        "aggregate_ceiling":{"fresh_conversations":10,"model_submissions":21,"resumes":3,"diagnostic_rpcs":3,"wrapper_seconds":1980}
+        "requested_version":version
     });
     evidence["test_artifact"] = json!(super::executable_fingerprint(
         &std::env::current_exe().expect("current precompiled test artifact"),
@@ -841,7 +852,12 @@ async fn acquire_conversations(
     )?;
     if unresolved != 0
         || crate::provider_compatibility::conversation_release(
-            super::codex_app_server::EXACT_VERSION,
+            inputs
+                .exact_version
+                .as_deref()
+                .context("missing exact conversation version")?,
+            &inputs.model,
+            &inputs.effort,
         )
         .is_ok()
     {

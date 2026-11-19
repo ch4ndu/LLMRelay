@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "provider": "codex",
+  "adapter_revision": "codex-local-stdio-conversation-v1",
+  "exact_version": "codex-cli 0.170.0",
+  "schema_hash": "ca6123bc03238217a62a32c745b45e267fdb26825a80ce6849e893fcbe6628b8",
+  "policy": "conversation_read_only_v1",
+  "eligibility": "qualified_split_evidence_v1",
+  "evidence_digest": "9e6100ccad0a177666d67591d7a77009bb94fbdef4d19b1e927391f21b561567",
+  "tested_scope": {
+    "platform": "macos",
+    "model": "gpt-6.1-sol",
+    "effort": "medium"
+  },
+  "split_evidence": {
+    "evidence_basis": "app_server_standalone_enforcement_plus_model_lifecycle_v1",
+    "lifecycle_complete": true,
+    "standalone_enforcement_complete": true,
+    "cleanup_verified": true,
+    "residual_accepted": true,
+    "model_tool_denial_observed": false
+  }
+}

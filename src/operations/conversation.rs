@@ -563,6 +563,8 @@ impl Application {
             {
                 crate::provider_compatibility::provisional_conversation_release(
                     &installation.executable_version,
+                    &profile.model,
+                    &profile.effort,
                 )?
             }
             #[cfg(not(test))]
@@ -570,7 +572,11 @@ impl Application {
                 bail!("Provisional conversation qualification is unavailable in production")
             }
         } else {
-            crate::provider_compatibility::conversation_release(&installation.executable_version)?
+            crate::provider_compatibility::conversation_release(
+                &installation.executable_version,
+                &profile.model,
+                &profile.effort,
+            )?
         };
         let (path, repository_identity, config_hash, epoch, configuration, base_revision): (
             String,
@@ -631,8 +637,10 @@ impl Application {
         let policy_hash = json_hash(&serde_json::to_value(&config)?)?;
         let identity = adapter::ConversationNativeIdentity {
             executable: installation.executable,
+            schema_hash: adapter::schema_for_version(&installation.executable_version)
+                .context("Unsupported Codex conversation protocol version")?
+                .into(),
             executable_version: installation.executable_version,
-            schema_hash: adapter::SCHEMA_HASH.into(),
             adapter_revision: adapter::ADAPTER_REVISION.into(),
             adapter_hash: json_hash(&serde_json::json!({
                 "protocol_source": hex::encode(sha2::Sha256::digest(include_bytes!(

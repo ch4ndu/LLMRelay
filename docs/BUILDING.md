@@ -201,7 +201,7 @@ package for dashboard operation; this limitation does not indicate a failed serv
 
 ## Structured conversation qualification
 
-The conversation adapter targets exact `codex-cli 0.167.0`; the compiled conversation manifest records experimental `qualified_split_evidence_v1` for tested macOS with `gpt-6.1-sol` at medium effort. Host tests do not establish native permission enforcement.
+The conversation adapter has separate exact release bindings for `codex-cli 0.167.0` and `codex-cli 0.170.0`. The 0.170.0 release admits `gpt-6.1-sol` at medium effort on macOS under the experimental `qualified_split_evidence_v1` contract. Both versions require current project admission. Host tests do not establish native permission enforcement.
 
 The ignored `providers::native_qualification::app_server_conversation` case reuses the existing disposable fixture. Run it only with explicit task authorization, a selected supported model/effort, compatible existing authentication, a source-matched LLMRelay executable and a fresh absolute disposable directory. Build the production executable and precompile the library test with `cargo test --locked --lib --no-run --message-format=json` before starting the timed run. Resolve the exact library-test executable from Cargo artifact output:
 
@@ -211,7 +211,7 @@ LLMRELAY_NATIVE_QUALIFICATION_EXECUTABLE=<source-matched-absolute-executable> \
 LLMRELAY_NATIVE_QUALIFICATION_PROVIDER=codex \
 LLMRELAY_NATIVE_QUALIFICATION_MODEL=<selected-model> \
 LLMRELAY_NATIVE_QUALIFICATION_EFFORT=<selected-effort> \
-LLMRELAY_NATIVE_QUALIFICATION_EXACT_VERSION='codex-cli 0.167.0' \
+LLMRELAY_NATIVE_QUALIFICATION_EXACT_VERSION='<exact unqualified candidate version>' \
 LLMRELAY_NATIVE_QUALIFICATION_HELPER_PYTHON=<canonical-absolute-python3> \
 <precompiled-library-test> providers::native_qualification::app_server_conversation --ignored --exact --nocapture --test-threads=1
 ```

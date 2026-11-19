@@ -940,7 +940,9 @@ fn inspect_native_compatibility(
 
 fn native_version_supported(version: &str, launch_mode: NativeLaunchMode) -> bool {
     match launch_mode {
-        NativeLaunchMode::ConversationStdio => version == super::codex_app_server::EXACT_VERSION,
+        NativeLaunchMode::ConversationStdio => {
+            super::codex_app_server::schema_for_version(version).is_some()
+        }
         NativeLaunchMode::InteractiveStandalone => [
             EXACT_CODEX_VERSION,
             SINGLE_AGENT_QUALIFICATION_VERSION,
@@ -1124,11 +1126,8 @@ pub(crate) fn inspect_conversation_preflight(
     cwd: &Path,
     version: &str,
 ) -> Result<(Vec<String>, serde_json::Value)> {
-    if version != super::codex_app_server::EXACT_VERSION {
-        bail!(
-            "Conversations require exact {}.",
-            super::codex_app_server::EXACT_VERSION
-        )
+    if super::codex_app_server::schema_for_version(version).is_none() {
+        bail!("Unsupported Codex conversation protocol version")
     }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -1172,7 +1171,10 @@ pub(crate) fn inspect_conversation_preflight(
         NativeLaunchMode::ConversationStdio,
     )?;
     let mut configuration = compatibility.identity;
-    configuration["revision"] = serde_json::json!("conversation-local-config-v3-0.167.0");
+    configuration["revision"] = serde_json::json!(format!(
+        "conversation-local-config-v3-{}",
+        version.trim_start_matches("codex-cli ")
+    ));
     configuration["class"] = serde_json::json!("prelaunch_checks_only_native_unqualified");
     Ok((
         compatibility.disabled_mcp_servers.into_iter().collect(),
@@ -1611,6 +1613,12 @@ mod executor_environment_tests {
             ("codex-cli 0.167.0", true, true, false),
             ("codex-cli 0.167.1", false, false, false),
             ("codex-cli 0.168.0", false, false, false),
+            (
+                super::super::codex_app_server::VERSION_0170,
+                true,
+                false,
+                false,
+            ),
             ("0.167.0", false, false, false),
         ] {
             assert_eq!(

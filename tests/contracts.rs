@@ -23997,6 +23997,16 @@ fn m7_embedded_provider_selectors_are_exact_and_require_role_qualification() {
             .resolve(Provider::Claude, "2.1.289 (Claude Code)", role)
             .unwrap();
         assert_eq!(claude.predicate_id, "claude-code-2.1.289");
+        let current = bundles
+            .resolve(Provider::Claude, "2.1.328 (Claude Code)", role)
+            .unwrap();
+        assert_ne!(current.effective_hash, claude.effective_hash);
+        assert_eq!(current.required_evidence, claude.required_evidence);
+        assert_eq!(current.session_class, claude.session_class);
+        assert!(matches!(
+            bundles.resolve(Provider::Codex, "codex-cli 0.170.0", role),
+            Err(CompatibilityError::Unsupported { .. })
+        ));
         assert!(!claude.synthetic_origin);
         assert!(claude
             .required_evidence
