@@ -62544,6 +62544,89 @@ fn replan_parent_evidence(fixture: &Fixture, parent: &str) -> String {
 }
 
 #[test]
+fn missing_checks_replan_preserves_the_reviewed_candidate_and_requires_new_approval() {
+    let (fixture, paths, plan, task, hash) = terminal_replan_fixture("missing-required-checks");
+    let app = Application::new(
+        paths.clone(),
+        fixture.store.clone(),
+        std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    fixture.execute(
+        "UPDATE attempts SET phase='checks',status='needs_input',candidate_hash=?2 WHERE id=?1",
+        params![plan.attempt_id, hash],
+    );
+    fixture.execute_batch(
+        "UPDATE review_requests SET verdict='approved' WHERE id='terminal-review';
+        UPDATE role_results SET outcome='approved' WHERE id='terminal-result';",
+    );
+    let request = |candidate: &str, op: &str| HumanCommand::ReplanMissingChecks {
+        operation_id: op.into(),
+        task_id: task.clone(),
+        attempt_id: plan.attempt_id.clone(),
+        candidate_hash: candidate.into(),
+        reason: "Select the required file check".into(),
+        expected_version: fixture.scalar(&format!("SELECT version FROM tasks WHERE id='{task}'")),
+    };
+    let evidence = replan_parent_evidence(&fixture, &plan.attempt_id);
+    assert!(app
+        .execute_human_command(&request("different-candidate", "wrong-candidate"))
+        .is_err());
+    let ordinary_replan = terminal_replan_command(
+        &fixture,
+        &plan,
+        &task,
+        &hash,
+        "old-route",
+        serde_json::json!({}),
+    );
+    assert!(app.execute_human_command(&ordinary_replan).is_err());
+    fixture.execute("INSERT INTO trip_verification_checks(id,project_id,config_revision_id,check_key,category,command_kind,
+        executable,arguments_json,cwd,timeout_seconds,acceptance_rows_json,relevant_inputs_json,invalidation_json,original_text)
+        SELECT 'check-file',t.project_id,s.active_config_revision_id,'check-file','focused','structured_argv','cmp','[]','.',30,
+        '[]','[]','{}','Verify file' FROM tasks t JOIN trip_project_state s ON s.project_id=t.project_id WHERE t.id=?1",params![task]);
+    fixture.execute("INSERT INTO trip_selected_checks(attempt_id,revision,check_id,required,selected_by_generation_id,created_at)
+        SELECT id,selected_checks_revision,'check-file',1,'g-manager',created_at FROM attempts WHERE id=?1",params![plan.attempt_id]);
+    assert!(app
+        .execute_human_command(&request(&hash, "has-required-check"))
+        .is_err());
+    fixture.execute_batch("UPDATE trip_selected_checks SET required=0 WHERE check_id='check-file'");
+    let command = request(&hash, "recover");
+    let staged = app.execute_human_command(&command).unwrap();
+    assert_eq!(staged.state, "replan_created_pending_quiescence");
+    assert_eq!(
+        app.execute_human_command(&command).unwrap().entity_id,
+        staged.entity_id
+    );
+    assert!(app
+        .execute_human_command(&request(&hash, "stale-parent"))
+        .is_err());
+    fixture.assert_scalar::<i64>("SELECT COUNT(*) FROM rework_intents", 1);
+    fixture.assert_scalar::<i64>(
+        "SELECT COUNT(*) FROM attempts WHERE parent_attempt_id IS NOT NULL AND phase='planning'
+        AND plan_hash IS NULL AND plan_approved_at IS NULL AND accepted_snapshot_id IS NULL",
+        1,
+    );
+    let materialized = app.coordinator_tick().unwrap();
+    assert_eq!(
+        materialized["action"], "rework_materialized",
+        "{materialized}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            paths
+                .artifacts
+                .join("worktrees")
+                .join(staged.entity_id)
+                .join("untracked.txt")
+        )
+        .unwrap(),
+        "rejected but preserved\n"
+    );
+    assert_eq!(replan_parent_evidence(&fixture, &plan.attempt_id), evidence);
+}
+
+#[test]
 fn terminal_replan_stages_a_fresh_planning_child_once_without_materializing() {
     let (fixture, paths, plan, task, candidate_hash) =
         terminal_replan_fixture("terminal-replan-staging");

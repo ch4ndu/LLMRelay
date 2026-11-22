@@ -4635,6 +4635,14 @@ pub enum HumanCommand {
     /// Your explicit request for a fresh planning attempt after the attempt's
     /// terminal nonapproving code or final review. The rejected candidate is
     /// the new attempt's source only; it never becomes accepted authority.
+    ReplanMissingChecks {
+        operation_id: String,
+        task_id: String,
+        attempt_id: String,
+        expected_version: i64,
+        candidate_hash: String,
+        reason: String,
+    },
     ReplanAfterTerminalReview {
         operation_id: String,
         task_id: String,
@@ -4752,6 +4760,7 @@ impl HumanCommand {
             | Self::ReauthorizeAttemptGuidance { operation_id, .. }
             | Self::AbandonUnconfirmedGuidance { operation_id, .. }
             | Self::CancelStaleRestartCandidate { operation_id, .. }
+            | Self::ReplanMissingChecks { operation_id, .. }
             | Self::ReplanAfterTerminalReview { operation_id, .. }
             | Self::Archive { operation_id, .. }
             | Self::Restore { operation_id, .. }

@@ -2275,7 +2275,7 @@ pub fn execute_with_runtime(
             )
         }
         HumanCommand::PrepareNextRunKnowledge { request } => {
-            prepare_next_run_knowledge(store, &transaction, request, &request_hash, &now)?
+            prepare_next_run_knowledge(store, &transaction, request, &request_hash, &now, runtime)?
         }
         HumanCommand::UpsertProfileSet { .. }
         | HumanCommand::ArchiveProfileSet { .. }
@@ -4072,24 +4072,48 @@ pub fn execute_with_runtime(
                 _ => bail!("human review decision must be accept or request_changes"),
             }
         }
-        HumanCommand::ReplanAfterTerminalReview {
+        HumanCommand::ReplanMissingChecks {
             task_id,
             attempt_id,
             expected_version,
-            review_request_id,
-            role_result_id,
             candidate_hash,
-            snapshot_id,
+            reason,
+            ..
+        }
+        | HumanCommand::ReplanAfterTerminalReview {
+            task_id,
+            attempt_id,
+            expected_version,
+            candidate_hash,
             reason,
             ..
         } => {
+            let binding;
+            let (review_request_id, role_result_id, snapshot_id) = match command {
+                HumanCommand::ReplanAfterTerminalReview {
+                    review_request_id,
+                    role_result_id,
+                    snapshot_id,
+                    ..
+                } => (review_request_id, role_result_id, snapshot_id),
+                _ => {
+                    binding = missing_checks_source(&transaction, attempt_id, candidate_hash)?
+                        .context("The task is no longer held at Checks on this reviewed candidate. Refresh the task.")?;
+                    (&binding.0, &binding.1, &binding.2)
+                }
+            };
             let (child, detail) = stage_terminal_replan(
                 &transaction,
+                runtime,
                 operation_id,
                 &TerminalReplan {
                     task_id,
                     attempt_id,
                     expected_version: *expected_version,
+                    missing_required_checks: matches!(
+                        command,
+                        HumanCommand::ReplanMissingChecks { .. }
+                    ),
                     review_request_id,
                     role_result_id,
                     candidate_hash,
@@ -16132,6 +16156,7 @@ fn prepare_next_run_knowledge(
     request: &crate::domain::PrepareNextRunKnowledge,
     request_hash: &str,
     now: &str,
+    runtime: Option<&crate::trip::CapabilityRuntime>,
 ) -> Result<OperationResult> {
     require_supported_attempt_execution(transaction, &request.parent_attempt_id)?;
     use crate::domain::{KnowledgeConsumer, KnowledgePreparationAction, KnowledgePreviewRequest};
@@ -16235,6 +16260,19 @@ fn prepare_next_run_knowledge(
                 carry_plan_approval: false,
             })
         }
+        "terminal_replan"
+            if matches!(
+                authorized,
+                Some(NextRunAuthorization::TerminalReplan {
+                    missing_required_checks: true,
+                    ..
+                })
+            ) =>
+        {
+            // The saved human decision names the exact reviewed candidate.
+            // Staging below revalidates that binding inside this transaction.
+            authorized.context("Missing check recovery authorization")?
+        }
         "terminal_replan" => {
             if family != crate::domain::WorkflowFamily::Trip {
                 bail!("Only TRIP terminal reviews can be replanned")
@@ -16266,6 +16304,7 @@ fn prepare_next_run_knowledge(
                     .clone()
                     .context("Select the exact terminal review")?,
                 role_result_id: request.parent_result_binding_id.clone(),
+                missing_required_checks: false,
                 snapshot_id,
                 candidate_hash,
                 reason:
@@ -16400,6 +16439,7 @@ fn prepare_next_run_knowledge(
             .map(|(child, _)| child)
         }
         NextRunAuthorization::TerminalReplan {
+            missing_required_checks,
             review_request_id,
             role_result_id,
             candidate_hash,
@@ -16408,11 +16448,13 @@ fn prepare_next_run_knowledge(
         } => {
             stage_terminal_replan(
                 transaction,
+                runtime,
                 &request.operation_id,
                 &TerminalReplan {
                     task_id: &request.task_id,
                     attempt_id: &request.parent_attempt_id,
                     expected_version: request.expected_task_version,
+                    missing_required_checks,
                     review_request_id: &review_request_id,
                     role_result_id: &role_result_id,
                     candidate_hash: &candidate_hash,
@@ -16776,10 +16818,40 @@ fn stage_rework_lineage(
     Ok(Some((new_attempt, intent)))
 }
 
+/// Bind the recovery to the frozen, independently reviewed candidate, never
+/// to an accepted result. Re-evaluate the selection under the caller's transaction.
+pub(crate) fn missing_checks_source(
+    connection: &Connection,
+    attempt: &str,
+    candidate: &str,
+) -> Result<Option<(String, String, String)>> {
+    Ok(connection.query_row(
+        "SELECT r.id,rr.id,s.id FROM attempts a
+         JOIN tasks t ON t.id=a.task_id
+         JOIN review_requests r ON r.attempt_id=a.id AND r.candidate_hash=a.candidate_hash
+         JOIN role_results rr ON json_extract(rr.metadata_json,'$.review_request_id')=r.id
+         JOIN snapshots s ON s.attempt_id=a.id AND s.kind='candidate' AND s.complete=1 AND s.manifest_hash=a.candidate_hash
+         WHERE a.id=?1 AND a.candidate_hash=?2 AND a.phase='checks' AND a.status='needs_input'
+           AND t.attention='needs_input' AND t.archived_at IS NULL AND a.accepted_snapshot_id IS NULL
+           AND r.review_kind='code' AND r.verdict='approved' AND r.delivery_state='finished'
+           AND rr.consumed_at IS NOT NULL AND rr.outcome=r.verdict AND rr.session_id=r.session_id
+           AND NOT EXISTS(SELECT 1 FROM trip_selected_checks sc WHERE sc.attempt_id=a.id
+             AND sc.revision=a.selected_checks_revision AND sc.required=1)
+           AND rr.role_generation_id=r.role_generation_id
+           AND json_extract(rr.metadata_json,'$.candidate_hash')=r.candidate_hash
+           AND json_extract(rr.metadata_json,'$.review_kind')=r.review_kind
+           AND r.rowid=(SELECT MAX(rowid) FROM review_requests WHERE attempt_id=a.id)
+           AND (SELECT COUNT(*) FROM role_results other WHERE json_extract(other.metadata_json,'$.review_request_id')=r.id)=1
+         ORDER BY r.rowid DESC,s.rowid DESC LIMIT 1",
+        params![attempt,candidate], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))
+    ).optional()?)
+}
+
 struct TerminalReplan<'a> {
     task_id: &'a str,
     attempt_id: &'a str,
     expected_version: i64,
+    missing_required_checks: bool,
     review_request_id: &'a str,
     role_result_id: &'a str,
     candidate_hash: &'a str,
@@ -16837,15 +16909,16 @@ pub(crate) const TERMINAL_REPLAN_FENCES: &[(&str, &str)] = &[
 ];
 
 /// Stages the explicitly requested fresh planning attempt after the parent's
-/// terminal nonapproving code or final review. Every binding is derived from
+/// terminal nonapproving review or an approved candidate held for missing checks. Every binding is derived from
 /// the ledger: the parent's latest review, its single consumed result, the
-/// complete rejected candidate snapshot, and a closed dedicated recheck when
+/// complete reviewed candidate snapshot, and a closed dedicated recheck when
 /// one exists. The child starts from that candidate as a source only, with no
 /// plan, approval, checks, conformance or accepted snapshot, and fresh
 /// allowances. Parent requests, results, budgets, receipts and snapshots are
 /// not changed. Returns the child and its immutable provenance.
 fn stage_terminal_replan(
     transaction: &Transaction<'_>,
+    runtime: Option<&crate::trip::CapabilityRuntime>,
     operation_id: &str,
     request: &TerminalReplan<'_>,
     now: &str,
@@ -16853,6 +16926,19 @@ fn stage_terminal_replan(
     let reason = request.reason.trim();
     if reason.is_empty() || reason.len() > 4096 {
         bail!("a replan reason of at most 4096 bytes is required")
+    }
+    let missing_checks = request.missing_required_checks;
+    if missing_checks {
+        crate::trip::require_attempt_ready(transaction, request.attempt_id, None)?;
+        if !missing_checks_source(transaction, request.attempt_id, request.candidate_hash)?
+            .is_some_and(|(review, result, snapshot)| {
+                review == request.review_request_id
+                    && result == request.role_result_id
+                    && snapshot == request.snapshot_id
+            })
+        {
+            bail!("The required checks or the reviewed candidate changed. Refresh the task.");
+        }
     }
     let parent: Option<(String, i64)> = transaction
         .query_row(
@@ -16862,13 +16948,14 @@ fn stage_terminal_replan(
                AND t.lifecycle IN ('in_progress','validation')
                AND t.attention IN ('none','needs_input')
                AND a.status IN ('running','needs_input','held')
-               AND a.phase='needs_input' AND a.candidate_hash IS NULL
+               AND ((a.phase='needs_input' AND a.candidate_hash IS NULL) OR ?4)
                AND a.id=(SELECT latest.id FROM attempts latest WHERE latest.task_id=t.id
                  ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1)",
             params![
                 request.task_id,
                 request.attempt_id,
-                request.expected_version
+                request.expected_version,
+                missing_checks
             ],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -16895,7 +16982,7 @@ fn stage_terminal_replan(
              JOIN snapshots s ON s.id=?5 AND s.attempt_id=r.attempt_id AND s.kind='candidate'
                AND s.complete=1 AND s.manifest_hash=r.candidate_hash
              WHERE r.id=?2 AND r.attempt_id=?1 AND r.review_kind IN ('code','final')
-               AND r.delivery_state='finished' AND r.verdict IN ('request_changes','needs_rework')
+               AND r.delivery_state='finished' AND (r.verdict IN ('request_changes','needs_rework') OR (?6 AND r.review_kind='code' AND r.verdict='approved'))
                AND r.candidate_hash=?4
                AND r.rowid=(SELECT MAX(latest.rowid) FROM review_requests latest
                  WHERE latest.attempt_id=r.attempt_id)
@@ -16906,7 +16993,7 @@ fn stage_terminal_replan(
                 request.review_request_id,
                 request.role_result_id,
                 request.candidate_hash,
-                request.snapshot_id
+                request.snapshot_id, missing_checks
             ],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -16923,7 +17010,7 @@ fn stage_terminal_replan(
         )
         .optional()?;
     match &recheck {
-        None if verdict == "needs_rework" => {}
+        None if verdict == "needs_rework" || missing_checks => {}
         None => bail!("a request_changes verdict leaves the attempt open for repair; only a terminal review can be replanned"),
         Some((state, Some(recheck_request), _, _))
             if state == "closed" && recheck_request == request.review_request_id => {}
@@ -16968,6 +17055,7 @@ fn stage_terminal_replan(
             Some(request.review_request_id),
             &error.to_string(),
             crate::knowledge::NextRunAuthorization::TerminalReplan {
+                missing_required_checks: missing_checks,
                 review_request_id: request.review_request_id.into(),
                 role_result_id: request.role_result_id.into(),
                 candidate_hash: request.candidate_hash.into(),
@@ -16998,6 +17086,37 @@ fn stage_terminal_replan(
         now,
     )?
     .context("The validated terminal continuation could not freeze knowledge")?;
+    if missing_checks {
+        // A check-only correction can advance the project's active revision
+        // while this parent stays frozen. Only the new child takes current
+        // settings and ordinary capability proofs. Failure rolls back staging.
+        let rebind_root: Option<String> = transaction.query_row(
+            "SELECT p.repository_path FROM projects p JOIN tasks t ON t.project_id=p.id
+             JOIN trip_project_state ps ON ps.project_id=p.id
+             WHERE t.id=?1 AND EXISTS(SELECT 1 FROM trip_attempt_profiles ap
+               WHERE ap.attempt_id=?2 AND ap.project_config_revision_id!=ps.active_config_revision_id)",
+            params![request.task_id,child], |r|r.get(0)
+        ).optional()?;
+        if let Some(root) = rebind_root {
+            let runtime = runtime
+                .context("Current runtime verification is required for the new planning attempt")?;
+            transaction.execute(
+                "DELETE FROM trip_attempt_profiles WHERE attempt_id=?1",
+                [&child],
+            )?;
+            crate::trip::bind_attempt_profiles(
+                transaction,
+                request.task_id,
+                &child,
+                std::path::Path::new(&root),
+                runtime,
+                now,
+            )
+            .context(
+                "Verify the current task role profiles before starting the linked planning attempt",
+            )?;
+        }
+    }
     let child_profiles: String = transaction.query_row(
         "SELECT json_group_array(json_object('role',role,'settings_revision',settings_revision,
            'profile_hash',profile_hash))
@@ -17024,6 +17143,7 @@ fn stage_terminal_replan(
     let detail = serde_json::json!({
         "intent_id":intent,"parent_attempt_id":request.attempt_id,"child_attempt_id":child,
         "source_snapshot_id":request.snapshot_id,"candidate_hash":request.candidate_hash,
+        "missing_required_checks":missing_checks,
         "terminal_review":{"review_request_id":request.review_request_id,"review_kind":review_kind,
             "verdict":verdict,"role_result_id":request.role_result_id},
         "parent_final_repair_recheck":parent_recheck,

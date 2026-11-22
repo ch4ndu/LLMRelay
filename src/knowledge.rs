@@ -1720,6 +1720,8 @@ pub(crate) enum NextRunAuthorization {
         carry_plan_approval: bool,
     },
     TerminalReplan {
+        #[serde(default)]
+        missing_required_checks: bool,
         review_request_id: String,
         role_result_id: String,
         candidate_hash: String,

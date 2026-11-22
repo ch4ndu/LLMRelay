@@ -164,7 +164,7 @@ export function ReviewPanel(
         JSON.stringify([...commandIdentities.current]),
       );
       setError("");
-      if (body.kind === "human_review" || body.kind === "approve_plan") {
+      if (["human_review", "approve_plan", "replan_missing_checks"].includes(String(body.kind))) {
         setSubmittedDecision(reviewStage);
       }
       onChanged();
@@ -232,6 +232,45 @@ export function ReviewPanel(
     }
   };
 
+  const hasRequiredCheck = verification.some((check) => check.required);
+  if (
+    !terminal && !migration && !hasRequiredCheck && attempt?.phase === "checks" &&
+    attempt.candidate_hash && task.attention === "needs_input" &&
+    attempt.status === "needs_input" && submittedDecision !== reviewStage
+  ) {
+    return (
+      <section className="panel review-panel" data-attention-target={`attempt:${attempt.id}`} tabIndex={-1}>
+        <h3>Return to planning</h3>
+        <p>
+          The approved plan has no required verification check. Start a linked planning
+          attempt from the reviewed candidate. The new plan needs review and approval.
+          If the project has no suitable check, configure one in Project Setup first.
+        </p>
+        <label>
+          Rework feedback
+          <textarea
+            value={feedback}
+            onChange={(event) => setFeedback(event.target.value)}
+            placeholder="Which check should the new plan include?"
+          />
+        </label>
+        <button
+          disabled={pending || !feedback.trim()}
+          onClick={() => void invoke({
+            kind: "replan_missing_checks",
+            task_id: task.id,
+            attempt_id: attempt.id,
+            expected_version: task.version,
+            candidate_hash: attempt.candidate_hash,
+            reason: feedback.trim(),
+          })}
+        >
+          Request rework
+        </button>
+        {error && <ErrorNotice error={error} />}
+      </section>
+    );
+  }
   if (
     terminal || submittedDecision === reviewStage || !attempt ||
     ![
@@ -278,6 +317,11 @@ export function ReviewPanel(
           ? "Independent review is complete. Approving confirms the whole plan; implementation still needs your separate permission."
           : "The result passed its selected checks and final review."}
       </p>
+      {plan && !hasRequiredCheck && (
+        <p className="warning" role="status">
+          This plan selects no required verification check. It will stop at Checks before final verification.
+        </p>
+      )}
       {!plan && !implementation && (
         <p className="hint">
           {verification.filter((item) =>

@@ -6786,9 +6786,103 @@ fn verify_project_activation_boundary(
         .collect()
 }
 
+/// A correction may append commands to a category. Existing command positions
+/// generate the check keys, so both their order and their contracts must survive.
+fn only_adds_verification_checks(
+    mut previous: serde_json::Value,
+    mut proposed: serde_json::Value,
+) -> bool {
+    // Project Setup serializes an unset tier as null. Older proposals omit it.
+    for proposal in [&mut previous, &mut proposed] {
+        if let Some(profiles) = proposal.get_mut("profiles").and_then(|v| v.as_object_mut()) {
+            for profile in profiles.values_mut().filter_map(|v| v.as_object_mut()) {
+                if profile
+                    .get("service_tier")
+                    .is_some_and(|tier| tier.is_null())
+                {
+                    profile.remove("service_tier");
+                }
+            }
+        }
+    }
+    let mut added = false;
+    for category in ["focused", "broad", "cleanup"] {
+        let Some(old) = previous["verification"][category].as_array() else {
+            return false;
+        };
+        let Some(new) = proposed
+            .get_mut("verification")
+            .and_then(|v| v.get_mut(category))
+            .and_then(|v| v.as_array_mut())
+        else {
+            return false;
+        };
+        if !new.starts_with(old) {
+            return false;
+        }
+        let new_len = new.len();
+        new.truncate(old.len());
+        for index in old.len()..new_len {
+            added = true;
+            if let Some(contracts) = proposed
+                .get_mut("verification_contracts")
+                .and_then(|v| v.as_object_mut())
+            {
+                contracts.remove(&format!("{category}_{}", index + 1));
+            }
+        }
+    }
+    added && proposed == previous
+}
+
+/// The sole live attempt must have an isolated, reviewed candidate held for
+/// missing checks. Setup still verifies process quiescence and every normal
+/// review, permission and ownership fence before reserving or activating.
+fn permits_held_check_correction(
+    connection: &Connection,
+    attempt: &str,
+    setup: &str,
+) -> Result<bool> {
+    let binding: Option<(String,String,String)> = connection.query_row(
+        "SELECT prior.proposal_json,next.proposal_json,a.candidate_hash
+         FROM attempts a JOIN tasks t ON t.id=a.task_id JOIN projects p ON p.id=t.project_id
+         JOIN workspaces w ON w.attempt_id=a.id AND w.state='ready' AND w.path!=p.repository_path
+         JOIN trip_project_state ps ON ps.project_id=p.id
+         JOIN trip_setup_operations next ON next.id=ps.setup_operation_id AND next.project_id=p.id
+         JOIN trip_setup_operations prior ON prior.id=next.supersedes_setup_operation_id
+           AND prior.project_id=p.id AND prior.state='activated'
+         JOIN trip_setup_profile_selections m ON m.setup_operation_id=prior.id AND m.role='manager'
+         JOIN trip_setup_profile_selections n ON n.setup_operation_id=next.id AND n.role='manager'
+           AND n.profile_hash=m.profile_hash AND n.selection_state='selected'
+         WHERE a.id=?1 AND next.id=?2 AND t.lifecycle IN ('validation','in_progress')
+           AND a.candidate_hash IS NOT NULL AND a.legacy_migration_required=0
+           AND COALESCE(json_extract(w.policy_json,'$.workspace_mode'),'isolated_worktree')='isolated_worktree'
+           AND json_extract(w.policy_json,'$.manifest_hash')=ps.manifest_hash
+           AND next.state IN ('install_authorized','applying','recovery_required')
+           AND next.install_authorized_at IS NOT NULL AND next.approved_source_set_hash=next.final_source_set_hash
+           AND NOT EXISTS(SELECT 1 FROM rework_intents WHERE parent_attempt_id=a.id)
+           AND NOT EXISTS(SELECT 1 FROM sessions s JOIN role_generations g ON g.id=s.role_generation_id
+                          WHERE g.attempt_id=a.id AND s.status NOT IN ('exited','launch_failed'))
+           AND NOT EXISTS(SELECT 1 FROM trip_frozen_install_files f
+               LEFT JOIN trip_frozen_install_files old ON old.setup_operation_id=prior.id AND old.relative_path=f.relative_path
+               WHERE f.setup_operation_id=next.id AND (old.source_hash IS NULL OR old.source_hash IS NOT f.preimage_hash
+                 OR (f.source_hash!=old.source_hash AND f.relative_path NOT IN ('.agents/trip-explorer/config.json',
+                     '.agents/trip-explorer/preflight.json','.agents/trip-explorer/manifest.json'))))",
+        params![attempt,setup],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))
+    ).optional()?;
+    let Some((previous, proposed, candidate)) = binding else {
+        return Ok(false);
+    };
+    Ok(only_adds_verification_checks(
+        serde_json::from_str(&previous)?,
+        serde_json::from_str(&proposed)?,
+    ) && crate::workflow::missing_checks_source(connection, attempt, &candidate)?.is_some())
+}
+
 fn require_project_activation_boundary(
     connection: &Connection,
     project_id: &str,
+    correction: Option<&str>,
     quiescence: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> Result<()> {
     if project_activation_attempts(connection, project_id)?
@@ -6804,7 +6898,15 @@ fn require_project_activation_boundary(
             |row| Ok(row.get::<_, Option<bool>>(0)?.unwrap_or(false)),
         )?;
         if current_identity {
-            bail!("configuration activation waits for current-workflow attempts to finish")
+            let eligible = match correction {
+                Some(setup) if quiescence.len() == 1 => {
+                    permits_held_check_correction(connection, attempt, setup)?
+                }
+                _ => false,
+            };
+            if !eligible {
+                bail!("configuration activation waits for current-workflow attempts to finish")
+            }
         }
         require_attempt_migration_boundary(connection, attempt, fingerprints)?;
     }
@@ -6858,7 +6960,7 @@ fn apply_installation(
     let quiescence = verify_project_activation_boundary(store, &project_id)?;
     {
         let connection = store.lock()?;
-        require_project_activation_boundary(&connection, &project_id, &quiescence)?;
+        require_project_activation_boundary(&connection, &project_id, Some(setup_id), &quiescence)?;
     }
     let root = crate::workspace::inspect(Path::new(&repository_path))?.root;
     let proposal: SetupProposal = serde_json::from_str(&proposal_json)?;
@@ -6881,7 +6983,15 @@ fn apply_installation(
         .join(setup_id)
         .join("staged");
     stage_files(&staging, &files)?;
-    reserve_apply_journal(store, receipt, setup_id, &staging, &files)?;
+    reserve_apply_journal(
+        store,
+        receipt,
+        setup_id,
+        &project_id,
+        &quiescence,
+        &staging,
+        &files,
+    )?;
     if let Err(error) = apply_journal(store, receipt, setup_id, &root) {
         mark_setup_recovery(store, setup_id, &format!("{error:#}"))?;
         return Err(error);
@@ -6951,6 +7061,10 @@ fn recover_installation(
         )?
     };
     let root = crate::workspace::inspect(Path::new(&path))?.root;
+    // An interrupted install can outlive the attempt state that allowed it.
+    // Recheck before replaying any outstanding filesystem writes.
+    let quiescence = verify_project_activation_boundary(store, &project_id)?;
+    require_project_activation_boundary(&*store.lock()?, &project_id, Some(setup_id), &quiescence)?;
     if let Err(error) = apply_journal(store, receipt, setup_id, &root) {
         mark_setup_recovery(store, setup_id, &format!("{error:#}"))?;
         return Err(error);
@@ -7057,7 +7171,7 @@ fn adopt_installation(
     let quiescence = verify_project_activation_boundary(store, project_id)?;
     let (setup_id, proof_bindings, preflight) = {
         let connection = store.lock()?;
-        require_project_activation_boundary(&connection, project_id, &quiescence)?;
+        require_project_activation_boundary(&connection, project_id, None, &quiescence)?;
         let setup_id: String = connection.query_row(
             "SELECT id FROM trip_setup_operations WHERE project_id=?1 AND proposal_hash=?2 AND state IN ('probing','preflight_complete') ORDER BY created_at DESC LIMIT 1",
             params![project_id,proposal_hash], |row| row.get(0),
@@ -7082,7 +7196,7 @@ fn adopt_installation(
     if !current {
         bail!("project version is stale")
     }
-    require_project_activation_boundary(&tx, project_id, &quiescence)?;
+    require_project_activation_boundary(&tx, project_id, None, &quiescence)?;
     let current_setup_id:String=tx.query_row(
         "SELECT id FROM trip_setup_operations WHERE project_id=?1 AND proposal_hash=?2 AND state IN ('probing','preflight_complete') ORDER BY created_at DESC LIMIT 1",
         params![project_id,proposal_hash],|row|row.get(0)
@@ -10110,6 +10224,50 @@ fn decode_cmux_socket_stderr(value: &str) -> Result<Vec<u8>> {
         bail!("cmux socket stderr must be the exact bounded hexadecimal native stderr or empty")
     }
     hex::decode(value).context("decode cmux socket native stderr")
+}
+
+#[cfg(test)]
+mod check_correction_tests {
+    use super::only_adds_verification_checks;
+    use serde_json::json;
+
+    #[test]
+    fn correction_only_appends_checks_and_contracts_for_the_new_positions() {
+        let prior = json!({
+            "host_manager":{"model":"original"},
+            "profiles":{"reader":{"model":"original"}},
+            "verification":{"focused":["existing"],"broad":[],"cleanup":[]},
+            "verification_contracts":{"focused_1":{"original_text":"existing"}}
+        });
+        assert!(!only_adds_verification_checks(prior.clone(), prior.clone()));
+        let mut correction = prior.clone();
+        correction["profiles"]["reader"]["service_tier"] = serde_json::Value::Null;
+        correction["verification"]["focused"] = json!(["existing", "added"]);
+        correction["verification_contracts"]["focused_2"] = json!({"original_text":"added"});
+        assert!(only_adds_verification_checks(
+            prior.clone(),
+            correction.clone()
+        ));
+        for (path, changed) in [
+            ("/profiles/reader/service_tier", json!("priority")),
+            ("/profiles/reader/model", json!("different")),
+            ("/host_manager/model", json!("different")),
+            ("/verification/focused", json!(["added", "existing"])),
+            ("/verification/focused", json!(["replacement"])),
+            (
+                "/verification_contracts/focused_1",
+                json!({"cwd":"changed"}),
+            ),
+            ("/verification/broad", json!("malformed")),
+        ] {
+            let mut proposal = correction.clone();
+            *proposal.pointer_mut(path).unwrap() = changed;
+            assert!(
+                !only_adds_verification_checks(prior.clone(), proposal),
+                "{path}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -15552,7 +15710,7 @@ fn activate_configuration(
     };
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    require_project_activation_boundary(&tx, project_id, &quiescence)?;
+    require_project_activation_boundary(&tx, project_id, Some(setup_id), &quiescence)?;
     if let Some(result) = lookup_trip_receipt(&tx, receipt)? {
         return Ok(result);
     }
@@ -15713,12 +15871,15 @@ fn reserve_apply_journal(
     store: &Store,
     receipt: &CommandReceipt<'_>,
     setup_id: &str,
+    project_id: &str,
+    quiescence: &BTreeMap<String, BTreeMap<String, String>>,
     staging: &Path,
     files: &[JournalFile],
 ) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     let mut connection = store.lock()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_project_activation_boundary(&tx, project_id, Some(setup_id), quiescence)?;
     let state: String = tx.query_row(
         "SELECT state FROM trip_setup_operations WHERE id=?1",
         params![setup_id],

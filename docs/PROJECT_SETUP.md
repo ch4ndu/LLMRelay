@@ -125,6 +125,8 @@ An activated setup keeps showing its recorded results. When a selected profile's
 
 During supported Implementer sessions, the Workspace **Approvals** list handles native action requests the CLI actually emits with **Approve once**, **Always approve matching actions**, and **Deny**. Codex honors approvals already granted through its native policy, so a natively allowed or sandbox-allowed action may run without a new inbox item. LLMRelay does not enumerate, create, edit, or revoke native Codex approvals; dashboard **Revoke** affects only LLMRelay-owned reusable rules. Workflow approvals, review-budget changes, role switching, and final acceptance remain separate decisions you make in the dashboard. Trusting a folder does not grant those actions to an agent.
 
+A reviewed configuration correction can add verification checks while the project's sole unfinished attempt is held at Checks with no required selection. This requires an isolated worktree, an approved code review for the frozen candidate, and confirmed session quiescence. Existing commands, their contracts, and the role configuration must stay intact. After installation, verify the current runtime profiles and choose **Return to planning** on the held task. The linked attempt selects from the updated catalog and needs its own plan approval.
+
 ## Providers: local inspection
 
 Open **Providers**, select local catalog entries, and choose **Inspect providers**.

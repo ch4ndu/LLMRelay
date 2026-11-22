@@ -252,6 +252,35 @@ Deno.test("ReviewPanel hides decisions for completed and cancelled tasks with re
   }
 });
 
+Deno.test("ReviewPanel warns before approval and binds missing-check rework to the held candidate", async () => {
+  const requests: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (_input, init) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return new Response("{}");
+  }) as typeof fetch;
+  try {
+    const attempt = { ...task.active_attempt!, phase: "awaiting_plan_approval", plan_hash: "plan", plan: "Plan" };
+    mount(<ReviewPanel task={{ ...task, active_attempt: attempt }} onChanged={noop} />);
+    check(document.body.textContent?.includes("no required verification check"), "missing preapproval warning");
+    const held = { ...task, attention: "needs_input", active_attempt: {
+      ...attempt, phase: "checks", status: "needs_input", candidate_hash: "reviewed",
+    } };
+    rerender(<ReviewPanel task={held} onChanged={noop} />);
+    check(!document.body.textContent?.includes("Accept result"), "held candidate offered acceptance");
+    field("Rework feedback", "Select the file check");
+    click("Request rework");
+    await settle();
+    check(requests.length === 1 && requests[0].kind === "replan_missing_checks" &&
+      requests[0].task_id === task.id && requests[0].attempt_id === attempt.id &&
+      requests[0].candidate_hash === "reviewed" && requests[0].expected_version === task.version &&
+      requests[0].reason === "Select the file check", "incorrect rework binding");
+    check(!document.querySelector(".review-panel"), "stale request remained actionable");
+  } finally {
+    unmount();
+    globalThis.fetch = nativeFetch;
+  }
+});
+
 Deno.test("ReviewPanel sends one decision while pending and hides it after confirmation before refresh", async () => {
   const reviewing: Task = {
     ...task,

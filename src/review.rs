@@ -822,7 +822,7 @@ impl ReviewService {
 
     /// Verifies a rework child's workspace against its intent's source. An
     /// accepted source keeps the accepted-snapshot verification above. A
-    /// candidate source verifies only as the exact rejected candidate recorded
+    /// candidate source verifies only as the exact reviewed candidate recorded
     /// by one terminal replan of the intent's parent; it never gains accepted
     /// authority.
     pub fn verify_rework_source(&self, intent_id: &str, destination: &Path) -> Result<bool> {
@@ -845,7 +845,9 @@ impl ReviewService {
                       AND terminal.attempt_id=ri.parent_attempt_id
                       AND terminal.review_kind IN ('code','final')
                       AND terminal.delivery_state='finished'
-                      AND terminal.verdict IN ('request_changes','needs_rework')
+                      AND (terminal.verdict IN ('request_changes','needs_rework')
+                        OR (terminal.verdict='approved' AND terminal.review_kind='code'
+                          AND json_extract(provenance.detail_json,'$.missing_required_checks')=1))
                       AND terminal.candidate_hash=source.manifest_hash
                     JOIN role_results result
                       ON result.id=json_extract(provenance.detail_json,'$.terminal_review.role_result_id')
